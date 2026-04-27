@@ -1,0 +1,35 @@
+{
+  "name": "ai-record-summary",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev -H 127.0.0.1",
+    "build": "next build",
+    "start": "next start -H 127.0.0.1",
+    "db:init": "tsx scripts/db/init.ts",
+    "db:drop-tables": "tsx scripts/db/drop-tables.ts --confirm airecord --yes",
+    "search:reindex": "tsx scripts/search/reindex-recordings.ts",
+    "typecheck": "tsc --noEmit",
+    "lint": "next lint"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@types/pg": "^8.11.11",
+    "lucide-react": "^0.468.0",
+    "next": "^15.1.3",
+    "pg": "^8.13.1",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "server-only": "^0.0.1",
+    "tsx": "^4.19.2",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.5",
+    "@types/react": "^19.0.2",
+    "@types/react-dom": "^19.0.2",
+    "typescript": "^5.7.2"
+  }
+}

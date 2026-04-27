@@ -1,643 +1,332 @@
-# Phase 1 实施说明：录音入库、转写、Speaker Diarization 与目标人物识别
+# Phase 1 实施说明：录音入库、音频转码与分析、说话人识别与文本校正
 
 ## 1. 文档目的
 
-本文档定义项目第一阶段的实施范围、页面清单、数据结构、接口、后台任务流程和验收标准。
+本文档用于说明 Phase 1 当前已经实现的范围、技术方案、运行方式、数据结构、后台任务流、页面能力和验收口径。
 
-Phase 1 必须完成以下闭环：
+相比最初版本，Phase 1 已经从“上传录音并完成转写/说话人分离”扩展为一个完整的本地后台处理闭环：
 
-- 用户可以上传录音
-- 系统可以异步完成转写
-- 系统可以完成 speaker diarization
-- 系统可以识别已知目标人物是否出现在录音中
-- 用户可以在后台页面查看录音、转写结果、说话人标签和目标人物命中结果
+- TypeScript + Next.js App Router 前端与后台一体化应用
+- PostgreSQL 自动建库建表
+- 本地文件存储
+- 批量上传录音
+- 内嵌 scheduler + Node.js worker thread 线程池处理音频任务
+- 多 ASR provider，可配置切换
+- Qwen3-ASR + fsmn-vad 当前作为主要 ASR 路线
+- pyannote speaker diarization
+- SpeechBrain 目标人物识别
+- utterance 展示层合并连续发言
+- pycorrector、规则替换和本地 LLM 文本校正
+- LLM 对同 speaker 相邻 utterance 做受限语义合并和断句
+- 实时任务进度轮询
+- 处理耗时落表，并在列表页展示整条录音累计处理耗时
+- 失败任务重试、已完成文本校正和目标人物识别重试
+- 录音与目标人物删除，并清理数据库和本地文件
+- 本地模型缓存目录统一收口到项目内
 
-本阶段不做检索和 AI 问答，但必须把录音结构化成后续可检索、可分析的数据基础。
+Phase 1 仍然不做全文检索、向量数据库、跨录音问答和 AI 总结。这些能力进入 Phase 2。
 
-## 2. Phase 1 范围
+## 2. 技术选型
 
-### 2.1 本阶段要完成的能力
+Phase 1 遵循 `technical-architecture.md` 中的主技术路线：
 
-- 音频文件上传
-- 录音管理页
-- 录音处理状态管理
-- Whisper 异步转写
-- Speaker diarization
-- 目标人物参考样本管理
-- 目标人物识别
-- 录音详情页展示完整文本、时间戳片段、`Speaker A / B / C` 标签
-- 录音详情页展示目标人物命中片段和置信度
+- 前端与后台：TypeScript + Next.js App Router
+- 数据库：PostgreSQL
+- 数据访问：`pg` 连接池与 SQL schema 初始化
+- 文件存储：项目本地 `uploads`
+- 后台任务：应用启动后内嵌 scheduler + Node.js worker threads
+- 音频分析：Python venv 中运行 ASR、pyannote、SpeechBrain、pycorrector、llama.cpp
+- 模型缓存：项目本地 `model-cache`
 
-### 2.2 本阶段不做的能力
+应用启动入口是 `instrumentation.ts`。在 `NEXT_RUNTIME=nodejs` 时会按顺序执行：
 
-- 全文检索
-- 向量检索
-- AI 总结回答
-- LangGraph 工作流
-- 跨录音统一归并说话人身份
-- 多目标人物复杂权限和协作管理
+1. 加载并写入全局应用配置
+2. 检查并安装音频依赖
+3. 初始化 PostgreSQL 数据库和表结构
+4. 启动内嵌后台任务调度器
 
-### 2.3 实施边界
+## 3. 配置与启动
 
-- Phase 1 在单条录音内产出稳定的匿名说话人标签，如 `Speaker A`、`Speaker B`
-- Phase 1 不要求跨录音复用同一个匿名标签
-- Phase 1 识别已知目标人物，并将识别结果挂到说话片段和转写片段上
-- Phase 1 页面保持后台风格，优先可用性，不追求复杂交互
+### 3.1 `.env`
 
-## 3. 阶段目标与验收口径
+项目使用 `.env` 作为本地运行配置文件。
 
-### 3.1 阶段目标
+主要配置项包括：
 
-当用户提供一条真实录音时，系统必须完成以下闭环：
+- 数据库：`DB_HOST`、`DB_PORT`、`DB_USER`、`DB_PASSWORD`、`DB_NAME`、`DB_ADMIN_DATABASE`、`DB_SSL`
+- 存储：`LOCAL_STORAGE_ROOT`、`PUBLIC_FILE_BASE_URL`
+- 启动期依赖：`AUDIO_DEPS_AUTO_INSTALL`
+- 模型缓存：`AUDIO_MODEL_CACHE_ROOT`
+- 任务调度：`EMBEDDED_WORKER_ENABLED`、`EMBEDDED_WORKER_CONCURRENCY`、`EMBEDDED_WORKER_INTERVAL_MS`、`EMBEDDED_WORKER_BATCH_SIZE`
+- ASR provider：`ASR_PROVIDER`
+- Whisper：`WHISPER_PYTHON_BIN`、`WHISPER_MODEL`、`WHISPER_LANGUAGE`、`WHISPER_INITIAL_PROMPT_CONFIG`
+- Qwen3-ASR：`QWEN_ASR_*`
+- SenseVoice：`SENSEVOICE_*`
+- Paraformer：`PARAFORMER_*`
+- HF Whisper/BELLE：`HF_WHISPER_*`
+- pyannote：`PYANNOTE_PYTHON_BIN`、`PYANNOTE_AUTH_TOKEN`
+- SpeechBrain：`SPEECHBRAIN_PYTHON_BIN`
+- 文本校正：`TRANSCRIPTION_CORRECTION_ENABLED`、`LLM_CORRECTION_ENABLED`、`LLM_CORRECTION_*`
+- utterance 合并阈值：`UTTERANCE_MAX_DURATION_MS`、`UTTERANCE_MAX_TEXT_CHARS`、`UTTERANCE_LLM_MERGE_*`
 
-1. 上传文件
-2. 创建录音记录
-3. 创建处理任务
-4. 异步执行转写
-5. 异步执行 speaker diarization
-6. 将说话片段与转写片段对齐
-7. 对说话片段与目标人物参考样本做比对
-8. 保存完整文本、时间戳片段、说话人标签和目标人物识别结果
-9. 在页面中查看录音、转写结果、说话人结构和目标人物命中信息
+运行 `npm` 命令前，本地建议先执行：
 
-### 3.2 验收标准
+```bash
+source ~/.bash_profile
+```
 
-- 用户可以在 Web 页面上传一条或多条录音
-- 上传成功后，录音管理页中可见新记录
-- 每条录音有明确状态，如 `uploaded`、`processing`、`completed`、`failed`
-- 转写完成后，录音详情页展示完整转写文本
-- 详情页展示带时间范围的基础分段
-- 详情页展示 `Speaker A / B / C` 等匿名说话人标签
-- 用户可以录入至少一个目标人物参考样本
-- 录音处理完成后，详情页展示目标人物疑似命中片段和置信度
-- 失败任务在页面中可见，并带错误信息
+### 3.2 全局配置
 
-## 4. 页面清单
+`lib/config/app-config.ts` 会把环境变量解析成统一的 `AppConfig`，并通过 `setGlobalAppConfig()` 写入：
 
-### 4.1 录音管理页
+- `globalThis.__aiRecordSummaryConfig`
+- `process.env.AI_RECORD_SUMMARY_CONFIG`
+
+worker thread 启动时会把完整配置通过环境变量注入子线程，确保 worker 内也能访问数据库、模型路径、Python binary、HuggingFace token 和任务参数。
+
+### 3.3 数据库初始化
+
+`lib/db/init.ts` 在 server 初始化阶段自动执行：
+
+1. 使用 admin 连接检查 `DB_NAME` 是否存在
+2. 不存在时自动创建数据库
+3. 连接业务数据库
+4. 执行 `sql/base.sql`
+5. 创建或补齐所有 Phase 1 表、索引和兼容字段
+
+本地首次启动应用时，不需要手动建库建表。
+
+如果需要清空当前数据库中的表，可以使用：
+
+```bash
+source ~/.bash_profile
+npm run db:drop-tables -- --confirm airecord --yes
+npm run db:init
+```
+
+`db:drop-tables` 只删除 `.env` 当前连接的数据库中 `public` schema 下的表，不删除数据库本身。
+
+### 3.4 音频依赖初始化
+
+`scripts/install_audio_dependencies.sh` 会在应用启动阶段由 `ensureAudioDependencies()` 调用。
+
+脚本行为：
+
+- 创建或复用 `.venv-audio`
+- 仅在首次创建 venv 时升级 `pip`、`setuptools`、`wheel`
+- 默认使用阿里云 PyPI 镜像源
+- 如果系统没有 `ffmpeg`，使用 `imageio-ffmpeg` 在 venv 中创建 ffmpeg wrapper
+- 安装或检查 `torch`
+- 按 `ASR_PROVIDER` 安装对应 ASR 依赖
+- 安装或检查 `pyannote.audio`
+- 安装或检查 `speechbrain`
+- 安装或检查 `pycorrector`
+- 当 `LLM_CORRECTION_ENABLED=true` 时，安装 `llama-cpp-python` 并下载 GGUF 模型到项目内缓存
+
+## 4. ASR Provider
+
+Phase 1 当前支持多个 ASR provider，通过 `ASR_PROVIDER` 切换：
+
+- `whisper`
+- `sensevoice`
+- `paraformer`
+- `hf_whisper`
+- `qwen_asr`
+
+### 4.1 Qwen3-ASR
+
+当前主要推荐路线：
+
+```env
+ASR_PROVIDER=qwen_asr
+QWEN_ASR_MODEL=Qwen/Qwen3-ASR-1.7B
+QWEN_ASR_USE_OWN_SEGMENTS=false
+```
+
+Qwen3-ASR 实测识别质量较好，但自身长音频分片不稳定，因此当前实现固定使用：
+
+```text
+fsmn-vad 分段 -> Qwen3-ASR 逐段转写
+```
+
+Qwen3-ASR 支持 `context`，项目会从 `config/initial-prompt.json` 中读取 `terms`、`phrases`、`people`、`notes`，构造带领域说明的上下文提示。
+
+如果本地 HuggingFace 缓存中已经有完整模型快照，Qwen provider 会自动启用 HuggingFace 离线模式，避免每次启动时访问远端 metadata。
+
+### 4.2 SenseVoiceSmall
+
+`sensevoice` provider 使用 FunASR `FunAudioLLM/SenseVoiceSmall`。
+
+当前实现：
+
+- 使用 `fsmn-vad` 做语音活动检测
+- 对 VAD 片段做可配置合并
+- 逐段调用 SenseVoiceSmall
+- 支持 `SENSEVOICE_LANGUAGE=auto`
+- 支持 `SENSEVOICE_USE_ITN=true`
+
+SenseVoiceSmall 是当前效果很稳的备选路线。
+
+### 4.3 Paraformer
+
+`paraformer` provider 使用 FunASR `paraformer-zh`。
+
+当前实现：
+
+- 使用 `fsmn-vad`
+- 使用 `ct-punc-c`
+- 显式指定 `model_revision=v2.0.4`
+- 支持从 `config/initial-prompt.json` 读取 `terms + protectTerms` 作为 hotword
+
+### 4.4 HF Whisper / BELLE Whisper
+
+`hf_whisper` provider 用于 HuggingFace Whisper 类模型，例如 BELLE 中文微调模型。
+
+当前实现：
+
+- 使用 Transformers pipeline
+- 使用 `fsmn-vad` 先分段
+- 逐段转写
+- 支持指定语言
+
+### 4.5 OpenAI Whisper
+
+`whisper` provider 使用 `openai-whisper`。
+
+当前实现保留 Whisper 原始输出能力，但 Whisper large-v3 在部分中文录音中容易出现重复幻觉，因此当前不作为默认推荐路线。
+
+## 5. 页面能力
+
+### 5.1 录音列表页
 
 路径：
 
 - `/recordings`
 
-用途：
+能力：
 
-- 作为后台默认入口页
-- 提供上传入口
-- 展示录音列表和处理状态
-- 进入录音详情
+- 批量上传录音
+- 上传后调用后端 API 创建录音记录和初始任务
+- 展示录音列表
+- 展示录音处理状态
+- 展示所有处理链路累计耗时
+- 支持状态筛选
+- 支持进入详情页
+- 支持删除录音
 
-核心内容：
+删除录音时，系统会同时清理：
 
-- 上传按钮
-- 状态筛选
-- 录音列表
-- 状态统计卡片
+- `recordings` 及级联关联数据
+- 本地上传文件
+- 内存中的实时进度
 
-列表字段：
-
-- 标题或文件名
-- 音频时长
-- 上传时间
-- 当前状态
-- 最近更新时间
-
-交互：
-
-- 点击进入详情页
-- 支持基础状态筛选
-- 支持分页，每页 10 条
-
-### 4.2 录音详情页
+### 5.2 录音详情页
 
 路径：
 
 - `/recordings/[id]`
 
-用途：
+能力：
 
-- 查看单条录音的完整处理结果
+- 展示音频播放器
+- 展示录音基础信息
+- 展示任务状态表
+- 在任务状态表中展示实时进度百分比
+- 展示失败任务的精简错误信息
+- hover 错误信息时展示完整异常
+- 支持失败任务重试
+- 支持已完成的文本校正任务重新执行
+- 支持已完成的目标人物识别任务重新执行
+- 优先展示 `utterance_segments`
+- 展示原始完整转写
+- 展示原始转写分段
+- 展示 speaker diarization 分段
+- 展示目标人物命中结果
 
-核心内容：
+详情页中的文本展示分为两层：
 
-- 音频播放器
-- 录音基本信息
-- 当前处理状态
-- 完整转写文本
-- 转写分段列表
-- 说话人分段列表
-- 目标人物命中结果
+- 原始层：`transcriptions` 和 `transcription_segments`，保留 ASR 原始输出
+- 展示层：`utterance_segments`，保存合并、规则替换、pycorrector、LLM 校正和 LLM 语义合并后的结果
 
-展示要求：
-
-- 每段显示 `start_time - end_time`
-- 每段显示对应文本
-- 每段显示对应 `speaker_label`
-- 命中目标人物的片段显示高亮或标记
-
-### 4.3 目标人物管理页
+### 5.3 目标人物管理页
 
 路径：
 
 - `/speaker-profiles`
 
-用途：
+能力：
 
-- 管理目标人物参考样本
+- 新建目标人物
+- 上传目标人物参考音频样本
+- 展示样本列表
+- 删除目标人物
 
-核心内容：
+删除目标人物时，系统会同时清理：
 
-- 目标人物名称
-- 参考音频样本上传入口
-- 样本列表
-- 当前启用状态
+- `speaker_profiles`
+- `speaker_profile_samples`
+- 本地样本文件
 
-## 5. 数据模型
+## 6. 数据模型
 
-### 5.1 recording
+### 6.1 核心表
 
-用途：
+`recordings`
 
-- 保存录音基础信息和总体状态
+- 录音主表
+- 保存标题、文件名、本地存储路径、MIME 类型、文件大小、时长、整体状态和错误信息
 
-字段：
+`transcriptions`
 
-- `id`
-- `title`
-- `file_name`
-- `storage_path`
-- `mime_type`
-- `file_size_bytes`
-- `duration_seconds`
-- `status`
-- `error_message`
-- `uploaded_at`
-- `created_at`
-- `updated_at`
+- 整条录音的 ASR 转写结果
+- 保存语言、模型名称、完整原始文本和 segment 数量
 
-状态取值：
+`transcription_segments`
 
-- `uploaded`
-- `processing`
-- `completed`
-- `failed`
+- ASR 原始分段
+- 保存原始文本、开始时间、结束时间
+- speaker diarization 后会回写 speaker label、cluster id 和目标人物识别结果
+- 不保存 pycorrector、replacement 或 LLM 润色后的文本
 
-### 5.2 transcription
+`speaker_diarization_segments`
 
-用途：
+- pyannote 输出的说话人时间片段
+- 保存 speaker cluster、speaker label、时间范围和目标人物识别结果
 
-- 保存整条录音的转写结果
+`utterance_segments`
 
-字段：
+- Phase 1 的连续发言展示层
+- 基于 `transcription_segments` 和 diarization 对齐结果生成
+- 保存最终展示文本
+- 通过 `source_transcription_segment_ids` 记录来源 ASR segment
+- `merge_reason` 记录合并原因，例如 `same_speaker` 或 `llm_same_speaker_semantic_merge`
 
-- `id`
-- `recording_id`
-- `language`
-- `model_name`
-- `full_text`
-- `segment_count`
-- `created_at`
-- `updated_at`
+`speaker_profiles`
 
-### 5.3 transcription_segment
+- 目标人物主表
+- 保存目标人物名称、状态和备注
 
-用途：
+`speaker_profile_samples`
 
-- 保存转写后的时间片段
+- 目标人物参考样本表
+- 保存样本文件信息、处理状态和错误信息
 
-字段：
+`processing_jobs`
 
-- `id`
-- `recording_id`
-- `transcription_id`
-- `segment_index`
-- `start_ms`
-- `end_ms`
-- `text`
-- `speaker_label`
-- `speaker_cluster_id`
-- `speaker_confidence`
-- `is_target_person`
-- `target_person_confidence`
-- `created_at`
+- 后台任务表
+- 保存任务类型、状态、重试次数、错误信息、开始时间、结束时间和处理耗时
+- `processing_duration_ms` 会在任务成功或失败时落表
 
-说明：
+### 6.2 任务类型
 
-- `speaker_label` 用于页面展示 `Speaker A / B / C`
-- `speaker_cluster_id` 用于内部标识同一条录音中的同一说话人
-- `speaker_confidence` 用于标记 diarization 结果可信度
+`processing_jobs.job_type` 当前支持：
 
-### 5.4 speaker_diarization_segment
+- `transcription`
+- `speaker_diarization`
+- `speaker_identification`
+- `text_correction`
 
-用途：
-
-- 保存 diarization 输出的原始说话片段
-
-字段：
-
-- `id`
-- `recording_id`
-- `speaker_cluster_id`
-- `speaker_label`
-- `start_ms`
-- `end_ms`
-- `confidence`
-- `is_target_person`
-- `target_person_confidence`
-- `matched_speaker_profile_id`
-- `created_at`
-
-说明：
-
-- 这张表保存“谁在什么时间段说话”
-- `transcription_segment` 保存“哪段文本对应哪个说话人”
-
-### 5.5 speaker_profile
-
-用途：
-
-- 保存目标人物基础信息
-
-字段：
-
-- `id`
-- `display_name`
-- `status`
-- `notes`
-- `created_at`
-- `updated_at`
-
-### 5.6 speaker_profile_sample
-
-用途：
-
-- 保存目标人物参考音频样本
-
-字段：
-
-- `id`
-- `speaker_profile_id`
-- `file_name`
-- `storage_path`
-- `mime_type`
-- `file_size_bytes`
-- `duration_seconds`
-- `status`
-- `error_message`
-- `created_at`
-- `updated_at`
-
-### 5.7 processing_job
-
-用途：
-
-- 保存后台处理任务状态
-
-字段：
-
-- `id`
-- `recording_id`
-- `job_type`
-- `status`
-- `attempt_count`
-- `error_message`
-- `started_at`
-- `finished_at`
-- `created_at`
-- `updated_at`
-
-取值：
-
-- `job_type`: `transcription`、`speaker_diarization`、`speaker_identification`
-- `status`: `pending`、`running`、`completed`、`failed`
-
-## 6. 存储设计
-
-### 6.1 音频文件存储
-
-Phase 1 使用以下两种存储策略之一：
-
-- 开发环境使用本地文件存储
-- 生产环境使用对象存储
-
-数据库中保存相对路径或对象存储 key。
-
-### 6.2 数据库存储
-
-Phase 1 使用：
-
-- `PostgreSQL`
-
-## 7. 工具与处理步骤说明
-
-### 7.1 工具分工
-
-Phase 1 的语音处理链路使用以下工具：
-
-- `Whisper`：负责转写和时间戳输出
-- `pyannote.audio`：负责 speaker diarization
-- `SpeechBrain`：负责目标人物识别
-
-职责边界如下：
-
-- `Whisper` 负责“这段音频说了什么”
-- `pyannote.audio` 负责“这段音频是谁在说”
-- `SpeechBrain` 负责“这个说话人是不是目标人物”
-
-### 7.2 Speaker Diarization 的具体步骤
-
-speaker diarization 在 Phase 1 中按以下步骤执行：
-
-1. 输入整条录音到 `pyannote.audio`
-2. `pyannote.audio` 识别语音活动区间
-3. `pyannote.audio` 为每个语音区间提取说话人特征
-4. `pyannote.audio` 将相似说话人特征聚类
-5. 系统为聚类结果分配稳定匿名标签，如 `Speaker A`、`Speaker B`
-6. 系统输出每个说话片段的时间范围、`speaker_cluster_id`、`speaker_label` 和置信度
-
-### 7.3 具体到每一步由什么工具负责
-
-#### 1. 语音活动区间识别
-
-这一步使用：
-
-- `pyannote.audio`
-
-职责：
-
-- 找出录音中哪些时间段存在语音
-- 过滤明显静音区间和无效区间
-
-输出：
-
-- 一组带开始时间和结束时间的语音区间
-
-#### 2. 说话人特征提取
-
-这一步使用：
-
-- `pyannote.audio`
-
-职责：
-
-- 为每个语音区间提取 speaker embedding
-- speaker embedding 表示该片段的音色和说话特征，而不是文本语义
-
-输出：
-
-- 每个语音区间对应的说话人特征向量
-
-#### 3. 说话人聚类
-
-这一步使用：
-
-- `pyannote.audio`
-
-职责：
-
-- 将相似说话人特征归为同一类
-- 形成单条录音内的说话人 cluster
-
-输出：
-
-- `speaker_cluster_id`
-- 每个 cluster 对应的多个时间片段
-
-#### 4. 匿名标签分配
-
-这一步由应用层完成。
-
-职责：
-
-- 将 cluster 映射为页面可展示的 `Speaker A`、`Speaker B`、`Speaker C`
-- 保证同一条录音内标签稳定
-
-输出：
-
-- `speaker_label`
-
-#### 5. 转写片段与说话片段对齐
-
-这一步由应用层完成。
-
-职责：
-
-- 将 `Whisper` 产出的转写片段和 `pyannote.audio` 产出的说话片段按时间范围对齐
-- 为每个转写片段补上 `speaker_label`、`speaker_cluster_id` 和 `speaker_confidence`
-
-输出：
-
-- 带说话人标签的 `transcription_segment`
-
-#### 6. 目标人物识别
-
-这一步使用：
-
-- `SpeechBrain`
-
-职责：
-
-- 将 diarization 后的说话片段与目标人物参考样本做相似度比对
-- 判断该说话片段是否属于目标人物
-
-输出：
-
-- `is_target_person`
-- `target_person_confidence`
-- `matched_speaker_profile_id`
-
-### 7.4 为什么 Phase 1 采用这套组合
-
-原因如下：
-
-- `Whisper` 负责转写，适合输出文本和时间戳
-- `pyannote.audio` 直接负责 diarization，不需要 Phase 1 自己拆出单独的 VAD、embedding 和 clustering 工具
-- `SpeechBrain` 更适合处理已知目标人物的声纹比对
-
-这意味着 Phase 1 的实现不是手动拼装多个独立模型，而是：
-
-- 用 `Whisper` 完成转写
-- 用 `pyannote.audio` 完成 diarization 全流程
-- 用 `SpeechBrain` 完成目标人物识别
-
-## 8. API
-
-### 8.1 上传录音
-
-- 方法：`POST`
-- 路径：`/api/recordings`
-
-职责：
-
-- 接收上传文件
-- 保存文件
-- 创建 `recording`
-- 创建 `processing_job`
-
-### 8.2 查询录音列表
-
-- 方法：`GET`
-- 路径：`/api/recordings`
-
-职责：
-
-- 返回录音列表和基础状态信息
-
-查询参数：
-
-- `status`
-- `page`
-- `pageSize`
-
-### 8.3 查询录音详情
-
-- 方法：`GET`
-- 路径：`/api/recordings/:id`
-
-职责：
-
-- 返回单条录音的元数据、状态、转写内容、转写分段、说话人分段和目标人物识别结果
-
-### 8.4 查询任务状态
-
-- 方法：`GET`
-- 路径：`/api/jobs/:id`
-
-职责：
-
-- 返回后台任务状态
-
-### 8.5 创建目标人物
-
-- 方法：`POST`
-- 路径：`/api/speaker-profiles`
-
-职责：
-
-- 创建目标人物基础信息
-
-### 8.6 上传目标人物参考样本
-
-- 方法：`POST`
-- 路径：`/api/speaker-profiles/:id/samples`
-
-职责：
-
-- 上传参考音频样本
-- 保存样本文件
-- 关联到目标人物
-
-### 8.7 查询目标人物列表
-
-- 方法：`GET`
-- 路径：`/api/speaker-profiles`
-
-职责：
-
-- 返回目标人物及样本状态
-
-## 9. 后台任务流程
-
-### 9.1 总体处理链路
-
-1. 用户上传音频文件
-2. 服务端保存文件
-3. 写入 `recording`
-4. 写入处理任务
-5. Worker 拉取待处理任务
-6. 调用 Whisper 执行转写
-7. 保存 `transcription`
-8. 调用 speaker diarization 模型输出说话片段
-9. 保存 `speaker_diarization_segment`
-10. 将 diarization 结果与转写片段对齐
-11. 对每个说话片段与目标人物参考样本做比对
-12. 将 `speaker_label`、目标人物识别结果回写到 `transcription_segment`
-13. 更新 `recording.status = completed`
-14. 更新处理任务状态为 `completed`
-
-### 9.2 Speaker Diarization 流程说明
-
-speaker diarization 的目标是回答一句话：
-
-- 录音里的每一段话是谁在说
-
-Phase 1 的 diarization 流程如下：
-
-1. 输入整条录音
-2. 模型识别语音活动区间，过滤纯静音片段
-3. 模型提取每个语音区间的说话人特征
-4. 将相似的说话片段聚成同一个 speaker cluster
-5. 为每个 cluster 分配稳定匿名标签，如 `Speaker A`、`Speaker B`
-6. 输出每个说话片段的开始时间、结束时间、`speaker_cluster_id`、`speaker_label`
-7. 再将这些说话片段与 Whisper 的转写片段对齐，得到“这段文本是谁说的”
-
-说明：
-
-- diarization 先解决“区分不同人”
-- 目标人物识别再解决“其中哪个人是已知目标人物”
-- 这两个流程必须串联，而不是二选一
-
-### 9.3 转写输出要求
-
-Whisper 输出必须保留：
-
-- 完整文本
-- 片段级文本
-- 每段开始时间
-- 每段结束时间
-- 使用的模型名称
-
-### 9.4 Diarization 输出要求
-
-diarization 输出必须保留：
-
-- `speaker_cluster_id`
-- `speaker_label`
-- 每段开始时间
-- 每段结束时间
-- `confidence`
-
-### 9.5 目标人物识别输出要求
-
-目标人物识别输出必须保留：
-
-- 是否命中目标人物
-- 命中片段对应的时间范围
-- 每个片段的置信度
-- 命中的目标人物 ID
-
-### 9.6 Worker 设计
-
-Phase 1 使用独立 worker 进程处理后台任务。
-
-要求：
-
-- Web 请求不直接同步执行转写、diarization 或识别
-- Worker 可单独运行
-- Worker 出错后可以定位问题
-- 没有有效目标人物样本时，系统跳过目标人物识别并记录状态
-
-## 10. 前端实现
-
-### 10.1 页面结构
-
-页面结构固定为：
-
-- `/recordings`
-- `/recordings/[id]`
-- `/speaker-profiles`
-
-### 10.2 UI 优先级
-
-第一阶段优先保证：
-
-- 信息清楚
-- 状态可见
-- 操作路径短
-- 目标人物命中结果清晰可审阅
-- 说话人标签清晰可审阅
-
-### 10.3 状态展示
+### 6.3 状态类型
 
 录音状态：
 
@@ -646,125 +335,360 @@ Phase 1 使用独立 worker 进程处理后台任务。
 - `completed`
 - `failed`
 
-目标人物识别结果状态：
+任务状态：
 
-- `matched`
-- `not_matched`
-- `low_confidence`
+- `pending`
+- `running`
+- `completed`
+- `failed`
 
-## 11. 目录与模块
+## 7. 后台任务流
 
-- `app/`：页面与路由
-- `components/`：页面组件
-- `lib/db/`：数据库访问
-- `lib/storage/`：文件存储封装
-- `lib/transcription/`：Whisper 调用封装
-- `lib/diarization/`：speaker diarization 封装
-- `lib/speaker-identification/`：目标人物识别封装
-- `lib/jobs/`：任务调度与 worker 逻辑
-- `lib/types/`：公共类型定义
+### 7.1 上传触发
 
-## 12. 实施顺序
+用户上传录音后，`POST /api/recordings` 会：
 
-1. 建立项目基础骨架和页面路由
-2. 完成数据库表结构
-3. 完成目标人物和参考样本数据结构
-4. 完成文件上传与录音入库
-5. 完成录音管理页、详情页和目标人物管理页
-6. 完成后台任务模型和 worker
-7. 接入 Whisper 转写
-8. 接入 speaker diarization
-9. 完成转写片段与说话片段对齐
-10. 接入目标人物识别
-11. 完成结果落库与页面展示
-12. 补充错误处理和状态展示
+1. 保存上传文件到本地存储
+2. 创建 `recordings` 记录
+3. 创建初始 `transcription` 任务
+4. 发送 PostgreSQL `notify processing_jobs`
+5. 触发内嵌 scheduler 尝试消费任务
 
-## 13. 风险与注意事项
+### 7.2 调度器
 
-### 13.1 长音频处理时长
+后台任务不需要单独运行 `npm run worker`。
 
-风险：
+应用启动后，`startEmbeddedJobScheduler()` 会启动内嵌调度器。调度器负责：
 
-- 长录音处理时间长，用户容易误以为系统卡住
+- 监听 PostgreSQL `processing_jobs` 通知
+- 定时轮询兜底
+- 维护 worker thread pool
+- 根据空闲 worker 数量拉取 pending job
+- 避免同一录音被多个 worker 同时处理
+- 在任务完成后继续 drain 下一批任务
 
-应对：
+并发由 `EMBEDDED_WORKER_CONCURRENCY` 控制。
 
-- 明确展示处理中状态
-- 页面轮询状态
+### 7.3 并发与防重复
 
-### 13.2 音频格式兼容问题
+当前任务领取逻辑有三层保护：
 
-风险：
+- scheduler 内存中的 `activeRecordingIds`
+- 数据库查询使用 `for update skip locked`
+- 数据库事务内使用 advisory lock
 
-- 用户上传的录音格式不统一
+这样可以避免多个 worker 同时取到同一条录音的任务。
 
-应对：
+### 7.4 任务链路
 
-- Phase 1 限制支持格式
-- 对不支持格式直接返回错误
+完整链路如下：
 
-### 13.3 转写质量不稳定
+1. `transcription`
+   - 调用当前 `ASR_PROVIDER`
+   - 保存 `transcriptions`
+   - 保存原始 `transcription_segments`
+   - 创建下一步 `speaker_diarization`
 
-风险：
+2. `speaker_diarization`
+   - 调用 pyannote
+   - 自动探测设备：`cuda -> mps -> cpu`
+   - 保存 `speaker_diarization_segments`
+   - 将 diarization 与 ASR segment 按时间对齐
+   - 生成未校正的 `utterance_segments`
+   - 创建下一步 `speaker_identification`
 
-- 噪音、多说话人、低质量录音会影响转写结果
+3. `speaker_identification`
+   - 调用 SpeechBrain
+   - 使用目标人物样本做声纹比对
+   - 按说话人聚类聚合可用音频后再识别
+   - 回写 diarization、transcription segment 和 utterance 的目标人物命中结果
+   - 创建下一步 `text_correction`
 
-应对：
+4. `text_correction`
+   - 重新生成 `utterance_segments`
+   - 对 utterance 文本执行 pycorrector、规则替换和本地 LLM 校正
+   - 生成同 speaker 相邻候选组
+   - 使用本地 LLM 做受限语义合并和断句
+   - 校验 LLM 输出的 sourceIds、顺序和连续性
+   - 再执行一次 replacements
+   - 完成后将录音状态置为 `completed`
 
-- 先接受基础可用
-- 用真实数据迭代模型和预处理策略
+## 8. 说话人分离与目标人物识别
 
-### 13.4 Diarization 误分
+### 8.1 pyannote speaker diarization
 
-风险：
+pyannote 通过 `.venv-audio/bin/python` 执行 `run_pyannote.py`。
 
-- 重叠说话、短语音、噪音会导致说话人分段不准
+当前实现：
 
-应对：
+- 需要 `PYANNOTE_AUTH_TOKEN`
+- HuggingFace 账号需要接受相关 gated model 的使用条件
+- 音频会先用 ffmpeg 转为 16k mono waveform
+- waveform 会预加载到内存，避免 torchcodec/ffmpeg 动态库兼容问题
+- 自动探测设备：`cuda -> mps -> cpu`
+- `pipeline.to(device)`
+- waveform 也会移动到同一个 device
+- stderr 会打印实际使用设备，例如 `pyannote device: mps`
 
-- 页面展示匿名说话人和置信度
-- 后续阶段再补人工修正能力
+### 8.2 SpeechBrain 目标人物识别
 
-### 13.5 目标人物识别误判
+SpeechBrain 用于把 diarization 片段和目标人物参考样本做相似度比对。
 
-风险：
+当前模型：
 
-- 样本质量和场景差异会导致误判或漏判
+- `speechbrain/spkrec-ecapa-voxceleb`
 
-应对：
+当前策略：
 
-- 展示置信度
-- 不把识别结果展示成绝对结论
-- 优先使用清晰参考样本
+- 不再逐个极短 diarization segment 独立识别
+- 先按 speaker cluster 聚合可用音频
+- 过滤过短片段
+- 最多取一定时长做目标人物比对
+- 识别结果回写到该 speaker cluster 下的相关片段
 
-## 14. Phase 1 完成定义
+模型缓存位于项目内 `model-cache`，不是项目根目录的 `pretrained_models`。
 
-满足以下条件时，Phase 1 完成：
+## 9. 文本校正、替换与 LLM 合并
 
-- 可以上传真实录音并成功保存
-- 可以看到录音列表和状态变化
-- 可以异步完成转写
-- 可以异步完成 speaker diarization
-- 可以在详情页看到完整文本和时间戳分段
-- 可以在详情页看到 `Speaker A / B / C` 标签
-- 可以管理目标人物参考样本
-- 可以看到目标人物命中片段和置信度
-- 失败情况可见且可定位
+Phase 1 当前把文本后处理作为必要链路，而不是可选增强。
 
-## 15. Phase 2 入口
+文本校正只写入 `utterance_segments`，不会覆盖 ASR 原始分段。
 
-Phase 1 稳定后，下一阶段进入：
+处理顺序：
 
-- chunk 切分优化
+1. pycorrector
+2. replacements / regexReplacements
+3. 本地 LLM 单段润色
+4. replacements / regexReplacements
+5. 本地 LLM 对同 speaker 候选组做语义合并和断句
+6. replacements / regexReplacements
+
+### 9.1 配置文件
+
+配置文件：
+
+- `config/initial-prompt.json`
+
+主要字段：
+
+- `intro`：ASR 初始提示的开头说明
+- `prompt`：ASR 上下文说明
+- `terms`：给 ASR context 或 hotword 使用的专业词
+- `protectTerms`：给 pycorrector 白名单和部分 provider hotword 使用的保护词
+- `llmTerms`：预留给本地 LLM 校正使用的专业词
+- `phrases`：固定表达或上下文提示
+- `people`：人名
+- `notes`：其他提示
+- `llmCorrection.system`：本地 LLM 单段润色 system prompt
+- `llmCorrection.userTemplate`：本地 LLM 单段润色 user prompt
+- `llmCorrection.mergeSystem`：本地 LLM 合并断句 system prompt
+- `llmCorrection.mergeUserTemplate`：本地 LLM 合并断句 user prompt
+- `replacements`：确定性字符串替换
+- `regexReplacements`：正则替换
+
+### 9.2 pycorrector
+
+pycorrector 用于基础中文纠错。
+
+如果 pycorrector 或其可选依赖不可用，系统会回退到原文本和规则替换，不会让整个任务失败。
+
+### 9.3 规则替换
+
+规则替换用于处理确定性的专业词错误，例如：
+
+- 同音错字
+- 英文缩写规范化
+- 专业名词统一
+- 人名或产品名统一
+
+replacements 会在 LLM 单段润色后和 LLM 合并后再次执行，避免 LLM 把确定性替换结果改回去。
+
+### 9.4 本地 LLM 单段润色
+
+本地 LLM 用于处理“文本语义不通，但能根据上下文和专业词表判断”的场景。
+
+当前实现：
+
+- 使用 `llama-cpp-python`
+- 使用 GGUF 模型
+- 模型下载到 `model-cache/llm-correction`
+- 当前默认模型配置为 `Qwen/Qwen2.5-7B-Instruct-GGUF`
+- 支持多分片 GGUF 文件
+- 自动检测 `llama.cpp` 是否支持 GPU/Metal offload
+- 支持时设置 `n_gpu_layers=-1`
+- 不支持时回退 CPU
+
+### 9.5 LLM 语义合并与断句
+
+LLM 语义合并发生在 `text_correction` job 的末段。
+
+代码先生成安全候选组，LLM 只在候选组内判断是否合并。
+
+候选规则可配置：
+
+- `UTTERANCE_LLM_MERGE_MAX_GAP_MS`
+- `UTTERANCE_LLM_MERGE_MAX_DURATION_MS`
+- `UTTERANCE_LLM_MERGE_MAX_TEXT_CHARS`
+
+默认规则：
+
+- 同 speaker
+- 不跨目标人物识别边界
+- 相邻 gap 不超过 1200ms
+- 合并后总时长不超过 20000ms
+- 合并后文本不超过 300 字
+
+LLM 输出必须满足：
+
+- 所有 sourceIds 必须来自输入
+- 不能遗漏、重复或改变 sourceIds 顺序
+- 每个 group 的 sourceIds 必须连续
+- 不能跨 speaker
+- text 不能为空
+
+校验失败时，会回退到单段润色结果。
+
+## 10. 进度、耗时、错误与重试
+
+### 10.1 进度
+
+进度不落表。
+
+worker thread 会把实时进度发送给主线程，主线程写入内存中的 progress store。前端通过：
+
+- `GET /api/recordings/[id]/progress`
+
+轮询获取当前录音进度。
+
+详情页任务状态表中展示进度百分比，不展示底层模型名、frame 数或具体技术实现。
+
+### 10.2 处理耗时
+
+任务处理耗时会落表到：
+
+- `processing_jobs.processing_duration_ms`
+
+任务成功或失败时，应用根据 `started_at` 和 `finished_at` 计算耗时。
+
+录音列表页展示的是同一条录音所有处理链路累计耗时。
+
+### 10.3 错误展示
+
+后台会记录任务失败错误。
+
+前端展示策略：
+
+- 默认只展示精简错误
+- hover 时通过 tooltip 展示完整异常
+- HuggingFace token 等敏感信息会在日志和错误信息中脱敏
+
+### 10.4 重试
+
+重试入口：
+
+- `POST /api/jobs/[id]/retry`
+
+支持：
+
+- 失败任务重试
+- 已完成 `text_correction` 任务重新执行
+- 已完成 `speaker_identification` 任务重新执行
+
+已完成校正任务可以重试，是为了让用户调整 `terms`、`phrases`、`replacements` 或 LLM prompt 后重新生成最终展示文本。
+
+## 11. API 清单
+
+录音：
+
+- `POST /api/recordings`
+- `GET /api/recordings/[id]`
+- `POST /api/recordings/[id]/delete`
+- `GET /api/recordings/[id]/progress`
+
+任务：
+
+- `GET /api/jobs/[id]`
+- `POST /api/jobs/[id]/retry`
+
+目标人物：
+
+- `POST /api/speaker-profiles`
+- `POST /api/speaker-profiles/[id]/samples`
+- `POST /api/speaker-profiles/[id]/delete`
+
+文件访问：
+
+- `GET /uploads/[...path]`
+
+## 12. 目录结构
+
+音频转码与分析相关代码集中在：
+
+- `lib/audio-transcoding-analysis`
+
+子目录：
+
+- `transcription`：ASR provider 分发、prompt/context 拼装
+- `transcription/providers/whisper`：OpenAI Whisper provider
+- `transcription/providers/sensevoice`：SenseVoiceSmall provider
+- `transcription/providers/paraformer`：Paraformer provider
+- `transcription/providers/hf-whisper`：HuggingFace Whisper/BELLE provider
+- `transcription/providers/qwen-asr`：Qwen3-ASR provider
+- `diarization`：pyannote speaker diarization
+- `speaker-identification`：SpeechBrain 目标人物识别
+- `text-correction`：pycorrector、规则替换、本地 LLM 润色和 LLM 合并
+- `jobs`：内嵌 scheduler、任务处理、worker thread、进度 store
+- `runtime`：Python 运行环境、依赖检查和 JSON 执行工具
+- `scripts`：非 ASR provider 专属的 Python 脚本
+
+其他关键目录：
+
+- `app/api`：后端 API routes
+- `app/recordings`：录音列表和详情页
+- `app/speaker-profiles`：目标人物管理页
+- `config`：ASR context 和文本校正配置
+- `sql`：数据库 schema
+- `scripts`：启动期依赖安装、数据库初始化、模型下载辅助脚本
+- `uploads`：本地上传文件
+- `model-cache`：本地模型缓存
+
+## 13. 验收标准
+
+Phase 1 当前验收口径：
+
+- 首次启动应用时，可以自动检查并创建 PostgreSQL 数据库和表
+- 首次启动应用时，可以自动准备 `.venv-audio` 和音频分析依赖
+- 用户可以批量上传录音
+- 上传后每条录音都会自动创建 `transcription` 任务
+- 后台 scheduler 可以自动消费任务，不需要单独运行 worker 命令
+- 多个录音可以通过 worker thread pool 并发处理
+- 同一录音不会被多个 worker 重复处理
+- 录音详情页可以看到任务状态和进度百分比
+- 录音列表页可以看到整条录音累计处理耗时
+- ASR 原始转写会保存到 `transcriptions` 和 `transcription_segments`
+- pyannote 结果会保存到 `speaker_diarization_segments`
+- 目标人物识别结果会回写到相关分段
+- 文本校正最终结果只保存到 `utterance_segments`
+- LLM 可以在受限候选组内做同 speaker 语义合并和断句
+- 失败任务可以重试
+- 已完成文本校正任务可以重试
+- 已完成目标人物识别任务可以重试
+- 录音删除会清理数据库和本地录音文件
+- 目标人物删除会清理数据库和本地样本文件
+
+## 14. Phase 1 暂不处理
+
+以下能力不属于当前 Phase 1：
+
 - 全文检索
 - 向量检索
-- 搜索结果页
-- 基于检索结果的问答
-- 跨录音统一说话人身份管理
+- pgvector、Milvus 或 Qdrant 接入
+- 跨录音统一说话人身份
+- AI 总结
+- AI 问答
+- LangGraph 工作流
+- 多用户权限
+- 云端对象存储
+- 生产级任务队列
 
-进入 Phase 2 前必须确认：
-
-- 真实录音转写质量满足基础要求
-- diarization 结果达到可用水平
-- 目标人物识别准确率达到可用水平
-- 当前表结构满足检索扩展
+这些能力可以进入 Phase 2 或后续阶段设计。
