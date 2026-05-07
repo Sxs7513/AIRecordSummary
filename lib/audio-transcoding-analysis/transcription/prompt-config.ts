@@ -102,7 +102,7 @@ export async function loadQwenAsrContext(configPath: string, maxItems: number, e
     return selected;
   };
 
-  const terms = take(cleanItems(config.terms));
+  const terms = take(cleanItems(config.protectTerms));
   const phrases = take(cleanItems(config.phrases));
   const people = take(cleanItems(config.people));
   const notes = take(cleanItems(config.notes));
@@ -112,8 +112,8 @@ export async function loadQwenAsrContext(configPath: string, maxItems: number, e
     "这是半导体、光电子、材料物理相关的技术讨论。以下内容是可能出现的专业术语、人名或固定表达，仅在语音和上下文匹配时优先采用，不要主动补充未出现的信息。",
     terms.length > 0 ? `专业术语：${terms.join("、")}` : "",
     phrases.length > 0 ? `固定表达：${phrases.join("、")}` : "",
-    people.length > 0 ? `人名：${people.join("、")}` : "",
-    notes.length > 0 ? `其他提示：${notes.join("；")}` : ""
+    // people.length > 0 ? `人名：${people.join("、")}` : "",
+    // notes.length > 0 ? `其他提示：${notes.join("；")}` : ""
   ].filter(Boolean);
 
   if (sections.length === 1 && sections[0] === extraContext.trim()) {

@@ -10,7 +10,7 @@ Phase 2 的目标是在 Phase 1 产物之上接入向量数据库和 RAG 能力�
 
 本阶段优先做“检索得到、总结可信、证据可回放”。考虑到用户 query 不可控，Phase 2 不能只做单一 `query embedding -> vector topK -> answer` 链路，还需要引入 LLM router、证据充分性判断、必要时二次检索以及回答引用校验。
 
-第一版可以先用普通 TypeScript service 按 graph-like node 拆分实现；如果后续需要更多循环、checkpoint、多轮状态恢复，再把这些 node 迁移到 LangGraph。
+Phase 2 在线 RAG 编排使用 LangGraph 作为核心工作流引擎。LLM router、retrieval executor、evidence grader、answer generator、answer validator、query rewrite 和 answer rewrite 都作为 LangGraph node 实现，并通过 graph state 串联。
 
 ## 2. Phase 2 范围
 
@@ -26,6 +26,7 @@ Phase 2 的目标是在 Phase 1 产物之上接入向量数据库和 RAG 能力�
 - 支持非向量类问题，例如“最近两个音频都说了什么”“总结昨天的录音”
 - 支持证据不足时最多一次 query rewrite 和二次检索
 - 支持回答引用不合法时最多一次 answer rewrite
+- 使用 LangGraph 编排可重试 RAG 工作流、节点状态和条件分支
 - 默认使用本地开源大模型做总结实验
 - 预留 DeepSeek API provider，方便后续效果不够时切换
 - 返回模型总结、引用证据和多个相关录音片段
@@ -49,7 +50,6 @@ Phase 2 的目标是在 Phase 1 产物之上接入向量数据库和 RAG 能力�
 - 查询日志与点击日志
 - 支持按说话人、目标人物、日期范围、录音状态过滤
 - 支持“只检索不总结”的调试模式，调试入口可以先隐藏但 API 保留
-- LangGraph 接入，用于复杂循环、checkpoint 和多轮状态恢复
 
 ### 2.3 暂不做
 
@@ -118,8 +118,8 @@ Phase 2 需要把“embedding 模型”和“总结模型”拆成两个 provide
 
 MVP 默认：
 
-- embedding：本地 `Qwen/Qwen3-Embedding-0.6B`
-- answer：本地 `Qwen3-8B`
+- embedding：本地 `Qwen/Qwen3-Embedding-4B`
+- answer：本地 `Qwen3.5-9B Q8_0 GGUF`
 
 后续如果本地开源模型效果不够，再把 answer provider 切到 DeepSeek API。业务层不直接耦合具体模型。
 
@@ -135,6 +135,8 @@ MVP 默认：
 - “上周跟张三相关的会议有什么风险”
 
 这些问题首先需要确定录音范围、时间范围、人物范围或对比对象，再决定是否需要片段级向量检索。因此在线查询链路必须增加 LLM router，把原始 query 转换为结构化 retrieval plan。
+
+人物检索先作为 retrieval plan 的一等约束预留。Router 可以识别用户 query 中的人物名，但第一版不直接把人名当成数据库过滤条件；后续会在 `routeQuery` 和 `retrieveEvidence` 之间增加 `resolvePeople` 节点，把 `personNames` 解析为已确认的 `speakerProfileIds`，再交给检索执行器。
 
 ### 3.8 先确定检索计划，再生成回答
 
@@ -154,22 +156,24 @@ query
 
 每个步骤都要输出结构化日志。模型可以建议检索计划、改写 query 或改写回答，但不能直接编造录音 ID、片段 ID 或引用来源。所有录音范围、片段范围和引用都必须由后端根据数据库结果生成。
 
-### 3.9 LangGraph 边界
+### 3.9 LangGraph 工作流编排
 
-Phase 2 可以先用普通 TypeScript 函数实现 graph-like nodes，保持依赖和调试简单。
+Phase 2 将 LangGraph 作为 RAG 查询链路的编排层。业务逻辑仍以可测试的 node 函数组织，但运行时由 LangGraph 负责节点串联、条件分支、重试上限和 graph state 传递。
 
-当出现以下需求时，建议迁移到 LangGraph：
+LangGraph 负责：
 
-- 证据不足后需要多轮 query rewrite 和重复检索
-- 引用校验失败后需要多轮 answer rewrite
-- 多个工具并行或条件调用
-- 多轮对话需要 checkpoint 和状态恢复
-- 需要持久化每个 node 的执行状态，便于审计和回放
+- 根据 router 结果进入不同 retrieval strategy
+- 在 evidence 不足时进入 query rewrite 分支
+- 在 answer validation 失败时进入 answer rewrite 分支
+- 控制 `retrievalAttempt` 和 `answerRewriteCount`，避免无限循环
+- 暴露每个 node 的结构化日志和中间状态，便于排查问题
+- 后续需要多轮对话或状态恢复时接入 checkpoint
 
-当前建议把 node 边界设计成可迁移形式：
+Graph node 边界：
 
 ```ts
 routeQuery(state) -> state
+resolvePeople(state) -> state
 retrieveEvidence(state) -> state
 gradeEvidence(state) -> state
 rewriteQuery(state) -> state
@@ -199,8 +203,8 @@ create extension if not exists pg_trgm;
 
 MVP 推荐本地 embedding provider：
 
-- 默认模型：`Qwen/Qwen3-Embedding-0.6B`
-- 默认维度：`1024`
+- 默认模型：`Qwen/Qwen3-Embedding-4B`
+- 默认维度：`2560`
 - Python 依赖：`sentence-transformers`
 
 推荐原因：
@@ -209,21 +213,18 @@ MVP 推荐本地 embedding provider：
 - 中文、英文和混合语义效果较稳
 - 适合录音转写文本这种口语化内容
 - 可本地运行，与 Phase 1 的本地模型策略一致
-- 0.6B 版本资源成本可控，适合先跑通 Phase 2
-
-升级备选：
-
-- `Qwen/Qwen3-Embedding-4B`
-- 维度：`2560`
-- 适合对召回质量要求更高且本地资源充足的场景
+- 4B 版本召回质量更强，适合当前以本地高质量 RAG 为目标的配置
 
 轻量备选：
 
+- `Qwen/Qwen3-Embedding-0.6B`
+- 维度：`1024`
+- 适合资源成本更敏感的本地轻量场景
 - `BAAI/bge-small-zh-v1.5`
 - 维度：`512`
 - 适合 CPU 资源紧张场景
 
-注意：pgvector 的向量维度和模型输出维度强相关。Phase 2 MVP 默认使用 `vector(1024)`。如果切换到 `Qwen/Qwen3-Embedding-4B` 等不同维度模型，需要执行迁移或重建 chunk embedding 表。
+注意：pgvector 的向量维度和模型输出维度强相关。Phase 2 默认使用 `halfvec(2560)`，便于 2560 维 embedding 继续使用 HNSW 索引。如果切换到不同维度模型，需要执行迁移或重建 chunk embedding 表。
 
 ### 4.3 关键词检索
 
@@ -247,15 +248,15 @@ Phase 2 的 RAG 总结模型优先使用开源模型做本地实验。
 
 推荐本地模型方向：
 
-- 默认：`Qwen3-8B`
-- 质量升级：`Qwen3-14B`
+- 默认：`Qwen3.5-9B Q8_0 GGUF`
+- 资源更省备选：`Qwen3-8B`
 - 资源紧张备选：`Qwen3-4B`
 - 量化 GGUF 版本优先，便于复用 Phase 1 本地 llama.cpp 运行方式
 
 默认策略：
 
 - 先用 `llama-cpp-python` 跑本地开源模型
-- MVP 使用 `Qwen3-8B` 的 4-bit GGUF 量化版本
+- MVP 使用 `Qwen3.5-9B` 的 Q8_0 GGUF 量化版本
 - prompt 中强制要求只基于证据回答
 - 输出结构化 JSON，便于校验引用
 - 如果本地效果不好，再新增 `deepseek_api` provider
@@ -271,8 +272,8 @@ DeepSeek API 作为后续备选：
 ```env
 RAG_ANSWER_ENABLED=true
 RAG_ANSWER_PROVIDER=local_llm
-RAG_ANSWER_MODEL_REPO=Qwen/Qwen3-8B-GGUF
-RAG_ANSWER_MODEL_FILE=Qwen3-8B-Q4_K_M.gguf
+LOCAL_LLM_MODEL_REPO=DevQuasar/Qwen.Qwen3.5-9B-GGUF
+LOCAL_LLM_MODEL_FILE=Qwen.Qwen3.5-9B.Q8_0.gguf
 RAG_ANSWER_CONTEXT_SIZE=8192
 RAG_ANSWER_TIMEOUT_MS=600000
 
@@ -330,7 +331,7 @@ create table if not exists embedding_models (
 
 用于保存可检索文本、来源时间范围和 embedding。
 
-MVP 默认 `embedding vector(1024)`：
+MVP 默认 `embedding halfvec(2560)`：
 
 ```sql
 create table if not exists recording_search_chunks (
@@ -349,7 +350,7 @@ create table if not exists recording_search_chunks (
     is_target_person boolean not null default false,
     matched_speaker_profile_ids uuid[] not null default '{}',
     metadata jsonb not null default '{}'::jsonb,
-    embedding vector(1024) not null,
+    embedding halfvec(2560) not null,
     created_at timestamptz not null default now(),
     updated_at timestamptz not null default now(),
     unique (recording_id, embedding_model_id, chunk_index)
@@ -372,7 +373,7 @@ create index if not exists recording_search_chunks_text_trgm_idx
     on recording_search_chunks using gin (normalized_text gin_trgm_ops);
 
 create index if not exists recording_search_chunks_embedding_hnsw_idx
-    on recording_search_chunks using hnsw (embedding vector_cosine_ops);
+    on recording_search_chunks using hnsw (embedding halfvec_cosine_ops);
 ```
 
 ### 5.4 新增表：search_queries
@@ -518,8 +519,8 @@ export interface EmbeddingProvider {
 ```env
 EMBEDDING_ENABLED=true
 EMBEDDING_PROVIDER=local_qwen3
-EMBEDDING_MODEL=Qwen/Qwen3-Embedding-0.6B
-EMBEDDING_DIMENSIONS=1024
+EMBEDDING_MODEL=Qwen/Qwen3-Embedding-4B
+EMBEDDING_DIMENSIONS=2560
 EMBEDDING_PYTHON_BIN=.venv-audio/bin/python
 EMBEDDING_DEVICE=auto
 EMBEDDING_BATCH_SIZE=16
@@ -614,38 +615,51 @@ npm run search:reindex -- --force
 
 Router 的职责是把用户 query 转成结构化 retrieval plan。Router 不负责回答问题，也不能编造录音 ID 或 chunk ID。
 
-第一版支持四类策略：
+第一版检索计划只保留两类执行模式，其他条件都作为联合检索 scope：
 
 ```ts
 type RetrievalStrategy =
-  | "vector_search"
-  | "recent_recording_summary"
-  | "date_range_summary"
-  | "scoped_vector_search";
+  | "scope_summary"
+  | "chunk_search";
 ```
 
 含义：
 
-- `vector_search`：具体主题检索，例如“谁提到了预算风险”
-- `recent_recording_summary`：最近 N 条录音整体总结，例如“最近两个音频都说了什么”
-- `date_range_summary`：某一天或某段时间的录音总结，例如“总结昨天的录音”
-- `scoped_vector_search`：先限定录音范围，再在范围内查主题，例如“上周跟张三相关的会议有什么风险”
+- `scope_summary`：筛选录音集合后读取这些录音的上下文做整体总结，例如“这两天的录音分别说了什么”
+- `chunk_search`：筛选录音集合后，在范围内按主题做片段级语义检索，例如“昨天关于预算讲了什么”
+
+`recordingLimit`、`recordingRank`、`timeRange`、人物、地点、指定录音等都属于 scope filter，可以联合出现，不再拆成独立 strategy。
+
+人物相关 query 第一版根据是否有具体主题进入 `chunk_search` 或 `scope_summary`。Router 只抽取人名到 `filters.personNames`，不能编造 `speakerProfileIds`。后续人物检索上线时，由独立 resolver 把人名、别名或用户选择映射到 `speaker_profiles.id`。
 
 Router 输出 JSON：
 
 ```json
 {
-  "intent": "recent_recording_summary",
-  "strategy": "recent_recording_summary",
+  "intent": "scope_summary",
+  "strategy": "scope_summary",
   "topic": null,
-  "recordingLimit": 2,
+  "recordingLimit": null,
+  "recordingRank": null,
+  "timeRange": {
+    "text": "这两天",
+    "type": "relative",
+    "amount": 2,
+    "unit": "day",
+    "direction": "past",
+    "from": null,
+    "to": null
+  },
   "dateRange": null,
   "filters": {
+    "recordingIds": [],
     "speakerProfileIds": [],
+    "personNames": [],
+    "locations": [],
     "targetPersonOnly": false
   },
   "needsAnswer": true,
-  "reason": "用户询问最近两个音频的整体内容，需要按上传时间选择最近两条 completed 录音"
+  "reason": "用户询问最近两天录音的整体内容，需要按创建时间筛选时间范围内的 completed 录音"
 }
 ```
 
@@ -654,33 +668,50 @@ Router 输出 JSON：
 - JSON 必须能解析
 - `strategy` 必须属于允许枚举
 - `recordingLimit` 必须 clamp，例如 `1 <= limit <= 5`
-- `dateRange` 必须是合法日期，且不能无限大
+- `timeRange` 只表达时间意图，程序侧归一化为 `dateRange.from/to`
+- 相对时间 query 不能信任模型直接给出的 `dateRange`，必须优先由程序根据 `timeRange` 或原始 query 归一化
+- `dateRange` 使用 Asia/Shanghai 的本地边界字符串，例如 `2026-05-07T00:00:00.000+08:00`
+- SQL 时间范围使用半开区间：`created_at >= from and created_at < to`
+- `dateRange` 如果由模型直接给出，必须是合法日期，且不能无限大
 - `speakerProfileIds` 必须来自数据库已有目标人物
-- Router 失败时 fallback 到 `vector_search`
+- `personNames` 只是 router 抽取的未解析人名，不能直接进入 SQL 过滤
+- Router 失败时 fallback 到 `chunk_search`
+
+#### 9.0.1.1 人物检索预留设计
+
+人物检索会分为两层：
+
+- 人名解析层：把 query 中的 `personNames` 解析为候选 `speaker_profiles.id`
+- 检索过滤层：用 `speakerProfileIds` 或 `targetPersonOnly` 限定 `recording_search_chunks.matched_speaker_profile_ids`
+
+后续新增节点：
+
+```text
+routeQuery
+-> resolvePeople
+-> executeRetrievalPlan
+```
+
+`resolvePeople` 的输出写回 `route.filters.speakerProfileIds`，并保留 `personNames` 便于日志和前端澄清。当人名无法唯一匹配时，第一版可以不做 SQL 人物过滤，只把人名并入 `topic` 做向量召回；之后可以扩展为让前端要求用户选择具体人物。
 
 #### 9.0.2 Retrieval Plan Executor
 
-不同策略执行不同后端检索：
+两类执行模式共享同一套 scope filter：
 
 ```text
-vector_search
--> query embedding
--> pgvector topK
--> evidence chunks
+buildScopeFilters
+-> recordingLimit / recordingRank / timeRange / recordingIds / personNames / locations
 
-recent_recording_summary
--> select completed recordings order by uploaded_at desc limit N
--> read utterance_segments/search chunks by recording
+scope_summary
+-> select completed recordings by scope
+-> read utterance_segments by recording
 -> evidence recording contexts
 
-date_range_summary
--> select completed recordings where uploaded_at between from/to
--> read utterance contexts
-
-scoped_vector_search
--> resolve recording scope
+chunk_search
+-> resolve recording/person/location/time scope
 -> query embedding
--> pgvector search within recording_id scope
+-> pgvector search within scope
+-> evidence chunks
 ```
 
 录音级总结上下文不能无限塞给模型。第一版建议：
@@ -700,7 +731,7 @@ scoped_vector_search
 {
   "query": "最近两个音频都说了什么",
   "route": {
-    "strategy": "recent_recording_summary",
+    "strategy": "scope_summary",
     "recordingLimit": 2
   },
   "evidence": [
@@ -804,9 +835,11 @@ routeQuery
   "filters": {
     "recordingIds": [],
     "speakerProfileIds": [],
+    "personNames": [],
+    "locations": [],
     "targetPersonOnly": false,
-    "uploadedFrom": null,
-    "uploadedTo": null
+    "createdFrom": null,
+    "createdTo": null
   }
 }
 ```
@@ -927,11 +960,11 @@ select
     c.*,
     r.title,
     r.file_name,
-    1 - (c.embedding <=> $1::vector) as vector_score
+    1 - (c.embedding <=> $1::halfvec) as vector_score
 from recording_search_chunks c
 join recordings r on r.id = c.recording_id
 where r.status = 'completed'
-order by c.embedding <=> $1::vector
+order by c.embedding <=> $1::halfvec
 limit $2;
 ```
 
@@ -1131,6 +1164,7 @@ export interface RagAnswerProvider {
 lib/search/
   chunking.ts
   graph-state.ts
+  graph.ts
   normalize.ts
   planner.ts
   rag.ts
@@ -1220,7 +1254,7 @@ package.json
 
 验收：
 
-- 给定 2 条文本返回 2 个 1024 维向量
+- 给定 2 条文本返回 2 个 2560 维向量
 - 空文本和异常输入有明确错误
 
 ### Step 4：Chunking
@@ -1268,7 +1302,7 @@ package.json
 - 实现 `POST /api/rag/query`
 - 实现 `POST /api/rag/query/stream`
 - 增加 LLM router，将 query 转成 retrieval plan
-- 实现 `vector_search`、`recent_recording_summary`、`date_range_summary`、`scoped_vector_search`
+- 实现 `scope_summary`、`chunk_search` 两种执行模式，并支持 recording/time/person/location 联合 scope
 - 调用 retrieval executor 获取 chunk evidence 或 recording context evidence
 - 实现 `gradeEvidence`，证据不足时最多一次 query rewrite 和二次检索
 - 将最终 evidence 组装成证据包
@@ -1329,8 +1363,12 @@ package.json
 - Phase 1 已完成录音可批量生成索引
 - 重跑脚本不会生成重复 chunk
 
-### Step 11：LLM Router 与可重试 RAG
+### Step 11：LangGraph RAG 工作流
 
+- 引入 LangGraph 作为在线 RAG 编排层
+- 定义 `RagGraphState`，包含 query、route、retrievalAttempt、answerRewriteCount、evidence、grader、answer、validator 等字段
+- 新增 graph node：`routeQuery`、`retrieveEvidence`、`gradeEvidence`、`rewriteQuery`、`generateAnswer`、`validateAnswer`、`rewriteAnswer`、`fallbackAnswer`
+- 定义条件边：证据不足进入 query rewrite，引用不合法进入 answer rewrite，达到重试上限进入 fallback
 - 新增 router provider，输出结构化 retrieval plan
 - 新增 route schema 校验和 fallback
 - 新增 recording scope retrieval：最近 N 条、日期范围、范围内主题检索
@@ -1343,23 +1381,14 @@ package.json
 验收：
 
 - query router 输出可解析 JSON
-- router 失败时 fallback 到 `vector_search`
+- router 失败时 fallback 到 `chunk_search`
 - “最近两个音频都说了什么”能覆盖两条最近 completed 录音
 - evidence 不足时会产生 grader reason 和 rewriteQuery
 - answer 引用不合法时会触发一次 rewrite 或 extractive fallback
 - 不会出现无限检索或无限重写
-
-### Step 12：LangGraph 迁移预留
-
-- 先以普通 TS node 函数实现 graph-like 流程
-- `RagGraphState` 中保留 route、attempt、grader、validator、evidence、answer 等字段
-- 后续需要 checkpoint、多轮状态恢复或更复杂循环时，再引入 LangGraph
-
-验收：
-
-- 每个 node 都可以独立测试
 - `RagGraphState` 可序列化
-- SSE 事件不绑定具体 graph runtime
+- 每个 node 都可以独立测试
+- SSE 事件由 graph 执行过程映射出来，不直接耦合具体 answer provider
 
 ## 15. 风险与处理
 
@@ -1410,7 +1439,7 @@ package.json
 
 处理：
 
-- 默认固定 `Qwen/Qwen3-Embedding-0.6B` 和 `1024`
+- 默认固定 `Qwen/Qwen3-Embedding-4B` 和 `2560`
 - `embedding_models` 记录维度
 - 切换模型必须执行迁移或重建索引
 
@@ -1432,7 +1461,7 @@ package.json
 处理：
 
 - 所有 router 输出必须经过 schema 校验
-- 失败 fallback 到 `vector_search`
+- 失败 fallback 到 `chunk_search`
 - `recordingLimit`、dateRange、speakerProfileIds 都由程序校验
 - router 只生成计划，不直接生成录音 ID 或 chunk ID
 

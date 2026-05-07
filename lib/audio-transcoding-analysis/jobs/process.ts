@@ -1,9 +1,10 @@
-import { alignTranscriptionSegments, applySpeakerIdentification, completeJob, failJob, generateUtteranceSegments, getRecordingForWorker, saveDiarization, saveTranscription } from "../../db/recordings";
-import { listSpeakerProfiles } from "../../db/speaker-profiles";
-import { redactSecrets } from "../../security/redact";
-import { getAppConfig } from "../../config/app-config";
-import { indexRecordingForSearch } from "../../search/indexing";
-import { correctUtteranceTexts, mergeCorrectedUtterances } from "../text-correction/correct-utterance";
+import { alignTranscriptionSegments, applySpeakerIdentification, completeJob, failJob, generateUtteranceSegments, getRecordingForWorker, saveDiarization, saveRecordingSummary, saveTranscription } from "../../db/recordings.ts";
+import { listSpeakerProfiles } from "../../db/speaker-profiles.ts";
+import { redactSecrets } from "../../security/redact.ts";
+import { getAppConfig } from "../../config/app-config.ts";
+import { indexRecordingForSearch } from "../../search/indexing.ts";
+import { generateRecordingSummary } from "../summary/generate-summary.ts";
+import { correctUtteranceTexts, mergeCorrectedUtterances } from "../text-correction/correct-utterance.ts";
 import type { AudioProgressEvent, DiarizationOutput, ProcessingJob, Recording, SpeakerDiarizationSegment, SpeakerIdentificationMatch, SpeakerProfileWithSamples, TranscriptionOutput } from "../../types/models";
 
 export interface AudioAnalyzer {
@@ -23,6 +24,26 @@ export async function processJob(analyzer: AudioAnalyzer, job: ProcessingJob) {
     const context = await getRecordingForWorker(job.recordingId);
 
     if (job.jobType === "transcription") {
+      const config = getAppConfig();
+      if (config.audio.asrProvider === "qwen_asr") {
+        const output = await analyzer.transcribe(context.recording);
+        if (output.diarization) {
+          await saveDiarization(context.recording.id, output.diarization);
+        }
+        await saveTranscription(context.recording.id, output);
+        await alignTranscriptionSegments(context.recording.id);
+        await generateUtteranceSegments(context.recording.id);
+        await completeJob(job.id, { nextJobType: "text_correction" });
+        console.log("[jobs] qwen transcription with diarization job done", {
+          jobId: job.id,
+          recordingId: job.recordingId,
+          diarizationSegmentCount: output.diarization?.segments.length ?? 0,
+          transcriptionSegmentCount: output.segments.length,
+          durationMs: Date.now() - startedAt
+        });
+        return { job, status: "completed" as const };
+      }
+
       const output = await analyzer.transcribe(context.recording);
       await saveTranscription(context.recording.id, output);
       await completeJob(job.id, { nextJobType: "speaker_diarization" });
@@ -40,7 +61,7 @@ export async function processJob(analyzer: AudioAnalyzer, job: ProcessingJob) {
       await saveDiarization(freshContext.recording.id, output);
       await alignTranscriptionSegments(freshContext.recording.id);
       await generateUtteranceSegments(freshContext.recording.id);
-      await completeJob(job.id, { nextJobType: "speaker_identification" });
+      await completeJob(job.id, { nextJobType: "text_correction" });
       console.log("[jobs] diarization job done", {
         jobId: job.id,
         recordingId: job.recordingId,
@@ -65,7 +86,7 @@ export async function processJob(analyzer: AudioAnalyzer, job: ProcessingJob) {
 
     if (job.jobType === "text_correction") {
       await generateUtteranceSegments(context.recording.id, { correctTexts: correctUtteranceTexts, mergeUtterances: mergeCorrectedUtterances });
-      await completeJob(job.id, getAppConfig().search.embeddingEnabled ? { nextJobType: "embedding_indexing" } : { recordingStatus: "completed" });
+      await completeJob(job.id, getAppConfig().search.embeddingEnabled ? { nextJobType: "embedding_indexing" } : { nextJobType: "summary" });
       console.log("[jobs] text correction job done", {
         jobId: job.id,
         recordingId: job.recordingId,
@@ -76,12 +97,27 @@ export async function processJob(analyzer: AudioAnalyzer, job: ProcessingJob) {
 
     if (job.jobType === "embedding_indexing") {
       const result = await indexRecordingForSearch(context.recording.id);
-      await completeJob(job.id, { recordingStatus: "completed" });
+      await completeJob(job.id, { nextJobType: "summary" });
       console.log("[jobs] embedding indexing job done", {
         jobId: job.id,
         recordingId: job.recordingId,
         chunkCount: result.chunkCount,
         skipped: result.skipped,
+        durationMs: Date.now() - startedAt
+      });
+      return { job, status: "completed" as const };
+    }
+
+    if (job.jobType === "summary") {
+      const freshContext = await getRecordingForWorker(job.recordingId);
+      const summary = await generateRecordingSummary(freshContext.recording, freshContext.utteranceSegments);
+      await saveRecordingSummary({ recordingId: freshContext.recording.id, ...summary });
+      await completeJob(job.id, { recordingStatus: "completed" });
+      console.log("[jobs] summary job done", {
+        jobId: job.id,
+        recordingId: job.recordingId,
+        provider: summary.provider,
+        summaryLength: summary.summaryText.length,
         durationMs: Date.now() - startedAt
       });
       return { job, status: "completed" as const };

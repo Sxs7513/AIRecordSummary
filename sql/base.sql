@@ -26,6 +26,7 @@ create table if not exists recordings (
     title text not null,
     file_name text not null,
     storage_path text not null,
+    location text,
     mime_type text not null,
     file_size_bytes bigint not null check (file_size_bytes >= 0),
     duration_seconds integer check (duration_seconds is null or duration_seconds >= 0),
@@ -35,6 +36,9 @@ create table if not exists recordings (
     created_at timestamptz not null default now(),
     updated_at timestamptz not null default now()
 );
+
+alter table recordings
+    add column if not exists location text;
 
 comment on table recordings is
     '录音主表，保存每条上传音频的基础信息、文件信息和整体处理状态。';
@@ -46,6 +50,8 @@ comment on column recordings.file_name is
     '用户上传时的原始文件名，用于后台展示和排查问题。';
 comment on column recordings.storage_path is
     '音频文件在本地文件系统或对象存储中的相对路径或 key。';
+comment on column recordings.location is
+    '录音发生地点，由用户在录音详情页手动配置，用于录音级筛选和联合检索。';
 comment on column recordings.mime_type is
     '音频文件 MIME 类型，例如 audio/mpeg、audio/wav。';
 comment on column recordings.file_size_bytes is
@@ -65,6 +71,8 @@ comment on column recordings.updated_at is
 
 create index if not exists recordings_status_idx on recordings (status);
 create index if not exists recordings_uploaded_at_idx on recordings (uploaded_at desc);
+create index if not exists recordings_created_at_idx on recordings (created_at desc);
+create index if not exists recordings_location_trgm_idx on recordings using gin (location gin_trgm_ops);
 
 -- transcriptions
 -- 录音整条转写结果主表。
@@ -366,7 +374,7 @@ create table if not exists processing_jobs (
     id uuid primary key default gen_random_uuid(),
     recording_id uuid not null references recordings(id) on delete cascade,
     job_type text not null check (
-        job_type in ('transcription', 'speaker_diarization', 'speaker_identification', 'text_correction', 'embedding_indexing')
+        job_type in ('transcription', 'speaker_diarization', 'speaker_identification', 'text_correction', 'embedding_indexing', 'summary')
     ),
     status text not null check (status in ('pending', 'running', 'completed', 'failed')),
     attempt_count integer not null default 0 check (attempt_count >= 0),
@@ -390,7 +398,7 @@ comment on column processing_jobs.id is
 comment on column processing_jobs.recording_id is
     '关联 recordings.id，表示该任务属于哪条录音。';
 comment on column processing_jobs.job_type is
-    '任务类型。transcription 表示转写，speaker_diarization 表示说话人分离，speaker_identification 表示目标人物识别，text_correction 表示文本校正。';
+    '任务类型。transcription 表示转写，speaker_diarization 表示说话人分离，speaker_identification 表示目标人物识别，text_correction 表示文本校正，embedding_indexing 表示检索索引，summary 表示录音总结。';
 comment on column processing_jobs.status is
     '任务状态。pending 表示待执行，running 表示执行中，completed 表示完成，failed 表示失败。';
 comment on column processing_jobs.attempt_count is
@@ -423,8 +431,32 @@ begin
     alter table processing_jobs drop constraint if exists processing_jobs_job_type_check;
     update processing_jobs set job_type = 'text_correction' where job_type = 'text_polishing';
     alter table processing_jobs add constraint processing_jobs_job_type_check
-        check (job_type in ('transcription', 'speaker_diarization', 'speaker_identification', 'text_correction', 'embedding_indexing'));
+        check (job_type in ('transcription', 'speaker_diarization', 'speaker_identification', 'text_correction', 'embedding_indexing', 'summary'));
 end $$;
+
+create table if not exists recording_summaries (
+    id uuid primary key default gen_random_uuid(),
+    recording_id uuid not null references recordings(id) on delete cascade,
+    provider text not null check (provider in ('local_llm', 'deepseek_api')),
+    model_name text not null,
+    summary_text text not null,
+    created_at timestamptz not null default now(),
+    updated_at timestamptz not null default now(),
+    unique (recording_id)
+);
+
+comment on table recording_summaries is
+    '录音总结表，保存润色后文本生成的整条录音摘要。';
+comment on column recording_summaries.recording_id is
+    '关联 recordings.id，表示这份总结属于哪条录音。';
+comment on column recording_summaries.provider is
+    '总结使用的模型提供方，例如 local_llm 或 deepseek_api。';
+comment on column recording_summaries.model_name is
+    '总结使用的模型名称或文件名。';
+comment on column recording_summaries.summary_text is
+    '面向用户展示的录音总结正文。';
+
+create index if not exists recording_summaries_recording_id_idx on recording_summaries (recording_id);
 
 -- Phase 2: semantic search and RAG
 create table if not exists embedding_models (
@@ -454,11 +486,33 @@ create table if not exists recording_search_chunks (
     is_target_person boolean not null default false,
     matched_speaker_profile_ids uuid[] not null default '{}',
     metadata jsonb not null default '{}'::jsonb,
-    embedding vector(1024) not null,
+    embedding halfvec(2560) not null,
     created_at timestamptz not null default now(),
     updated_at timestamptz not null default now(),
     unique (recording_id, embedding_model_id, chunk_index)
 );
+
+do $$
+declare
+    embedding_type text;
+begin
+    select format_type(a.atttypid, a.atttypmod)
+    into embedding_type
+    from pg_attribute a
+    join pg_class c on c.oid = a.attrelid
+    join pg_namespace n on n.oid = c.relnamespace
+    where n.nspname = 'public'
+      and c.relname = 'recording_search_chunks'
+      and a.attname = 'embedding'
+      and not a.attisdropped;
+
+    if embedding_type is distinct from 'halfvec(2560)' then
+        drop index if exists recording_search_chunks_embedding_hnsw_idx;
+        delete from recording_search_chunks;
+        alter table recording_search_chunks
+            alter column embedding type halfvec(2560);
+    end if;
+end $$;
 
 create index if not exists recording_search_chunks_recording_id_idx
     on recording_search_chunks (recording_id);
@@ -469,7 +523,7 @@ create index if not exists recording_search_chunks_target_person_idx
 create index if not exists recording_search_chunks_text_trgm_idx
     on recording_search_chunks using gin (normalized_text gin_trgm_ops);
 create index if not exists recording_search_chunks_embedding_hnsw_idx
-    on recording_search_chunks using hnsw (embedding vector_cosine_ops);
+    on recording_search_chunks using hnsw (embedding halfvec_cosine_ops);
 
 create table if not exists search_queries (
     id uuid primary key default gen_random_uuid(),

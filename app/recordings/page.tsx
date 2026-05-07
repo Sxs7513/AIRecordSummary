@@ -80,6 +80,12 @@ export default async function RecordingsPage({
                       <strong>{item.title}</strong>
                       <br />
                       <span className="subtle">{item.fileName}</span>
+                      {item.location ? (
+                        <>
+                          <br />
+                          <span className="subtle">地点：{item.location}</span>
+                        </>
+                      ) : null}
                     </Link>
                   </td>
                   <td>

@@ -32,11 +32,13 @@ export async function diarizeRecording(recording: Recording, onProgress?: (progr
   const audioPath = path.join(process.cwd(), recording.storagePath);
   const cacheDir = path.join(process.cwd(), config.audio.modelCacheRoot, "huggingface", "hub");
   const args = [script, audioPath, "--cache-dir", cacheDir];
+  if (!config.audio.pyannoteUseLocalConfig) args.push("--no-local-config");
   console.log("[diarization] starting pyannote", {
     recordingId: recording.id,
     pythonBin,
     audioPath,
     cacheDir,
+    useLocalConfig: config.audio.pyannoteUseLocalConfig,
     hasAuthToken: Boolean(config.audio.pyannoteAuthToken)
   });
   let output: DiarizationOutput;

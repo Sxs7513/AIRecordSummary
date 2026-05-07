@@ -6,8 +6,7 @@ import { getAppConfig } from "../../config/app-config";
 import { getNextPendingJob } from "../../db/recordings";
 import { pool } from "../../db/pool";
 import { clearRecordingProgress, setRecordingProgress } from "./progress";
-import { processJob, type AudioAnalyzer } from "./process";
-import type { DiarizationOutput, ProcessingJob, SpeakerIdentificationMatch, TranscriptionOutput } from "../../types/models";
+import type { ProcessingJob } from "../../types/models";
 
 declare global {
   // eslint-disable-next-line no-var
@@ -46,7 +45,7 @@ class EmbeddedJobScheduler {
     });
 
     const workerPath = path.join(process.cwd(), "lib", "audio-transcoding-analysis", "jobs", "worker-thread.ts");
-    console.log("[jobs] starting audio worker pool", { workerPath, workerConcurrency: config.jobs.workerConcurrency });
+    console.log("[jobs] starting job worker pool", { workerPath, workerConcurrency: config.jobs.workerConcurrency });
     for (let index = 0; index < config.jobs.workerConcurrency; index += 1) {
       this.startWorker(index + 1, workerPath, config);
     }
@@ -68,7 +67,7 @@ class EmbeddedJobScheduler {
 
   private startWorker(workerId: number, workerPath: string, config: ReturnType<typeof getAppConfig>) {
     const worker = new Worker(workerPath, {
-      execArgv: ["--import", "tsx"],
+      execArgv: ["--require", "tsx/cjs"],
       env: {
         ...process.env,
         AI_RECORD_SUMMARY_CONFIG: JSON.stringify(config)
@@ -132,7 +131,7 @@ class EmbeddedJobScheduler {
   }
 
   kick() {
-    console.log("[jobs] scheduler kicked");
+    // console.log("[jobs] scheduler kicked");
     void this.drain();
   }
 
@@ -178,8 +177,7 @@ class EmbeddedJobScheduler {
   }
 
   private runClaimedJob(slot: WorkerSlot, job: ProcessingJob) {
-    const analyzer = this.createAnalyzerForSlot(slot);
-    void processJob(analyzer, job)
+    void this.runWorkerTaskOnSlot<{ job: ProcessingJob; status: "completed" | "failed" }>(slot, "processJob", { job })
       .then((result) => {
         if (result.status === "completed" || result.status === "failed") {
           clearRecordingProgress(result.job.recordingId);
@@ -201,23 +199,14 @@ class EmbeddedJobScheduler {
       });
   }
 
-  private createAnalyzerForSlot(slot: WorkerSlot): AudioAnalyzer {
-    return {
-      transcribe: (recording) => this.runAudioTaskOnSlot<TranscriptionOutput>(slot, "transcribe", { recording }),
-      diarize: (recording) => this.runAudioTaskOnSlot<DiarizationOutput>(slot, "diarize", { recording }),
-      identifySpeakers: (recording, diarizationSegments, profiles) =>
-        this.runAudioTaskOnSlot<SpeakerIdentificationMatch[]>(slot, "identifySpeakers", { recording, diarizationSegments, profiles })
-    };
-  }
-
-  private runAudioTaskOnSlot<T>(slot: WorkerSlot, type: string, payload: Record<string, unknown>): Promise<T> {
+  private runWorkerTaskOnSlot<T>(slot: WorkerSlot, type: string, payload: Record<string, unknown>): Promise<T> {
     if (slot.activeRequestId) {
-      return Promise.reject(new Error(`Audio worker ${slot.id} is busy`));
+      return Promise.reject(new Error(`Job worker ${slot.id} is busy`));
     }
     const id = randomUUID();
     slot.activeRequestId = id;
     slot.reserved = false;
-    console.log("[jobs] dispatching audio task", { requestId: id, type, workerId: slot.id });
+    console.log("[jobs] dispatching worker task", { requestId: id, type, workerId: slot.id });
     return new Promise<T>((resolve, reject) => {
       this.pending.set(id, {
         resolve: (value) => resolve(value as T),

@@ -1,6 +1,7 @@
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { audioProcessEnv } from "../../audio-transcoding-analysis/runtime/runtime-env";
+import { resolveSharedLocalLlmModelPath } from "../../local-llm/model-path";
 import type { RagAnswerInput, RagAnswerOutput } from "../types";
 
 export async function streamLocalLlmAnswer(
@@ -10,9 +11,7 @@ export async function streamLocalLlmAnswer(
   onThinking?: (event: "start" | "done", text?: string) => void
 ): Promise<RagAnswerOutput> {
   const script = path.join(process.cwd(), "lib", "search", "answering", "scripts", "run_llm_answer_stream.py");
-  const modelDir = path.join(process.cwd(), options.modelCacheRoot, "rag-answer", options.modelRepo.replaceAll("/", "__"));
-  const modelFile = options.modelFile.split(",")[0]?.trim() ?? options.modelFile;
-  const modelPath = path.join(modelDir, modelFile);
+  const { modelPath } = resolveSharedLocalLlmModelPath(options);
 
   return new Promise<RagAnswerOutput>((resolve, reject) => {
     const child = spawn(options.pythonBin, [script], {

@@ -2,7 +2,7 @@ import "server-only";
 
 export interface RecordingProgress {
   recordingId: string;
-  task: "transcription" | "speaker_diarization" | "speaker_identification" | "text_correction" | "embedding_indexing";
+  task: "transcription" | "speaker_diarization" | "speaker_identification" | "text_correction" | "embedding_indexing" | "summary";
   stage: string;
   message: string;
   percent: number;

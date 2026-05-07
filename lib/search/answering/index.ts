@@ -19,8 +19,8 @@ export function getAnswerProvider(): RagAnswerProvider {
   return new LocalLlmAnswerProvider({
     pythonBin: config.embeddingPythonBin,
     modelCacheRoot: appConfig.audio.modelCacheRoot,
-    modelRepo: config.answerModelRepo,
-    modelFile: config.answerModelFile,
+    modelRepo: config.localLlmModelRepo,
+    modelFile: config.localLlmModelFile,
     contextSize: config.answerContextSize,
     timeoutMs: config.answerTimeoutMs
   });

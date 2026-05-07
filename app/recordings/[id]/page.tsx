@@ -2,8 +2,12 @@ import Link from "next/link";
 import { notFound } from "next/navigation";
 import { ArrowLeft } from "lucide-react";
 import { AutoRefresh } from "@/components/auto-refresh";
+import { MarkdownSummary } from "@/components/markdown-summary";
 import { RecordingPlayer } from "@/components/recording-player";
+import { RecordingLocationForm } from "@/components/recording-location-form";
 import { RecordingProgress } from "@/components/recording-progress";
+import { RecordingTitleForm } from "@/components/recording-title-form";
+import { SpeakerLabelForm } from "@/components/speaker-label-form";
 import { StatusBadge } from "@/components/status-badge";
 import { UtteranceList } from "@/components/utterance-list";
 import { getRecordingDetail } from "@/lib/db/recordings";
@@ -25,6 +29,13 @@ export default async function RecordingDetailPage({ params, searchParams }: { pa
   const profileById = new Map(detail.speakerProfiles.map((profile) => [profile.id, profile]));
   const shouldRefresh = detail.recording.status === "uploaded" || detail.recording.status === "processing";
   const seekMs = search.t && Number.isFinite(Number(search.t)) ? Number(search.t) : null;
+  const speakerLabels = Array.from(
+    new Set(
+      [...detail.utteranceSegments, ...detail.transcriptionSegments, ...detail.speakerDiarizationSegments]
+        .map((segment) => segment.speakerLabel)
+        .filter((label): label is string => Boolean(label))
+    )
+  ).sort((a, b) => a.localeCompare(b, "zh-CN"));
 
   return (
     <>
@@ -34,6 +45,7 @@ export default async function RecordingDetailPage({ params, searchParams }: { pa
           <h1>{detail.recording.title}</h1>
           <p className="subtle">
             {detail.recording.fileName} · {formatBytes(detail.recording.fileSizeBytes)} ·{" "}
+            {detail.recording.location ? `${detail.recording.location} · ` : ""}
             <StatusBadge status={detail.recording.status} />
           </p>
         </div>
@@ -43,11 +55,13 @@ export default async function RecordingDetailPage({ params, searchParams }: { pa
         </Link>
       </div>
 
-      <section className="grid" style={{ gridTemplateColumns: "minmax(280px,1fr) minmax(280px,1fr)" }}>
-        <div className="panel">
-          <h2>音频</h2>
-          <RecordingPlayer src={publicFileUrl(detail.recording.storagePath)} seekMs={seekMs} />
-          {detail.recording.errorMessage ? (
+      <details className="panel collapsible-panel" style={{ marginTop: 16 }} open>
+        <summary>音频与任务状态</summary>
+        <section className="grid" style={{ gridTemplateColumns: "minmax(280px,1fr) minmax(280px,1fr)", marginTop: 14 }}>
+          <div>
+            <h2>音频</h2>
+            <p className="subtle">播放器已固定在页面底部，滚动查看文字记录时也可以操作。</p>
+            {detail.recording.errorMessage ? (
 	            <p className="subtle">
 	              转码异常，错误信息：
 	              <span className="error-tooltip" data-tooltip={detail.recording.errorMessage} title={detail.recording.errorMessage}>
@@ -55,10 +69,10 @@ export default async function RecordingDetailPage({ params, searchParams }: { pa
 	              </span>
 	            </p>
           ) : null}
-        </div>
+          </div>
 
-        <div className="panel">
-          <h2>任务状态</h2>
+          <div>
+            <h2>任务状态</h2>
           <table>
             <thead>
               <tr>
@@ -91,10 +105,10 @@ export default async function RecordingDetailPage({ params, searchParams }: { pa
                     )}
                   </td>
                   <td>
-                    {job.status === "failed" || (job.status === "completed" && (job.jobType === "speaker_identification" || job.jobType === "text_correction")) ? (
+                    {job.status === "failed" || (job.status === "completed" && (job.jobType === "text_correction" || job.jobType === "embedding_indexing" || job.jobType === "summary")) ? (
                       <form action={`/api/jobs/${job.id}/retry`} method="post">
                         <button className="secondary" type="submit">
-                          {job.jobType === "text_correction" ? "重新校正" : job.jobType === "speaker_identification" ? "重新识别" : "重试"}
+                          {job.jobType === "text_correction" ? "重新校正" : job.jobType === "embedding_indexing" ? "重新索引" : job.jobType === "summary" ? "重新总结" : "重试"}
                         </button>
                       </form>
                     ) : (
@@ -105,16 +119,50 @@ export default async function RecordingDetailPage({ params, searchParams }: { pa
               ))}
             </tbody>
           </table>
+          </div>
+        </section>
+      </details>
+
+      <details className="panel collapsible-panel" style={{ marginTop: 16 }}>
+        <summary>录音信息</summary>
+        <div className="collapsible-body">
+        <RecordingTitleForm recordingId={detail.recording.id} title={detail.recording.title} />
+        <RecordingLocationForm recordingId={detail.recording.id} location={detail.recording.location} />
         </div>
-      </section>
+      </details>
 
-      <section className="panel" style={{ marginTop: 16 }}>
-        <h2>连续发言</h2>
+      <details className="panel collapsible-panel" style={{ marginTop: 16 }}>
+        <summary>说话人配置</summary>
+        <div className="collapsible-body">
+        {detail.recording.status === "completed" ? (
+          <SpeakerLabelForm recordingId={detail.recording.id} speakerLabels={speakerLabels} />
+        ) : (
+          <div className="empty">录音解析完成后可配置说话人名称</div>
+        )}
+        </div>
+      </details>
+
+      <details className="panel collapsible-panel" style={{ marginTop: 16 }} open>
+        <summary>录音总结</summary>
+        <div className="collapsible-body">
+        {detail.summary ? (
+          <MarkdownSummary markdown={detail.summary.summaryText} />
+        ) : (
+          <div className="empty">总结尚未生成</div>
+        )}
+        </div>
+      </details>
+
+      <details className="panel collapsible-panel" style={{ marginTop: 16 }} open>
+        <summary>文字记录</summary>
+        <div className="collapsible-body">
         <UtteranceList segments={detail.utteranceSegments} speakerProfiles={detail.speakerProfiles} highlightMs={seekMs} />
-      </section>
+        </div>
+      </details>
 
-      <section className="panel" style={{ marginTop: 16 }}>
-        <h2>完整转写</h2>
+      <details className="panel collapsible-panel" style={{ marginTop: 16 }}>
+        <summary>完整转写</summary>
+        <div className="collapsible-body">
         {detail.transcription ? (
           <div className="full-text">
             {detail.transcriptionSegments.length > 0
@@ -127,10 +175,12 @@ export default async function RecordingDetailPage({ params, searchParams }: { pa
         ) : (
           <div className="empty">转写结果尚未生成</div>
         )}
-      </section>
+        </div>
+      </details>
 
-      <section className="panel" style={{ marginTop: 16 }}>
-        <h2>转写分段</h2>
+      <details className="panel collapsible-panel" style={{ marginTop: 16 }}>
+        <summary>转写分段</summary>
+        <div className="collapsible-body">
         {detail.transcriptionSegments.length === 0 ? (
           <div className="empty">暂无分段</div>
         ) : (
@@ -159,10 +209,12 @@ export default async function RecordingDetailPage({ params, searchParams }: { pa
             })}
           </div>
         )}
-      </section>
+        </div>
+      </details>
 
-      <section className="panel" style={{ marginTop: 16 }}>
-        <h2>Speaker Diarization</h2>
+      <details className="panel collapsible-panel" style={{ marginTop: 16 }}>
+        <summary>Speaker Diarization</summary>
+        <div className="collapsible-body">
         {detail.speakerDiarizationSegments.length === 0 ? (
           <div className="empty">暂无说话人片段</div>
         ) : (
@@ -191,7 +243,18 @@ export default async function RecordingDetailPage({ params, searchParams }: { pa
             </tbody>
           </table>
         )}
-      </section>
+        </div>
+      </details>
+
+      <div className="fixed-audio-player">
+        <div className="fixed-audio-player-inner">
+          <div className="fixed-audio-meta">
+            <strong>{detail.recording.title}</strong>
+            <span>{detail.recording.fileName}</span>
+          </div>
+          <RecordingPlayer src={publicFileUrl(detail.recording.storagePath)} seekMs={seekMs} />
+        </div>
+      </div>
     </>
   );
 }

@@ -1,31 +1,59 @@
 "use client";
 
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { EvidenceList } from "./evidence-list";
-import type { RagAnswer, SearchEvidence } from "@/lib/types/models";
+import type { RagAnswer, RagQueryResponse, SearchEvidence } from "@/lib/types/models";
+import type { ReactNode } from "react";
 
-type StreamPayload =
-  | { event: "evidence"; data: { evidence: SearchEvidence[]; message?: string } }
-  | { event: "thinking_start"; data: { text?: string } }
-  | { event: "thinking_done"; data: { text?: string } }
-  | { event: "answer_delta"; data: { text: string } }
-  | { event: "answer_done"; data: { answer: RagAnswer | null } }
-  | { event: "error"; data: { message: string } };
+function AnswerText({
+  text,
+  evidence,
+  onCitationClick
+}: {
+  text: string;
+  evidence: SearchEvidence[];
+  onCitationClick: (index: number) => void;
+}) {
+  const evidenceByIndex = useMemo(() => new Map(evidence.map((item) => [item.index, item])), [evidence]);
+  const parts: ReactNode[] = [];
+  const citationPattern = /(?:\[|【|［)([\d\s,，、]+)(?:\]|】|］)/g;
+  let cursor = 0;
+  let match: RegExpExecArray | null;
 
-function parseSseEvents(buffer: string): { events: StreamPayload[]; rest: string } {
-  const events: StreamPayload[] = [];
-  const parts = buffer.split("\n\n");
-  const rest = parts.pop() ?? "";
-  for (const part of parts) {
-    const eventLine = part.split(/\r?\n/).find((line) => line.startsWith("event: "));
-    const dataLine = part.split(/\r?\n/).find((line) => line.startsWith("data: "));
-    if (!eventLine || !dataLine) continue;
-    events.push({
-      event: eventLine.slice("event: ".length) as StreamPayload["event"],
-      data: JSON.parse(dataLine.slice("data: ".length))
-    } as StreamPayload);
+  while ((match = citationPattern.exec(text)) !== null) {
+    if (match.index > cursor) parts.push(text.slice(cursor, match.index));
+    const indexes = match[1]
+      .split(/[\s,，、]+/)
+      .map((value) => Number(value))
+      .filter((value) => Number.isInteger(value));
+    if (indexes.length === 0) {
+      parts.push(match[0]);
+    }
+    for (const index of indexes) {
+      const item = evidenceByIndex.get(index);
+      if (item) {
+        parts.push(
+          <a
+            className="citation-link"
+            href={item.url}
+            key={`${match.index}-${index}`}
+            target="_blank"
+            rel="noreferrer"
+            onClick={() => onCitationClick(index)}
+            title={`打开录音：${item.recording.title}`}
+          >
+            [{index}]
+          </a>
+        );
+      } else {
+        parts.push(<span key={`${match.index}-${index}`}>[{index}]</span>);
+      }
+    }
+    cursor = match.index + match[0].length;
   }
-  return { events, rest };
+
+  if (cursor < text.length) parts.push(text.slice(cursor));
+  return <>{parts}</>;
 }
 
 export function RagChat() {
@@ -36,6 +64,7 @@ export function RagChat() {
   const [answer, setAnswer] = useState<RagAnswer | null>(null);
   const [thinking, setThinking] = useState<{ active: boolean; text: string }>({ active: false, text: "" });
   const [evidence, setEvidence] = useState<SearchEvidence[]>([]);
+  const [activeEvidenceIndex, setActiveEvidenceIndex] = useState<number | null>(null);
 
   async function submit(event: React.FormEvent) {
     event.preventDefault();
@@ -47,57 +76,29 @@ export function RagChat() {
     setAnswer(null);
     setThinking({ active: false, text: "" });
     setEvidence([]);
+    setActiveEvidenceIndex(null);
     try {
-      const response = await fetch("/api/rag/query/stream", {
+      const response = await fetch("/api/rag/query", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ query: text, mode: "answer", limit: 10 })
       });
-      if (!response.ok || !response.body) throw new Error("查询失败");
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = "";
-      let streamedText = "";
-      let done = false;
-      while (!done) {
-        const next = await reader.read();
-        done = next.done;
-        buffer += decoder.decode(next.value ?? new Uint8Array(), { stream: !done });
-        const parsed = parseSseEvents(buffer);
-        buffer = parsed.rest;
-        for (const item of parsed.events) {
-          if (item.event === "evidence") {
-            setEvidence(item.data.evidence);
-            setAnswer({ text: "", citations: [], notEnoughEvidence: false });
-          }
-          if (item.event === "answer_delta") {
-            streamedText += item.data.text;
-            setAnswer((current) => ({
-              text: streamedText,
-              citations: current?.citations ?? [],
-              notEnoughEvidence: current?.notEnoughEvidence ?? false
-            }));
-          }
-          if (item.event === "thinking_start") {
-            setThinking({ active: true, text: "" });
-          }
-          if (item.event === "thinking_done") {
-            setThinking({ active: false, text: item.data.text ?? "" });
-          }
-          if (item.event === "answer_done") {
-            setAnswer(item.data.answer);
-            setThinking((current) => ({ ...current, active: false }));
-          }
-          if (item.event === "error") {
-            throw new Error(item.data.message);
-          }
-        }
-      }
+      const payload = await response.json() as RagQueryResponse & { error?: string };
+      if (!response.ok) throw new Error(payload.error || "查询失败");
+      setEvidence(payload.evidence);
+      setAnswer(payload.answer);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       setLoading(false);
     }
+  }
+
+  function selectEvidence(index: number) {
+    setActiveEvidenceIndex(index);
+    window.setTimeout(() => {
+      document.getElementById(`evidence-${index}`)?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    }, 0);
   }
 
   return (
@@ -125,12 +126,14 @@ export function RagChat() {
                   <div>{thinking.text}</div>
                 </details>
               ) : null}
-              <div className="full-text">{answer.text || "正在生成回答..."}</div>
+              <div className="full-text">
+                <AnswerText text={answer.text || "正在生成回答..."} evidence={evidence} onCitationClick={selectEvidence} />
+              </div>
             </article>
           ) : loading ? (
             <article className="assistant-answer">正在检索录音片段...</article>
           ) : null}
-          <EvidenceList evidence={evidence} />
+          <EvidenceList evidence={evidence} activeIndex={activeEvidenceIndex} onSelect={selectEvidence} />
         </section>
       ) : null}
     </div>

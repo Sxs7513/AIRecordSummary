@@ -7,6 +7,7 @@ import type {
   ProcessingJob,
   Recording,
   RecordingDetail,
+  RecordingSummary,
   SpeakerDiarizationSegment,
   SpeakerIdentificationMatch,
   Transcription,
@@ -21,6 +22,7 @@ function rowRecording(row: Record<string, any>): Recording {
     title: row.title,
     fileName: row.file_name,
     storagePath: row.storage_path,
+    location: row.location ?? null,
     mimeType: row.mime_type,
     fileSizeBytes: Number(row.file_size_bytes),
     durationSeconds: row.duration_seconds,
@@ -41,6 +43,18 @@ function rowTranscription(row: Record<string, any>): Transcription {
     modelName: row.model_name,
     fullText: row.full_text,
     segmentCount: row.segment_count,
+    createdAt: row.created_at.toISOString(),
+    updatedAt: row.updated_at.toISOString()
+  };
+}
+
+function rowRecordingSummary(row: Record<string, any>): RecordingSummary {
+  return {
+    id: row.id,
+    recordingId: row.recording_id,
+    provider: row.provider,
+    modelName: row.model_name,
+    summaryText: row.summary_text,
     createdAt: row.created_at.toISOString(),
     updatedAt: row.updated_at.toISOString()
   };
@@ -117,6 +131,10 @@ function rowJob(row: Record<string, any>): ProcessingJob {
   };
 }
 
+async function ensureRecordingLocationColumn(client: { query: (sql: string, values?: unknown[]) => Promise<any> }) {
+  await client.query("alter table recordings add column if not exists location text");
+}
+
 export async function createRecording(input: {
   title: string;
   fileName: string;
@@ -175,7 +193,7 @@ export async function listRecordings(params: {
        left join processing_jobs on processing_jobs.recording_id = recordings.id
        ${where}
        group by recordings.id
-       order by recordings.uploaded_at desc
+       order by recordings.created_at desc
        limit $${values.length + 1} offset $${values.length + 2}`,
     [...values, pageSize, offset]
   );
@@ -197,7 +215,8 @@ export async function getRecordingDetail(id: string): Promise<RecordingDetail | 
   const recordingRows = await query<Record<string, any>>("select * from recordings where id = $1", [id]);
   if (recordingRows.length === 0) return null;
 
-  const [transcriptionRows, segmentRows, diarizationRows, utteranceRows, jobRows, profileRows] = await Promise.all([
+  const [summaryRows, transcriptionRows, segmentRows, diarizationRows, utteranceRows, jobRows, profileRows] = await Promise.all([
+    query<Record<string, any>>("select * from recording_summaries where recording_id = $1", [id]),
     query<Record<string, any>>("select * from transcriptions where recording_id = $1", [id]),
     query<Record<string, any>>("select * from transcription_segments where recording_id = $1 order by segment_index", [id]),
     query<Record<string, any>>("select * from speaker_diarization_segments where recording_id = $1 order by start_ms", [id]),
@@ -208,6 +227,7 @@ export async function getRecordingDetail(id: string): Promise<RecordingDetail | 
 
   return {
     recording: rowRecording(recordingRows[0]),
+    summary: summaryRows[0] ? rowRecordingSummary(summaryRows[0]) : null,
     transcription: transcriptionRows[0] ? rowTranscription(transcriptionRows[0]) : null,
     transcriptionSegments: segmentRows.map(rowTranscriptionSegment),
     speakerDiarizationSegments: diarizationRows.map(rowDiarizationSegment),
@@ -301,13 +321,43 @@ export async function completeJob(jobId: string, options: { nextJobType?: string
       recordingStatus: options.recordingStatus
     });
     if (options.nextJobType) {
-      const nextJobRows = await client.query("insert into processing_jobs (recording_id, job_type, status) values ($1, $2, 'pending') returning *", [job.recording_id, options.nextJobType]);
-      await client.query("select pg_notify('processing_jobs', $1)", [nextJobRows.rows[0].id]);
+      const existingNextJobRows = await client.query(
+        `select * from processing_jobs
+         where recording_id = $1
+           and job_type = $2
+         order by created_at desc
+         limit 1`,
+        [job.recording_id, options.nextJobType]
+      );
+      let nextJob = existingNextJobRows.rows[0];
+      if (nextJob?.status === "pending" || nextJob?.status === "running") {
+        await client.query("select pg_notify('processing_jobs', $1)", [nextJob.id]);
+      } else if (nextJob) {
+        const resetRows = await client.query(
+          `update processing_jobs
+           set status = 'pending',
+               error_message = null,
+               started_at = null,
+               finished_at = null,
+               processing_duration_ms = null,
+               updated_at = now()
+           where id = $1
+           returning *`,
+          [nextJob.id]
+        );
+        nextJob = resetRows.rows[0];
+        await client.query("select pg_notify('processing_jobs', $1)", [nextJob.id]);
+      } else {
+        const nextJobRows = await client.query("insert into processing_jobs (recording_id, job_type, status) values ($1, $2, 'pending') returning *", [job.recording_id, options.nextJobType]);
+        nextJob = nextJobRows.rows[0];
+        await client.query("select pg_notify('processing_jobs', $1)", [nextJob.id]);
+      }
       console.log("[jobs] enqueued next job", {
         previousJobId: jobId,
-        nextJobId: nextJobRows.rows[0].id,
+        nextJobId: nextJob.id,
         recordingId: job.recording_id,
-        nextJobType: options.nextJobType
+        nextJobType: options.nextJobType,
+        reused: Boolean(existingNextJobRows.rows[0])
       });
     }
     if (options.recordingStatus) {
@@ -357,9 +407,9 @@ export async function retryFailedJob(jobId: string): Promise<ProcessingJob> {
        where id = $1
          and (
            status = 'failed'
-           or (job_type = 'speaker_identification' and status = 'completed')
            or (job_type = 'text_correction' and status in ('completed', 'failed'))
            or (job_type = 'embedding_indexing' and status in ('completed', 'failed'))
+           or (job_type = 'summary' and status in ('completed', 'failed'))
          )
        returning *`,
       [jobId]
@@ -377,6 +427,156 @@ export async function retryFailedJob(jobId: string): Promise<ProcessingJob> {
       attemptCount: job.attemptCount
     });
     return job;
+  });
+}
+
+export async function updateRecordingSpeakerLabels(recordingId: string, mappings: Array<{ from: string; to: string }>): Promise<void> {
+  const cleaned = mappings
+    .map((mapping) => ({ from: mapping.from.trim(), to: mapping.to.trim() }))
+    .filter((mapping) => mapping.from && mapping.to && mapping.from !== mapping.to);
+  if (cleaned.length === 0) return;
+
+  await transaction(async (client) => {
+    const recordingRows = await client.query("select id from recordings where id = $1 for update", [recordingId]);
+    if (recordingRows.rowCount === 0) {
+      throw new Error("Recording not found");
+    }
+
+    for (const mapping of cleaned) {
+      await client.query(
+        `update speaker_diarization_segments
+         set speaker_label = $3
+         where recording_id = $1 and speaker_label = $2`,
+        [recordingId, mapping.from, mapping.to]
+      );
+      await client.query(
+        `update transcription_segments
+         set speaker_label = $3
+         where recording_id = $1 and speaker_label = $2`,
+        [recordingId, mapping.from, mapping.to]
+      );
+      await client.query(
+        `update utterance_segments
+         set speaker_label = $3
+         where recording_id = $1 and speaker_label = $2`,
+        [recordingId, mapping.from, mapping.to]
+      );
+    }
+
+    await client.query("delete from recording_search_chunks where recording_id = $1", [recordingId]);
+    if (getAppConfig().search.embeddingEnabled) {
+      const existing = await client.query(
+        `select id, status from processing_jobs
+         where recording_id = $1
+           and job_type = 'embedding_indexing'
+           and status in ('pending', 'running', 'completed', 'failed')
+         order by created_at desc
+         limit 1`,
+        [recordingId]
+      );
+      if (existing.rows[0]?.status === "pending" || existing.rows[0]?.status === "running") {
+        await client.query("select pg_notify('processing_jobs', $1)", [existing.rows[0].id]);
+      } else if (existing.rows[0]) {
+        await client.query(
+          `update processing_jobs
+           set status = 'pending',
+               error_message = null,
+               started_at = null,
+               finished_at = null,
+               processing_duration_ms = null,
+               updated_at = now()
+           where id = $1`,
+          [existing.rows[0].id]
+        );
+        await client.query("select pg_notify('processing_jobs', $1)", [existing.rows[0].id]);
+      } else {
+        const jobRows = await client.query(
+          `insert into processing_jobs (recording_id, job_type, status)
+           values ($1, 'embedding_indexing', 'pending')
+           returning id`,
+          [recordingId]
+        );
+        await client.query("select pg_notify('processing_jobs', $1)", [jobRows.rows[0].id]);
+      }
+      await client.query("update recordings set status = 'processing', error_message = null, updated_at = now() where id = $1", [recordingId]);
+    } else {
+      await client.query("update recordings set updated_at = now() where id = $1", [recordingId]);
+    }
+  });
+  console.log("[recordings] speaker labels updated", {
+    recordingId,
+    mappings: cleaned
+  });
+}
+
+export async function updateRecordingLocation(recordingId: string, location: string | null): Promise<void> {
+  const value = location?.trim() || null;
+  await transaction(async (client) => {
+    await ensureRecordingLocationColumn(client);
+    const rows = await client.query(
+      `update recordings
+       set location = $2,
+           updated_at = now()
+       where id = $1
+       returning id`,
+      [recordingId, value]
+    );
+    if (rows.rowCount === 0) {
+      throw new Error("Recording not found");
+    }
+  });
+  console.log("[recordings] location updated", {
+    recordingId,
+    location: value
+  });
+}
+
+export async function updateRecordingTitle(recordingId: string, title: string): Promise<void> {
+  const value = title.trim();
+  if (!value) throw new Error("Title is required");
+  await transaction(async (client) => {
+    const rows = await client.query(
+      `update recordings
+       set title = $2,
+           updated_at = now()
+       where id = $1
+       returning id`,
+      [recordingId, value]
+    );
+    if (rows.rowCount === 0) {
+      throw new Error("Recording not found");
+    }
+  });
+  console.log("[recordings] title updated", {
+    recordingId,
+    title: value
+  });
+}
+
+export async function saveRecordingSummary(input: {
+  recordingId: string;
+  provider: "local_llm" | "deepseek_api";
+  modelName: string;
+  summaryText: string;
+}): Promise<void> {
+  const summaryText = input.summaryText.trim();
+  if (!summaryText) throw new Error("Summary text is empty");
+  await query(
+    `insert into recording_summaries (recording_id, provider, model_name, summary_text)
+     values ($1, $2, $3, $4)
+     on conflict (recording_id)
+     do update set
+       provider = excluded.provider,
+       model_name = excluded.model_name,
+       summary_text = excluded.summary_text,
+       updated_at = now()`,
+    [input.recordingId, input.provider, input.modelName, summaryText]
+  );
+  console.log("[recordings] summary saved", {
+    recordingId: input.recordingId,
+    provider: input.provider,
+    modelName: input.modelName,
+    summaryLength: summaryText.length
   });
 }
 
@@ -402,9 +602,20 @@ export async function saveTranscription(recordingId: string, output: Transcripti
     for (const [index, segment] of output.segments.entries()) {
       await client.query(
         `insert into transcription_segments (
-          recording_id, transcription_id, segment_index, start_ms, end_ms, text
-        ) values ($1, $2, $3, $4, $5, $6)`,
-        [recordingId, transcriptionId, index, segment.startMs, segment.endMs, segment.text]
+          recording_id, transcription_id, segment_index, start_ms, end_ms, text,
+          speaker_label, speaker_cluster_id, speaker_confidence
+        ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+        [
+          recordingId,
+          transcriptionId,
+          index,
+          segment.startMs,
+          segment.endMs,
+          segment.text,
+          segment.speakerLabel ?? null,
+          segment.speakerClusterId ?? null,
+          segment.speakerConfidence ?? null
+        ]
       );
     }
   });
@@ -779,13 +990,14 @@ export async function generateUtteranceSegments(
   });
 }
 
-export async function getRecordingForWorker(recordingId: string): Promise<{ recording: Recording; transcriptionSegments: TranscriptionSegment[]; diarizationSegments: SpeakerDiarizationSegment[] }> {
+export async function getRecordingForWorker(recordingId: string): Promise<{ recording: Recording; transcriptionSegments: TranscriptionSegment[]; diarizationSegments: SpeakerDiarizationSegment[]; utteranceSegments: UtteranceSegment[] }> {
   const detail = await getRecordingDetail(recordingId);
   if (!detail) throw new Error("Recording not found");
   return {
     recording: detail.recording,
     transcriptionSegments: detail.transcriptionSegments,
-    diarizationSegments: detail.speakerDiarizationSegments
+    diarizationSegments: detail.speakerDiarizationSegments,
+    utteranceSegments: detail.utteranceSegments
   };
 }
 

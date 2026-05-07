@@ -13,7 +13,7 @@ export class ExtractiveAnswerProvider implements RagAnswerProvider {
     const topEvidence = input.evidence.slice(0, 3);
     return {
       text: topEvidence
-        .map((evidence) => `根据录音《${evidence.recording.title}》${formatRange(evidence.chunk.startMs, evidence.chunk.endMs)}，${evidence.chunk.text} [${evidence.index}]`)
+        .map((evidence) => `根据录音《${evidence.recording.title}》${evidence.recording.location ? `（地点：${evidence.recording.location}）` : ""}${formatRange(evidence.chunk.startMs, evidence.chunk.endMs)}，${evidence.chunk.text} [${evidence.index}]`)
         .join("\n\n"),
       citations: topEvidence.map((evidence) => ({
         index: evidence.index,

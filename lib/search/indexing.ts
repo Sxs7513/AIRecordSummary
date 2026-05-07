@@ -8,10 +8,6 @@ export async function indexRecordingForSearch(recordingId: string) {
   if (!config.embeddingEnabled) {
     return { chunkCount: 0, skipped: true };
   }
-  if (config.embeddingDimensions !== 1024) {
-    throw new Error("Phase 2 MVP schema uses vector(1024). Change EMBEDDING_DIMENSIONS back to 1024 or migrate recording_search_chunks.embedding.");
-  }
-
   const utterances = await listUtterancesForIndex(recordingId);
   const chunks = buildSearchChunks(utterances, {
     maxDurationMs: config.chunkMaxDurationMs,

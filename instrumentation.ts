@@ -4,8 +4,12 @@ export async function register() {
     const { ensureAudioDependencies } = await import("./lib/audio-transcoding-analysis/runtime/dependencies");
     const { initDatabase } = await import("@/lib/db/init");
     const { startEmbeddedJobScheduler } = await import("@/lib/audio-transcoding-analysis/jobs/scheduler");
-    setGlobalAppConfig();
-    await ensureAudioDependencies();
+    const config = setGlobalAppConfig();
+    if (config.audio.installDependenciesOnStartup) {
+      await ensureAudioDependencies();
+    } else {
+      console.log("[audio-deps] startup install disabled");
+    }
     await initDatabase();
     await startEmbeddedJobScheduler();
   }

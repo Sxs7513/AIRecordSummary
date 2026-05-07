@@ -137,12 +137,13 @@ load_env_file() {
   AUDIO_MODEL_CACHE_ROOT="${AUDIO_MODEL_CACHE_ROOT:-model-cache}"
   ASR_PROVIDER="${ASR_PROVIDER:-whisper}"
   EMBEDDING_ENABLED="${EMBEDDING_ENABLED:-true}"
-  EMBEDDING_MODEL="${EMBEDDING_MODEL:-Qwen/Qwen3-Embedding-0.6B}"
+  EMBEDDING_MODEL="${EMBEDDING_MODEL:-Qwen/Qwen3-Embedding-4B}"
   EMBEDDING_MODEL_CACHE_DIR="${EMBEDDING_MODEL_CACHE_DIR:-model-cache/embedding}"
   RAG_ANSWER_ENABLED="${RAG_ANSWER_ENABLED:-true}"
   RAG_ANSWER_PROVIDER="${RAG_ANSWER_PROVIDER:-local_llm}"
-  RAG_ANSWER_MODEL_REPO="${RAG_ANSWER_MODEL_REPO:-Qwen/Qwen3-8B-GGUF}"
-  RAG_ANSWER_MODEL_FILE="${RAG_ANSWER_MODEL_FILE:-Qwen3-8B-Q4_K_M.gguf}"
+  RECORDING_SUMMARY_PROVIDER="${RECORDING_SUMMARY_PROVIDER:-local_llm}"
+  LOCAL_LLM_MODEL_REPO="${LOCAL_LLM_MODEL_REPO:-${RAG_ANSWER_MODEL_REPO:-DevQuasar/Qwen.Qwen3.5-9B-GGUF}}"
+  LOCAL_LLM_MODEL_FILE="${LOCAL_LLM_MODEL_FILE:-${RAG_ANSWER_MODEL_FILE:-Qwen.Qwen3.5-9B.Q8_0.gguf}}"
   PGVECTOR_VERSION="${PGVECTOR_VERSION:-0.8.2}"
 }
 
@@ -641,6 +642,11 @@ ensure_torch() {
 }
 
 ensure_whisper() {
+  if [[ "${ASR_PROVIDER}" != "whisper" ]]; then
+    log "Skipping Whisper setup because ASR_PROVIDER is not whisper."
+    return
+  fi
+
   if python_has_module whisper; then
     log "whisper already installed."
     return
@@ -785,38 +791,46 @@ ensure_llm_correction_runtime() {
   done
 }
 
-ensure_rag_answer_runtime() {
-  if [[ "${RAG_ANSWER_ENABLED:-true}" != "true" ]]; then
-    log "Skipping RAG answer setup because RAG_ANSWER_ENABLED is not true."
-    return
+ensure_local_llm_runtime() {
+  local rag_uses_local_llm="false"
+  local summary_uses_local_llm="false"
+  if [[ "${RAG_ANSWER_ENABLED:-true}" == "true" && "${RAG_ANSWER_PROVIDER:-local_llm}" == "local_llm" ]]; then
+    rag_uses_local_llm="true"
   fi
-
-  if [[ "${RAG_ANSWER_PROVIDER:-local_llm}" != "local_llm" ]]; then
-    log "Skipping local RAG answer setup because RAG_ANSWER_PROVIDER is ${RAG_ANSWER_PROVIDER}."
+  if [[ "${RECORDING_SUMMARY_PROVIDER:-local_llm}" == "local_llm" ]]; then
+    summary_uses_local_llm="true"
+  fi
+  if [[ "${rag_uses_local_llm}" != "true" && "${summary_uses_local_llm}" != "true" ]]; then
+    log "Skipping shared local LLM setup because neither RAG answer nor recording summary uses local_llm."
     return
   fi
 
   if ! python_has_module llama_cpp; then
-    log "Installing llama-cpp-python for local RAG answers via ${PIP_INDEX_URL}."
+    log "Installing llama-cpp-python for shared local LLM via ${PIP_INDEX_URL}."
     pip_install llama-cpp-python
   else
     log "llama-cpp-python already installed."
   fi
 
-  local model_dir="${ROOT_DIR}/${AUDIO_MODEL_CACHE_ROOT}/rag-answer/${RAG_ANSWER_MODEL_REPO//\//__}"
+  local model_dir="${ROOT_DIR}/${AUDIO_MODEL_CACHE_ROOT}/local-llm/${LOCAL_LLM_MODEL_REPO//\//__}"
+  local legacy_model_dir="${ROOT_DIR}/${AUDIO_MODEL_CACHE_ROOT}/rag-answer/${LOCAL_LLM_MODEL_REPO//\//__}"
   mkdir -p "${model_dir}"
-  IFS=',' read -ra model_files <<< "${RAG_ANSWER_MODEL_FILE}"
+  IFS=',' read -ra model_files <<< "${LOCAL_LLM_MODEL_FILE}"
   for model_file in "${model_files[@]}"; do
     model_file="${model_file#"${model_file%%[![:space:]]*}"}"
     model_file="${model_file%"${model_file##*[![:space:]]}"}"
     local model_path="${model_dir}/${model_file}"
     if [[ -f "${model_path}" ]]; then
-      log "Local RAG answer model file already exists: ${model_path}"
+      log "Shared local LLM model file already exists: ${model_path}"
+      continue
+    fi
+    if [[ -f "${legacy_model_dir}/${model_file}" ]]; then
+      log "Shared local LLM model file already exists in legacy cache: ${legacy_model_dir}/${model_file}"
       continue
     fi
 
-    log "Downloading local RAG answer model file: ${RAG_ANSWER_MODEL_REPO}/${model_file}"
-    local model_url="https://huggingface.co/${RAG_ANSWER_MODEL_REPO}/resolve/main/${model_file}"
+    log "Downloading shared local LLM model file: ${LOCAL_LLM_MODEL_REPO}/${model_file}"
+    local model_url="https://huggingface.co/${LOCAL_LLM_MODEL_REPO}/resolve/main/${model_file}"
     "${PYTHON_BIN}" "${ROOT_DIR}/scripts/download_hf_file.py" "${model_url}" "${model_path}"
   done
 }
@@ -852,7 +866,7 @@ main() {
   ensure_pycorrector
   ensure_embedding_runtime
   ensure_llm_correction_runtime
-  ensure_rag_answer_runtime
+  ensure_local_llm_runtime
   print_summary
 }
 

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import contextlib
+import gc
 import json
 import os
 import sys
@@ -37,6 +38,101 @@ def annotation_from_output(diarization_output):
     output_type = type(diarization_output).__name__
     fields = ", ".join(sorted(name for name in dir(diarization_output) if not name.startswith("_"))[:20])
     raise RuntimeError(f"Unsupported pyannote diarization output {output_type}. Available fields: {fields}")
+
+
+def local_pyannote_pipeline_config(cache_dir: str | None) -> str | None:
+    if not cache_dir:
+        return None
+    snapshots_dir = Path(cache_dir) / "models--pyannote--speaker-diarization-3.1" / "snapshots"
+    if not snapshots_dir.exists():
+        return None
+    snapshots = sorted(
+        (path for path in snapshots_dir.iterdir() if path.is_dir()),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    for snapshot in snapshots:
+        config_path = snapshot / "config.yaml"
+        if config_path.exists():
+            return str(config_path)
+    return None
+
+
+def local_hf_snapshot_dir(cache_dir: str | None, model_id: str, required_file: str) -> str | None:
+    if not cache_dir:
+        return None
+    snapshots_dir = Path(cache_dir) / f"models--{model_id.replace('/', '--')}" / "snapshots"
+    if not snapshots_dir.exists():
+        return None
+    snapshots = sorted(
+        (path for path in snapshots_dir.iterdir() if path.is_dir()),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    for snapshot in snapshots:
+        if (snapshot / required_file).exists():
+            return str(snapshot.resolve())
+    return None
+
+
+def temporary_local_pyannote_config(cache_dir: str | None, config_path: str) -> str | None:
+    segmentation_dir = local_hf_snapshot_dir(cache_dir, "pyannote/segmentation-3.0", "pytorch_model.bin")
+    embedding_dir = local_hf_snapshot_dir(cache_dir, "pyannote/wespeaker-voxceleb-resnet34-LM", "pytorch_model.bin")
+    community_xvec_dir = local_hf_snapshot_dir(cache_dir, "pyannote/speaker-diarization-community-1", "plda/xvec_transform.npz")
+    community_plda_dir = local_hf_snapshot_dir(cache_dir, "pyannote/speaker-diarization-community-1", "plda/plda.npz")
+    if not segmentation_dir or not embedding_dir or not community_xvec_dir or not community_plda_dir:
+        return None
+
+    config_text = Path(config_path).read_text(encoding="utf-8")
+    config_text = config_text.replace("segmentation: pyannote/segmentation-3.0", f"segmentation: {json.dumps(segmentation_dir)}")
+    config_text = config_text.replace("embedding: pyannote/wespeaker-voxceleb-resnet34-LM", f"embedding: {json.dumps(embedding_dir)}")
+    temp_config = tempfile.NamedTemporaryFile("w", suffix=".pyannote.config.yaml", delete=False, encoding="utf-8")
+    try:
+        temp_config.write(config_text)
+        return temp_config.name
+    finally:
+        temp_config.close()
+
+
+def load_pyannote_pipeline(Pipeline, cache_dir: str | None, auth_token: str | None, use_local_config: bool):
+    if use_local_config:
+        local_config = local_pyannote_pipeline_config(cache_dir)
+        if local_config:
+            patched_config = temporary_local_pyannote_config(cache_dir, local_config)
+            if not patched_config:
+                print("pyannote local pipeline config found, but local dependency snapshots are incomplete; falling back to online loading.", file=sys.stderr, flush=True)
+            else:
+                print(f"pyannote loading patched local pipeline config: {patched_config}", file=sys.stderr, flush=True)
+                return Pipeline.from_pretrained(patched_config), patched_config
+    else:
+        print("pyannote local pipeline config disabled; using standard pipeline loading.", file=sys.stderr, flush=True)
+
+    if not auth_token:
+        raise RuntimeError(
+            "PYANNOTE_AUTH_TOKEN is required because local pyannote config is disabled or no complete local pyannote pipeline/dependency snapshots were found. "
+            "Download the model into model-cache/huggingface/hub first, or set PYANNOTE_AUTH_TOKEN for online loading."
+        )
+
+    try:
+        return Pipeline.from_pretrained("pyannote/speaker-diarization-3.1", token=auth_token, cache_dir=cache_dir), None
+    except TypeError:
+        return Pipeline.from_pretrained("pyannote/speaker-diarization-3.1", use_auth_token=auth_token, cache_dir=cache_dir), None
+
+
+def use_pyannote_offline_if_complete(cache_dir: str | None, use_local_config: bool) -> bool:
+    if not use_local_config:
+        return False
+    pipeline_config = local_pyannote_pipeline_config(cache_dir)
+    if not pipeline_config:
+        return False
+    temp_config = temporary_local_pyannote_config(cache_dir, pipeline_config)
+    if not temp_config:
+        return False
+    Path(temp_config).unlink(missing_ok=True)
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    os.environ["TRANSFORMERS_OFFLINE"] = "1"
+    os.environ["HF_DATASETS_OFFLINE"] = "1"
+    return True
 
 
 class PyannoteProgressHook:
@@ -86,6 +182,14 @@ def move_audio_to_device(audio, device):
     if device.type == "cpu":
         return audio
     return {**audio, "waveform": audio["waveform"].to(device)}
+
+
+def release_torch_memory(torch):
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available() and hasattr(torch.mps, "empty_cache"):
+        torch.mps.empty_cache()
 
 
 def load_audio_for_pyannote(audio_path: str):
@@ -142,6 +246,7 @@ def main() -> int:
     parser.add_argument("audio_path")
     parser.add_argument("--auth-token", default=os.environ.get("PYANNOTE_AUTH_TOKEN"))
     parser.add_argument("--cache-dir", default=os.environ.get("HUGGINGFACE_HUB_CACHE"))
+    parser.add_argument("--no-local-config", action="store_true")
     args = parser.parse_args()
 
     warnings.filterwarnings(
@@ -154,12 +259,9 @@ def main() -> int:
         message=r"std\(\): degrees of freedom is <= 0.*",
         category=UserWarning,
     )
-
-    if not args.auth_token:
-        raise RuntimeError(
-            "PYANNOTE_AUTH_TOKEN is required for pyannote/speaker-diarization-3.1. "
-            "Set PYANNOTE_AUTH_TOKEN in .env with a HuggingFace token that has access to the pyannote model."
-        )
+    use_local_config = not args.no_local_config
+    if use_pyannote_offline_if_complete(args.cache_dir, use_local_config):
+        print("pyannote offline mode enabled before import: complete local snapshots found.", file=sys.stderr, flush=True)
 
     with contextlib.redirect_stdout(sys.stderr):
         progress("import", "加载 pyannote 依赖", 5)
@@ -172,10 +274,7 @@ def main() -> int:
         if args.cache_dir:
             Path(args.cache_dir).mkdir(parents=True, exist_ok=True)
         progress("load_pipeline", "加载 pyannote diarization pipeline", 15)
-        try:
-            pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1", token=args.auth_token, cache_dir=args.cache_dir)
-        except TypeError:
-            pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1", use_auth_token=args.auth_token, cache_dir=args.cache_dir)
+        pipeline, temp_pipeline_config = load_pyannote_pipeline(Pipeline, args.cache_dir, args.auth_token, use_local_config)
 
         device = resolve_device(torch)
         pipeline.to(device)
@@ -202,6 +301,15 @@ def main() -> int:
                 "confidence": None,
             }
         )
+
+    with contextlib.suppress(Exception):
+        del diarization
+        del diarization_output
+        del audio
+        del pipeline
+        release_torch_memory(torch)
+        if temp_pipeline_config:
+            Path(temp_pipeline_config).unlink(missing_ok=True)
 
     progress("done", "Speaker diarization 完成", 100)
     print(json.dumps({"modelName": "pyannote/speaker-diarization-3.1", "segments": segments}, ensure_ascii=False))

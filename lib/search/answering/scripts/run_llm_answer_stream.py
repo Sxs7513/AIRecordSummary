@@ -2,6 +2,11 @@
 import json
 import re
 import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
+
+from lib.local_llm.scripts.chat_template import STOP_TOKENS, chat_prompt
 
 
 def citation_payload(evidence, indices):
@@ -21,25 +26,31 @@ def citation_payload(evidence, indices):
     return citations
 
 
-def build_prompt(query, evidence):
+def build_messages(query, evidence):
     items = []
     for item in evidence:
+        location = item["recording"].get("location") or "未配置"
         items.append(
-            f"[{item['index']}] 录音：{item['recording']['title']} "
+            f"[{item['index']}] 录音标题：{item['recording']['title']}\n"
+            f"地点：{location}\n"
             f"时间：{item['chunk']['startMs']}-{item['chunk']['endMs']}ms\n"
             f"{item['chunk']['text']}"
         )
-    return (
-        "<|im_start|>system\n"
+    system = (
         "你是一个谨慎的录音证据总结助手。只能基于证据回答，不能编造。\n"
+        "如果用户要求分别说明、逐条说明、每个录音说了什么，或问题是在问某个时间范围内的录音分别说了什么，必须按录音标题分段回答。\n"
+        "分段格式必须是：每条录音独立一段，段首写《录音标题》：，该段只总结这条录音的内容，并在段末或关键结论后带对应证据编号。\n"
+        "不要把多条录音合并成一段；如果有多条证据，每条证据至少对应一个独立段落。\n"
         "直接输出面向用户的中文回答，不要输出 JSON，不要输出 Markdown 标题。\n"
         "每个关键结论后必须带证据编号，例如 [1]、[2]。\n"
         "如果证据不足，只回答：没有在录音中找到足够依据。\n"
-        "<|im_end|>\n"
-        "<|im_start|>user\n"
-        f"用户问题：{query}\n\n证据：\n" + "\n\n".join(items) +
-        "\n<|im_end|>\n<|im_start|>assistant\n"
     )
+    user = f"用户问题：{query}\n\n证据：\n" + "\n\n".join(items)
+    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+
+def build_prompt(llm, query, evidence):
+    return chat_prompt(llm, build_messages(query, evidence))
 
 
 def emit(payload):
@@ -60,9 +71,9 @@ def main():
     except Exception as exc:
         raise RuntimeError("llama-cpp-python is required for local RAG answers") from exc
 
-    prompt = build_prompt(payload["query"], evidence)
     llm = Llama(model_path=payload["modelPath"], n_ctx=int(payload.get("contextSize") or 8192), verbose=False)
-    output = llm(prompt, max_tokens=1200, temperature=0.1, stop=["</s>", "<|im_end|>"], stream=True)
+    prompt = build_prompt(llm, payload["query"], evidence)
+    output = llm(prompt, max_tokens=1200, temperature=0.1, stop=STOP_TOKENS, stream=True)
 
     text_parts = []
     thinking_parts = []

@@ -4,6 +4,15 @@ import { useEffect } from "react";
 import type { SpeakerProfile, UtteranceSegment } from "@/lib/types/models";
 import { formatMs } from "@/lib/types/format";
 
+function playUtteranceSegment(segment: UtteranceSegment) {
+  window.dispatchEvent(new CustomEvent("recording-play-segment", {
+    detail: {
+      startMs: segment.startMs,
+      endMs: segment.endMs
+    }
+  }));
+}
+
 export function UtteranceList({ segments, speakerProfiles, highlightMs }: { segments: UtteranceSegment[]; speakerProfiles: SpeakerProfile[]; highlightMs: number | null }) {
   useEffect(() => {
     document.querySelector(".segment.highlight")?.scrollIntoView({ block: "center", behavior: "smooth" });
@@ -15,8 +24,22 @@ export function UtteranceList({ segments, speakerProfiles, highlightMs }: { segm
       {segments.map((segment) => {
         const profile = segment.matchedSpeakerProfileId ? profileById.get(segment.matchedSpeakerProfileId) : null;
         const highlighted = highlightMs !== null && highlightMs >= segment.startMs && highlightMs <= segment.endMs;
+        const playSegment = () => playUtteranceSegment(segment);
         return (
-          <article className={`segment ${segment.isTargetPerson ? "target" : ""} ${highlighted ? "highlight" : ""}`} id={`utterance-${segment.id}`} key={segment.id}>
+          <article
+            className={`segment utterance-segment ${segment.isTargetPerson ? "target" : ""} ${highlighted ? "highlight" : ""}`}
+            id={`utterance-${segment.id}`}
+            key={segment.id}
+            onClick={playSegment}
+            onKeyDown={(event) => {
+              if (event.key !== "Enter" && event.key !== " ") return;
+              event.preventDefault();
+              playSegment();
+            }}
+            role="button"
+            tabIndex={0}
+            title="点击播放该段录音"
+          >
             <div className="segment-head">
               <div className="meta">
                 <span>

@@ -84,8 +84,8 @@ export async function POST(request: Request) {
               {
                 pythonBin: config.search.embeddingPythonBin,
                 modelCacheRoot: config.audio.modelCacheRoot,
-                modelRepo: config.search.answerModelRepo,
-                modelFile: config.search.answerModelFile,
+                modelRepo: config.search.localLlmModelRepo,
+                modelFile: config.search.localLlmModelFile,
                 contextSize: config.search.answerContextSize,
                 timeoutMs: config.search.answerTimeoutMs
               },

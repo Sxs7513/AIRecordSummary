@@ -1,5 +1,5 @@
 export type RecordingStatus = "uploaded" | "processing" | "completed" | "failed";
-export type JobType = "transcription" | "speaker_diarization" | "speaker_identification" | "text_correction" | "embedding_indexing";
+export type JobType = "transcription" | "speaker_diarization" | "speaker_identification" | "text_correction" | "embedding_indexing" | "summary";
 export type JobStatus = "pending" | "running" | "completed" | "failed";
 export type SpeakerProfileStatus = "active" | "inactive";
 export type SampleStatus = "uploaded" | "processing" | "completed" | "failed";
@@ -9,6 +9,7 @@ export interface Recording {
   title: string;
   fileName: string;
   storagePath: string;
+  location: string | null;
   mimeType: string;
   fileSizeBytes: number;
   durationSeconds: number | null;
@@ -27,6 +28,16 @@ export interface Transcription {
   modelName: string;
   fullText: string;
   segmentCount: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface RecordingSummary {
+  id: string;
+  recordingId: string;
+  provider: "local_llm" | "deepseek_api";
+  modelName: string;
+  summaryText: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -123,6 +134,7 @@ export interface ProcessingJob {
 
 export interface RecordingDetail {
   recording: Recording;
+  summary: RecordingSummary | null;
   transcription: Transcription | null;
   transcriptionSegments: TranscriptionSegment[];
   speakerDiarizationSegments: SpeakerDiarizationSegment[];
@@ -140,10 +152,14 @@ export interface TranscriptionOutput {
   language: string | null;
   modelName: string;
   fullText: string;
+  diarization?: DiarizationOutput | null;
   segments: Array<{
     startMs: number;
     endMs: number;
     text: string;
+    speakerLabel?: string | null;
+    speakerClusterId?: string | null;
+    speakerConfidence?: number | null;
   }>;
 }
 
@@ -174,7 +190,11 @@ export interface AudioProgressEvent {
 export interface SearchFilters {
   recordingIds?: string[];
   speakerProfileIds?: string[];
+  personNames?: string[];
+  locations?: string[];
   targetPersonOnly?: boolean;
+  createdFrom?: string | null;
+  createdTo?: string | null;
   uploadedFrom?: string | null;
   uploadedTo?: string | null;
 }
@@ -185,6 +205,7 @@ export interface SearchEvidence {
     id: string;
     title: string;
     fileName: string;
+    location: string | null;
     durationSeconds: number | null;
   };
   chunk: {
