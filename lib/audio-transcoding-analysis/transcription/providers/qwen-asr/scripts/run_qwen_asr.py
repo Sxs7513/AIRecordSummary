@@ -784,7 +784,7 @@ def maybe_enhance_low_volume_clip(args, clip_path: str, metadata: dict) -> tuple
     if not args.enhance_low_volume_segments:
         return clip_path, False, {}
     stats = wav_volume_stats(clip_path)
-    low_volume = stats["rms"] < args.low_volume_rms_threshold or stats["peak"] < args.low_volume_peak_threshold
+    low_volume = stats["rms"] < args.low_volume_rms_threshold and stats["peak"] < args.low_volume_peak_threshold
     log_event(
         "segment_volume_checked",
         **metadata,
@@ -1026,8 +1026,8 @@ def main() -> int:
     parser.add_argument("--max-inference-batch-size", type=int, default=4)
     parser.add_argument("--segment-timeout-s", type=int, default=180)
     parser.add_argument("--enhance-low-volume-segments", action="store_true")
-    parser.add_argument("--low-volume-rms-threshold", type=float, default=0.015)
-    parser.add_argument("--low-volume-peak-threshold", type=float, default=0.12)
+    parser.add_argument("--low-volume-rms-threshold", type=float, default=0.008)
+    parser.add_argument("--low-volume-peak-threshold", type=float, default=0.04)
     parser.add_argument("--speaker-segment-merge-max-gap-ms", type=int, default=2000)
     parser.add_argument("--speaker-segment-merge-max-duration-ms", type=int, default=60000)
     parser.add_argument("--speaker-segment-min-duration-ms", type=int, default=1200)
@@ -1058,13 +1058,15 @@ def main() -> int:
             message=r"std\(\): degrees of freedom is <= 0.*",
             category=UserWarning,
         )
+        external_segments = load_external_segments(args.segments_json_path)
         try:
             import torch
             from funasr import AutoModel
-            from pyannote.audio import Pipeline
             from qwen_asr import Qwen3ASRModel
+            if not args.segments_json_path:
+                from pyannote.audio import Pipeline
         except Exception as exc:
-            raise RuntimeError("qwen-asr/funasr/pyannote/torch is not installed. Run scripts/install_audio_dependencies.sh first.") from exc
+            raise RuntimeError("qwen-asr/funasr/torch is not installed. Install the Qwen ASR Python dependencies first.") from exc
 
         if args.cache_dir:
             Path(args.cache_dir).mkdir(parents=True, exist_ok=True)
@@ -1072,11 +1074,15 @@ def main() -> int:
             os.environ["HUGGINGFACE_HUB_CACHE"] = str(Path(args.cache_dir).parent / "huggingface" / "hub")
             os.environ["TRANSFORMERS_CACHE"] = args.cache_dir
 
-        if args.pyannote_cache_dir:
+        if args.pyannote_cache_dir and not args.segments_json_path:
             Path(args.pyannote_cache_dir).mkdir(parents=True, exist_ok=True)
 
-        diarization = diarize_with_pyannote(args, torch, Pipeline)
-        speaker_segments = prepare_speaker_segments_for_asr(args, diarization)
+        if args.segments_json_path:
+            diarization = {"provider": "external", "modelName": "external", "segments": external_segments}
+            speaker_segments = []
+        else:
+            diarization = diarize_with_pyannote(args, torch, Pipeline)
+            speaker_segments = prepare_speaker_segments_for_asr(args, diarization)
 
         progress("load_model", f"加载 Qwen3-ASR 模型 {args.model}", 64)
         model = load_qwen_model(args, torch, Qwen3ASRModel)

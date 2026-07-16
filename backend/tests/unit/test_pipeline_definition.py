@@ -1,0 +1,89 @@
+import asyncio
+
+import pytest
+
+from audio_processing.definition import build_recording_processing, recording_processing
+from audio_processing.stages.noop import NoopStage
+from pipeline.contracts import ResourceQueue, RetryPolicy
+from pipeline.definitions.graph import PipelineDefinition, PipelineNode
+from pipeline.example import build_example_registry, example_pipeline, run_example
+from pipeline.registry import StageRegistry
+
+
+def test_recording_processing_uses_diarization_segments_for_qwen_asr() -> None:
+    nodes = {node.name: node for node in recording_processing.nodes}
+
+    assert nodes["diarize_pyannote"].depends_on == ("normalize_audio",)
+    assert nodes["preprocess_asr_audio"].depends_on == ("normalize_audio",)
+    assert nodes["transcribe_qwen_asr"].depends_on == ("preprocess_asr_audio", "diarize_pyannote")
+    assert nodes["transcribe_qwen_asr"].input_artifacts[1].artifact_type == "diarization.pyannote"
+    assert nodes["transcribe_qwen_asr"].resource_queue == ResourceQueue.GPU_HIGH
+    assert nodes["transcribe_qwen_asr"].stage_version == "5"
+    assert nodes["correct_asr_windows"].depends_on == ("transcribe_qwen_asr",)
+    assert nodes["align_transcript"].depends_on == ("correct_asr_windows", "preprocess_asr_audio", "diarize_pyannote")
+    assert nodes["build_utterances"].depends_on == ("align_transcript",)
+    assert nodes["build_utterances"].stage_version == "4"
+    assert nodes["build_search_chunks"].stage_version == "2"
+
+
+def test_recording_processing_can_select_funasr_without_changing_downstream_contracts() -> None:
+    definition = build_recording_processing("funasr_nano")
+    nodes = {node.name: node for node in definition.nodes}
+
+    assert "transcribe_qwen_asr" not in nodes
+    assert nodes["transcribe_funasr_nano"].depends_on == ("preprocess_asr_audio", "diarize_pyannote")
+    assert nodes["transcribe_funasr_nano"].stage_version == "3"
+    assert nodes["transcribe_funasr_nano"].output_artifacts == ("transcript.asr_windows",)
+    assert nodes["correct_asr_windows"].depends_on == ("transcribe_funasr_nano",)
+    assert nodes["correct_asr_windows"].input_artifacts[0].from_node == "transcribe_funasr_nano"
+    assert nodes["align_transcript"].depends_on == ("correct_asr_windows", "preprocess_asr_audio", "diarize_pyannote")
+    assert nodes["build_utterances"].depends_on == ("align_transcript",)
+
+
+def test_recording_processing_indexes_and_summarizes_in_parallel() -> None:
+    nodes = {node.name: node for node in recording_processing.nodes}
+
+    assert nodes["embedding_indexing"].depends_on == ("build_search_chunks",)
+    assert nodes["generate_summary"].depends_on == ("build_utterances",)
+    assert nodes["generate_summary"].stage_version == "2"
+    assert nodes["build_search_chunks"].output_artifacts == ("search.chunks",)
+    assert nodes["build_search_chunks"].resource_queue == ResourceQueue.GPU_NORMAL
+
+
+def test_pipeline_definition_rejects_cycles() -> None:
+    retry_policy = RetryPolicy(max_attempts=1)
+
+    with pytest.raises(ValueError, match="dependency cycle"):
+        PipelineDefinition(
+            name="cycle",
+            version="1",
+            nodes=(
+                PipelineNode("first", "noop", "1", ResourceQueue.CPU, retry_policy, ("second",)),
+                PipelineNode("second", "noop", "1", ResourceQueue.CPU, retry_policy, ("first",)),
+            ),
+        )
+
+
+def test_stage_registry_is_explicit_and_rejects_duplicates() -> None:
+    registry = StageRegistry()
+    stage = NoopStage()
+
+    registry.register(stage)
+
+    assert registry.get("noop", "1") is stage
+    with pytest.raises(ValueError, match="already registered"):
+        registry.register(stage)
+
+
+def test_pipeline_example_has_registered_stage_plugins() -> None:
+    registry = build_example_registry()
+
+    for node in example_pipeline.nodes:
+        assert registry.get(node.stage_name, node.stage_version).name == node.stage_name
+
+
+def test_pipeline_example_passes_upstream_output_to_dependent_stage() -> None:
+    output = asyncio.run(run_example())
+
+    assert output["consumed"] is True
+    assert output["upstream_outputs"]["prepare"]["prepared"] is True

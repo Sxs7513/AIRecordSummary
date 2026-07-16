@@ -1,8 +1,8 @@
-import { Upload } from "lucide-react";
 import { SpeakerProfileForm } from "@/components/speaker-profile-form";
+import { DeleteSpeakerProfileButton, SpeakerProfileSampleForm } from "@/components/speaker-profile-actions";
 import { StatusBadge } from "@/components/status-badge";
-import { listSpeakerProfiles } from "@/lib/db/speaker-profiles";
-import { formatBytes, formatDate } from "@/lib/types/format";
+import { listSpeakerProfiles } from "@/app/data/speaker-profiles";
+import { formatBytes, formatDate } from "@/app/shared/format";
 
 export const dynamic = "force-dynamic";
 
@@ -35,23 +35,10 @@ export default async function SpeakerProfilesPage() {
                     {profile.notes || "无备注"} · <StatusBadge status={profile.status} />
                   </p>
                 </div>
-                <form action={`/api/speaker-profiles/${profile.id}/delete`} method="post">
-                  <button className="danger" type="submit">
-                    删除
-                  </button>
-                </form>
+                <DeleteSpeakerProfileButton profileId={profile.id} />
               </div>
 
-              <form className="toolbar" action={`/api/speaker-profiles/${profile.id}/samples`} method="post" encType="multipart/form-data">
-                <label>
-                  参考音频
-                  <input name="audio" type="file" accept="audio/*" required />
-                </label>
-                <button type="submit">
-                  <Upload size={16} />
-                  上传样本
-                </button>
-              </form>
+              <SpeakerProfileSampleForm profileId={profile.id} />
 
               <table style={{ marginTop: 12 }}>
                 <thead>

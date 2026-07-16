@@ -4,9 +4,11 @@
   "private": true,
   "scripts": {
     "dev": "next dev -H 127.0.0.1",
+    "dev:python-web": "cd backend && .venv/bin/uvicorn main:app --app-dir src --reload --no-access-log",
     "build": "next build",
     "start": "next start -H 127.0.0.1",
-    "db:init": "tsx scripts/db/init.ts",
+    "db:init": "sh scripts/db/init-python-backend.sh",
+    "db:init:python": "sh scripts/db/init-python-backend.sh",
     "db:drop-tables": "tsx scripts/db/drop-tables.ts --confirm airecord --yes",
     "search:reindex": "tsx scripts/search/reindex-recordings.ts",
     "typecheck": "tsc --noEmit",
@@ -28,7 +30,8 @@
     "remark-gfm": "^4.0.1",
     "server-only": "^0.0.1",
     "tsx": "^4.19.2",
-    "zod": "^3.24.1"
+    "zod": "^3.24.1",
+    "zustand": "^5.0.14"
   },
   "devDependencies": {
     "@types/node": "^22.10.5",

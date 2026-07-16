@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { pythonApiUrl } from "@/app/sdk/python-api";
 
 interface Progress {
   percent: number;
@@ -26,7 +27,7 @@ export function RecordingProgress({
     let cancelled = false;
     async function load() {
       try {
-        const response = await fetch(`/api/recordings/${recordingId}/progress`, { cache: "no-store" });
+        const response = await fetch(pythonApiUrl(`/api/recordings/${recordingId}/progress`), { cache: "no-store" });
         const payload = await response.json();
         if (!cancelled) setProgress(payload.progress ?? null);
       } catch {

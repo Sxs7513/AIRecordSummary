@@ -1,6 +1,6 @@
 import type { Metadata } from "next";
-import Link from "next/link";
 import "./globals.css";
+import { AuthProvider } from "@/components/auth-provider";
 
 export const metadata: Metadata = {
   title: "AI 录音检索",
@@ -11,16 +11,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
   return (
     <html lang="zh-CN">
       <body>
-        <div className="shell">
-          <aside className="sidebar">
-            <p className="brand">AI 录音检索</p>
-            <nav className="nav">
-              <Link href="/chat">问录音</Link>
-              <Link href="/recordings">录音管理</Link>
-            </nav>
-          </aside>
-          <main className="main">{children}</main>
-        </div>
+        <AuthProvider>{children}</AuthProvider>
       </body>
     </html>
   );

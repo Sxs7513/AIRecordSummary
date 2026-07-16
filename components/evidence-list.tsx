@@ -3,8 +3,8 @@
 import Link from "next/link";
 import { ChevronDown, Play } from "lucide-react";
 import { useState } from "react";
-import { formatMs } from "@/lib/types/format";
-import type { SearchEvidence } from "@/lib/types/models";
+import { formatMs } from "@/app/shared/format";
+import type { SearchEvidence } from "@/app/shared/models";
 
 export function EvidenceList({
   evidence,
@@ -50,7 +50,7 @@ export function EvidenceList({
             </button>
             {isOpen ? (
               <div className="evidence-card-body">
-                <p>{item.chunk.text}</p>
+                {item.chunk.text ? <p>{item.chunk.text}</p> : null}
                 <div className="evidence-card-actions">
                   <Link className="button secondary" href={item.url} target="_blank" rel="noreferrer">
                     <Play size={16} />

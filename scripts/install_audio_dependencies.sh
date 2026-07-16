@@ -3,10 +3,10 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-VENV_DIR="${ROOT_DIR}/.venv-audio"
+VENV_DIR="${ROOT_DIR}/backend/.venv"
 PIP_CONSTRAINTS_FILE="${ROOT_DIR}/scripts/audio-python-constraints.txt"
-PYTHON_BIN_DEFAULT="python3.10"
-PYTHON_VERSION_MIN="3.10"
+PYTHON_BIN_DEFAULT="python3.14"
+PYTHON_VERSION_MIN="3.14"
 PIP_INDEX_URL="${PIP_INDEX_URL:-https://mirrors.aliyun.com/pypi/simple/}"
 PIP_TRUSTED_HOST="${PIP_TRUSTED_HOST:-mirrors.aliyun.com}"
 
@@ -52,7 +52,7 @@ python_meets_min_version() {
 
 find_supported_python() {
   local python_bin
-  for python_bin in python3.10 python3; do
+  for python_bin in python3.14 python3; do
     if command_exists "${python_bin}" && python_meets_min_version "${python_bin}"; then
       printf '%s\n' "${python_bin}"
       return 0
@@ -135,7 +135,11 @@ load_env_file() {
   LLM_CORRECTION_MODEL_REPO="${LLM_CORRECTION_MODEL_REPO:-Qwen/Qwen2.5-7B-Instruct-GGUF}"
   LLM_CORRECTION_MODEL_FILE="${LLM_CORRECTION_MODEL_FILE:-qwen2.5-7b-instruct-q4_k_m-00001-of-00002.gguf,qwen2.5-7b-instruct-q4_k_m-00002-of-00002.gguf}"
   AUDIO_MODEL_CACHE_ROOT="${AUDIO_MODEL_CACHE_ROOT:-model-cache}"
-  ASR_PROVIDER="${ASR_PROVIDER:-whisper}"
+  ASR_PROVIDER="${ASR_PROVIDER:-qwen_asr}"
+  QWEN_ASR_MODEL="${QWEN_ASR_MODEL:-Qwen/Qwen3-ASR-1.7B}"
+  TRANSCRIPT_ALIGNMENT_ENABLED="${TRANSCRIPT_ALIGNMENT_ENABLED:-true}"
+  TRANSCRIPT_ALIGNMENT_MODEL="${TRANSCRIPT_ALIGNMENT_MODEL:-Qwen/Qwen3-ForcedAligner-0.6B}"
+  FUNASR_NANO_MODEL="${FUNASR_NANO_MODEL:-FunAudioLLM/Fun-ASR-Nano-2512}"
   EMBEDDING_ENABLED="${EMBEDDING_ENABLED:-true}"
   EMBEDDING_MODEL="${EMBEDDING_MODEL:-Qwen/Qwen3-Embedding-4B}"
   EMBEDDING_MODEL_CACHE_DIR="${EMBEDDING_MODEL_CACHE_DIR:-model-cache/embedding}"
@@ -163,6 +167,20 @@ pip_install_binary_from_pypi() {
   "${VENV_PIP}" install --index-url "https://pypi.org/simple" --only-binary=:all: -c "${PIP_CONSTRAINTS_FILE}" "$@"
 }
 
+install_llama_cpp_python() {
+  local platform
+  platform="$(detect_platform)"
+
+  if [[ "${platform}" == "macos" && "$(uname -m)" == "arm64" ]]; then
+    log "Building llama-cpp-python for Apple Silicon with Metal; disabling native ARM feature probes that can hang on i8mm detection."
+    CMAKE_ARGS="${CMAKE_ARGS:-} -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_APPLE_SILICON_PROCESSOR=arm64 -DGGML_METAL=on -DGGML_NATIVE=OFF" \
+      pip_install --verbose llama-cpp-python
+    return
+  fi
+
+  pip_install --verbose llama-cpp-python
+}
+
 python_pip_install() {
   "${VENV_PYTHON}" -m pip install --index-url "${PIP_INDEX_URL}" --trusted-host "${PIP_TRUSTED_HOST}" -c "${PIP_CONSTRAINTS_FILE}" "$@"
 }
@@ -186,20 +204,20 @@ ensure_python() {
   platform="$(detect_platform)"
 
   if [[ "${platform}" == "macos" ]] && command_exists brew; then
-    log "Python ${PYTHON_VERSION_MIN}+ not found. Installing python@3.10 via Homebrew."
-    brew_install python@3.10
+    log "Python ${PYTHON_VERSION_MIN}+ not found. Installing python@3.14 via Homebrew."
+    brew_install python@3.14
     PYTHON_BIN="$(find_supported_python || true)"
     if [[ -n "${PYTHON_BIN}" ]]; then
       return
     fi
-    fail "Installed python@3.10, but no Python ${PYTHON_VERSION_MIN}+ binary was found in PATH."
+    fail "Installed python@3.14, but no Python ${PYTHON_VERSION_MIN}+ binary was found in PATH."
   fi
 
   if [[ "${platform}" == "linux" ]]; then
     if command_exists apt-get; then
-      log "Python ${PYTHON_VERSION_MIN}+ not found. Installing python3.10 via apt-get."
+      log "Python ${PYTHON_VERSION_MIN}+ not found. Installing python3.14 via apt-get."
       sudo apt-get update
-      sudo apt-get install -y python3.10 python3.10-venv python3-pip
+      sudo apt-get install -y python3.14 python3.14-venv python3-pip
       PYTHON_BIN="$(find_supported_python || true)"
       if [[ -n "${PYTHON_BIN}" ]]; then
         return
@@ -208,8 +226,8 @@ ensure_python() {
     fi
 
     if command_exists dnf; then
-      log "Python ${PYTHON_VERSION_MIN}+ not found. Installing python3.10 via dnf."
-      sudo dnf install -y python3.10 python3.10-pip
+      log "Python ${PYTHON_VERSION_MIN}+ not found. Installing python3.14 via dnf."
+      sudo dnf install -y python3.14 python3.14-pip
       PYTHON_BIN="$(find_supported_python || true)"
       if [[ -n "${PYTHON_BIN}" ]]; then
         return
@@ -218,8 +236,8 @@ ensure_python() {
     fi
 
     if command_exists yum; then
-      log "Python ${PYTHON_VERSION_MIN}+ not found. Installing python3.10 via yum."
-      sudo yum install -y python3.10 python3.10-pip
+      log "Python ${PYTHON_VERSION_MIN}+ not found. Installing python3.14 via yum."
+      sudo yum install -y python3.14 python3.14-pip
       PYTHON_BIN="$(find_supported_python || true)"
       if [[ -n "${PYTHON_BIN}" ]]; then
         return
@@ -621,6 +639,11 @@ ensure_venv() {
   fi
 }
 
+ensure_backend_runtime() {
+  log "Installing Python backend runtime and test dependencies in the audio environment."
+  python_pip_install -e "${ROOT_DIR}/backend[dev]"
+}
+
 upgrade_base_tools() {
   log "Upgrading pip, setuptools, and wheel in virtual environment via ${PIP_INDEX_URL}."
   python_pip_install --upgrade pip setuptools wheel
@@ -657,7 +680,7 @@ ensure_whisper() {
 }
 
 ensure_numba_runtime() {
-  if python_has_module llvmlite && python_has_module numba && "${VENV_PYTHON}" -c 'import numpy; raise SystemExit(0 if int(numpy.__version__.split(".")[0]) < 2 else 1)' >/dev/null 2>&1; then
+  if python_has_module llvmlite && python_has_module numba && "${VENV_PYTHON}" -c 'import numpy; major, minor = (int(part) for part in numpy.__version__.split(".")[:2]); raise SystemExit(0 if (major, minor) >= (2, 4) else 1)' >/dev/null 2>&1; then
     log "numpy, llvmlite, and numba already installed with compatible versions."
     return
   fi
@@ -666,32 +689,36 @@ ensure_numba_runtime() {
   pip_install_binary_from_pypi --force-reinstall numpy llvmlite numba certifi
 }
 
-ensure_funasr() {
-  if [[ "${ASR_PROVIDER}" != "sensevoice" && "${ASR_PROVIDER}" != "paraformer" && "${ASR_PROVIDER}" != "hf_whisper" && "${ASR_PROVIDER}" != "qwen_asr" ]]; then
-    log "Skipping FunASR setup because ASR_PROVIDER is not sensevoice, paraformer, hf_whisper, or qwen_asr."
+ensure_huggingface_snapshot() {
+  local model_name="$1"
+  local cache_dir="$2"
+  local display_name="$3"
+  mkdir -p "${cache_dir}"
+  log "Ensuring ${display_name} model is downloaded: ${model_name}"
+  "${VENV_PYTHON}" -c 'import sys; from huggingface_hub import snapshot_download; path = snapshot_download(repo_id=sys.argv[1], cache_dir=sys.argv[2]); print(f"[install-audio-deps] Model cache: {path}")' \
+    "${model_name}" "${cache_dir}"
+}
+
+ensure_funasr_nano() {
+  if [[ "${ASR_PROVIDER}" != "funasr_nano" ]]; then
+    log "Skipping Fun-ASR-Nano setup because ASR_PROVIDER is not funasr_nano."
     return
   fi
 
   if python_has_module funasr; then
-    log "funasr already installed."
+    if "${VENV_PYTHON}" -c 'from importlib.metadata import version; parts = tuple(int(part) for part in version("funasr").split(".")[:3]); raise SystemExit(0 if parts >= (1, 3, 3) else 1)' >/dev/null 2>&1; then
+      log "funasr already installed."
+    else
+      log "Installed FunASR is too old for Fun-ASR-Nano; upgrading it."
+      pip_install_with_pypi_fallback "funasr>=1.3.3" modelscope huggingface_hub
+    fi
   else
     log "Installing FunASR via ${PIP_INDEX_URL}."
-    pip_install funasr modelscope huggingface_hub
-  fi
-}
-
-ensure_transformers_asr() {
-  if [[ "${ASR_PROVIDER}" != "hf_whisper" ]]; then
-    log "Skipping Transformers ASR setup because ASR_PROVIDER is not hf_whisper."
-    return
+    pip_install_with_pypi_fallback "funasr>=1.3.3" modelscope huggingface_hub
   fi
 
-  if python_has_module transformers; then
-    log "transformers already installed."
-  else
-    log "Installing Transformers ASR dependencies via ${PIP_INDEX_URL}."
-    pip_install transformers accelerate huggingface_hub soundfile librosa
-  fi
+  local hf_hub_cache="${ROOT_DIR}/${AUDIO_MODEL_CACHE_ROOT}/huggingface/hub"
+  ensure_huggingface_snapshot "${FUNASR_NANO_MODEL}" "${hf_hub_cache}" "Fun-ASR-Nano"
 }
 
 ensure_qwen_asr() {
@@ -711,6 +738,12 @@ ensure_qwen_asr() {
   else
     log "Installing Qwen3-ASR runtime via ${PIP_INDEX_URL}."
     pip_install_with_pypi_fallback qwen-asr
+  fi
+
+  local hf_hub_cache="${ROOT_DIR}/${AUDIO_MODEL_CACHE_ROOT}/huggingface/hub"
+  ensure_huggingface_snapshot "${QWEN_ASR_MODEL}" "${hf_hub_cache}" "Qwen3-ASR"
+  if [[ "${TRANSCRIPT_ALIGNMENT_ENABLED}" == "true" ]]; then
+    ensure_huggingface_snapshot "${TRANSCRIPT_ALIGNMENT_MODEL}" "${hf_hub_cache}" "Qwen3-ForcedAligner"
   fi
 }
 
@@ -741,6 +774,18 @@ ensure_pycorrector() {
     log "Installing pycorrector via ${PIP_INDEX_URL}."
     pip_install pycorrector
   fi
+
+  if python_has_module kenlm; then
+    log "KenLM Python bindings already installed."
+    return
+  fi
+
+  log "Installing Python 3.14-compatible KenLM bindings from the camel-kenlm wheel on official PyPI."
+  pip_install_binary_from_pypi camel-kenlm
+
+  if ! python_has_module kenlm; then
+    fail "camel-kenlm was installed, but the kenlm module cannot be imported."
+  fi
 }
 
 ensure_embedding_runtime() {
@@ -757,9 +802,7 @@ ensure_embedding_runtime() {
   fi
 
   local embedding_cache_dir="${ROOT_DIR}/${EMBEDDING_MODEL_CACHE_DIR}"
-  mkdir -p "${embedding_cache_dir}"
-  log "Embedding model cache directory is ready: ${embedding_cache_dir}"
-  log "Embedding model will be downloaded on first use if not already cached: ${EMBEDDING_MODEL}"
+  ensure_huggingface_snapshot "${EMBEDDING_MODEL}" "${embedding_cache_dir}" "embedding"
 }
 
 ensure_llm_correction_runtime() {
@@ -769,8 +812,8 @@ ensure_llm_correction_runtime() {
   fi
 
   if ! python_has_module llama_cpp; then
-    log "Installing llama-cpp-python via ${PIP_INDEX_URL}."
-    pip_install llama-cpp-python
+    log "Installing llama-cpp-python via ${PIP_INDEX_URL}; compiler output is enabled because this package builds llama.cpp locally."
+    install_llama_cpp_python
   fi
 
   local model_dir="${ROOT_DIR}/${AUDIO_MODEL_CACHE_ROOT}/llm-correction/${LLM_CORRECTION_MODEL_REPO//\//__}"
@@ -806,8 +849,8 @@ ensure_local_llm_runtime() {
   fi
 
   if ! python_has_module llama_cpp; then
-    log "Installing llama-cpp-python for shared local LLM via ${PIP_INDEX_URL}."
-    pip_install llama-cpp-python
+    log "Installing llama-cpp-python for shared local LLM via ${PIP_INDEX_URL}; compiler output is enabled because this package builds llama.cpp locally."
+    install_llama_cpp_python
   else
     log "llama-cpp-python already installed."
   fi
@@ -836,7 +879,7 @@ ensure_local_llm_runtime() {
 }
 
 print_summary() {
-  log "Audio dependency environment is ready."
+  log "Backend audio dependency environment is ready."
   log "Virtual environment: ${VENV_DIR}"
   log "Python binary: ${VENV_PYTHON}"
   log "To activate manually: source ${VENV_DIR}/bin/activate"
@@ -854,12 +897,12 @@ main() {
   else
     log "Skipping pip, setuptools, and wheel upgrade for existing virtual environment."
   fi
+  ensure_backend_runtime
   ensure_ffmpeg
   ensure_torch
   ensure_numba_runtime
   ensure_whisper
-  ensure_funasr
-  ensure_transformers_asr
+  ensure_funasr_nano
   ensure_qwen_asr
   ensure_pyannote
   ensure_speechbrain

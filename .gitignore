@@ -5,11 +5,9 @@ out/
 coverage/
 tsconfig.tsbuildinfo
 .codex/
-uploads/recordings/*
-uploads/speaker-samples/*
-!uploads/recordings/.gitkeep
-!uploads/speaker-samples/.gitkeep
 model-cache/
 .env
 **/__pycache__/**
 .venv-audio
+.venv-clearvoice
+uploads/**

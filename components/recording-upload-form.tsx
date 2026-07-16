@@ -3,6 +3,7 @@
 import { useState, type FormEvent } from "react";
 import { useRouter } from "next/navigation";
 import { Upload } from "lucide-react";
+import { pythonApiUrl, responseDetail } from "@/app/sdk/python-api";
 
 export function RecordingUploadForm() {
   const router = useRouter();
@@ -16,20 +17,15 @@ export function RecordingUploadForm() {
     setIsUploading(true);
     try {
       const formData = new FormData(form);
-      const response = await fetch("/api/recordings", {
+      const response = await fetch(pythonApiUrl("/api/recordings"), {
         method: "POST",
-        body: formData
+        body: formData,
+        credentials: "include"
       });
-      const payload = await response.json();
-      if (!response.ok) {
-        throw new Error(payload.error || "上传失败");
-      }
+      if (!response.ok) throw new Error(await responseDetail(response, "上传失败"));
+      const payload = await response.json() as { recording: { id: string } };
       form.reset();
-      if (payload.recordings?.length === 1) {
-        router.push(`/recordings/${payload.recordings[0].id}?jobId=${payload.jobIds?.[0] || ""}`);
-      } else {
-        router.push("/recordings");
-      }
+      router.push(`/recordings/${payload.recording.id}`);
       router.refresh();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -42,11 +38,11 @@ export function RecordingUploadForm() {
     <form className="toolbar" onSubmit={handleSubmit}>
       <label>
         录音文件
-        <input name="audio" type="file" accept="audio/*" multiple required />
+        <input name="audio" type="file" accept="audio/*" required />
       </label>
       <label>
         标题
-        <input name="title" placeholder="单文件上传时可指定" />
+        <input name="title" placeholder="可选" />
       </label>
       <button type="submit" disabled={isUploading}>
         <Upload size={16} />

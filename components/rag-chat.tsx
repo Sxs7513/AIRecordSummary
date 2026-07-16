@@ -1,9 +1,11 @@
 "use client";
 
-import { useMemo, useState } from "react";
-import { EvidenceList } from "./evidence-list";
-import type { RagAnswer, RagQueryResponse, SearchEvidence } from "@/lib/types/models";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
+import { EvidenceList } from "./evidence-list";
+import type { SearchEvidence } from "@/app/shared/models";
+import { GenerationStreamClient } from "@/app/sdk/generation/client";
+import { useGenerationStore } from "@/app/sdk/generation/store";
 
 function AnswerText({
   text,
@@ -22,120 +24,87 @@ function AnswerText({
 
   while ((match = citationPattern.exec(text)) !== null) {
     if (match.index > cursor) parts.push(text.slice(cursor, match.index));
-    const indexes = match[1]
-      .split(/[\s,，、]+/)
-      .map((value) => Number(value))
-      .filter((value) => Number.isInteger(value));
-    if (indexes.length === 0) {
-      parts.push(match[0]);
-    }
+    const indexes = match[1].split(/[\s,，、]+/).map(Number).filter(Number.isInteger);
+    if (indexes.length === 0) parts.push(match[0]);
     for (const index of indexes) {
       const item = evidenceByIndex.get(index);
-      if (item) {
-        parts.push(
-          <a
-            className="citation-link"
-            href={item.url}
-            key={`${match.index}-${index}`}
-            target="_blank"
-            rel="noreferrer"
-            onClick={() => onCitationClick(index)}
-            title={`打开录音：${item.recording.title}`}
-          >
-            [{index}]
-          </a>
-        );
-      } else {
-        parts.push(<span key={`${match.index}-${index}`}>[{index}]</span>);
-      }
+      parts.push(item ? (
+        <a className="citation-link" href={item.url} key={`${match.index}-${index}`} target="_blank" rel="noreferrer" onClick={() => onCitationClick(index)} title={`打开录音：${item.recording.title}`}>
+          [{index}]
+        </a>
+      ) : <span key={`${match.index}-${index}`}>[{index}]</span>);
     }
     cursor = match.index + match[0].length;
   }
-
   if (cursor < text.length) parts.push(text.slice(cursor));
   return <>{parts}</>;
 }
 
 export function RagChat() {
+  const client = useRef<GenerationStreamClient | null>(null);
   const [query, setQuery] = useState("");
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
   const [askedQuery, setAskedQuery] = useState("");
-  const [answer, setAnswer] = useState<RagAnswer | null>(null);
-  const [thinking, setThinking] = useState<{ active: boolean; text: string }>({ active: false, text: "" });
-  const [evidence, setEvidence] = useState<SearchEvidence[]>([]);
+  const [runId, setRunId] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
   const [activeEvidenceIndex, setActiveEvidenceIndex] = useState<number | null>(null);
+  const run = useGenerationStore((state) => runId ? state.runs[runId] : undefined);
+
+  if (client.current === null) client.current = new GenerationStreamClient();
+
+  useEffect(() => () => {
+    if (runId) client.current?.close(runId);
+  }, [runId]);
+
+  const answerText = run?.blocks.map((block) => block.value).join("") ?? "";
+  const evidence = asEvidence(run?.sources);
+  const loading = run?.status === "queued" || run?.status === "running" || (runId !== null && run === undefined);
 
   async function submit(event: React.FormEvent) {
     event.preventDefault();
     const text = query.trim();
-    if (!text) return;
-    setLoading(true);
+    if (!text || loading) return;
     setError(null);
     setAskedQuery(text);
-    setAnswer(null);
-    setThinking({ active: false, text: "" });
-    setEvidence([]);
     setActiveEvidenceIndex(null);
     try {
-      const response = await fetch("/api/rag/query", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ query: text, mode: "answer", limit: 10 })
-      });
-      const payload = await response.json() as RagQueryResponse & { error?: string };
-      if (!response.ok) throw new Error(payload.error || "查询失败");
-      setEvidence(payload.evidence);
-      setAnswer(payload.answer);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setLoading(false);
+      const nextRunId = await client.current!.start("/api/rag/queries", { query: text, limit: 10 });
+      setRunId(nextRunId);
+    } catch (reason) {
+      setRunId(null);
+      setError(reason instanceof Error ? reason.message : String(reason));
     }
   }
 
   function selectEvidence(index: number) {
     setActiveEvidenceIndex(index);
-    window.setTimeout(() => {
-      document.getElementById(`evidence-${index}`)?.scrollIntoView({ behavior: "smooth", block: "nearest" });
-    }, 0);
+    window.setTimeout(() => document.getElementById(`evidence-${index}`)?.scrollIntoView({ behavior: "smooth", block: "nearest" }), 0);
   }
+
+  const runError = run?.status === "failed" ? run.error?.message ?? "录音问答失败" : null;
 
   return (
     <div className="rag-page">
       <form className="rag-search" onSubmit={submit}>
         <textarea value={query} onChange={(event) => setQuery(event.target.value)} placeholder="输入一个关于录音的问题..." rows={4} />
-        <div className="rag-actions">
-          <button type="submit" disabled={loading}>
-            {loading ? "查询中..." : "提问"}
-          </button>
-        </div>
+        <div className="rag-actions"><button type="submit" disabled={loading}>{loading ? "生成中..." : "提问"}</button></div>
       </form>
 
-      {error ? <div className="panel error-panel">{error}</div> : null}
-
+      {error || runError ? <div className="panel error-panel">{error ?? runError}</div> : null}
       {askedQuery ? (
         <section className="rag-result">
           <div className="user-question">{askedQuery}</div>
-          {answer ? (
-            <article className={`assistant-answer ${answer.notEnoughEvidence ? "weak" : ""}`}>
-              {thinking.active ? <div className="thinking-indicator">思考中</div> : null}
-              {!thinking.active && thinking.text ? (
-                <details className="thinking-details">
-                  <summary>思考过程</summary>
-                  <div>{thinking.text}</div>
-                </details>
-              ) : null}
-              <div className="full-text">
-                <AnswerText text={answer.text || "正在生成回答..."} evidence={evidence} onCitationClick={selectEvidence} />
-              </div>
+          {runId ? (
+            <article className={`assistant-answer ${run?.output?.notEnoughEvidence === true ? "weak" : ""}`}>
+              <div className="full-text"><AnswerText text={answerText || "正在生成回答..."} evidence={evidence} onCitationClick={selectEvidence} /></div>
             </article>
-          ) : loading ? (
-            <article className="assistant-answer">正在检索录音片段...</article>
           ) : null}
           <EvidenceList evidence={evidence} activeIndex={activeEvidenceIndex} onSelect={selectEvidence} />
         </section>
       ) : null}
     </div>
   );
+}
+
+function asEvidence(value: unknown): SearchEvidence[] {
+  return Array.isArray(value) ? value as SearchEvidence[] : [];
 }

@@ -4,7 +4,11 @@ import { useEffect, useRef } from "react";
 
 interface PlaySegmentEventDetail {
   startMs: number;
-  endMs: number;
+  endMs?: number;
+}
+
+function dispatchPlaybackPosition(currentMs: number | null) {
+  window.dispatchEvent(new CustomEvent("recording-playback-position", { detail: { currentMs } }));
 }
 
 export function RecordingPlayer({ src, seekMs }: { src: string; seekMs: number | null }) {
@@ -29,6 +33,7 @@ export function RecordingPlayer({ src, seekMs }: { src: string; seekMs: number |
   useEffect(() => {
     const audio = ref.current;
     if (!audio) return;
+    let animationFrame: number | null = null;
 
     const seekTo = (seconds: number) => {
       programmaticSeekRef.current = true;
@@ -57,8 +62,7 @@ export function RecordingPlayer({ src, seekMs }: { src: string; seekMs: number |
     const playSegment = (event: Event) => {
       const { startMs, endMs } = (event as CustomEvent<PlaySegmentEventDetail>).detail;
       const startSeconds = Math.max(0, startMs / 1000);
-      const endSeconds = Math.max(startSeconds, endMs / 1000);
-      clipEndSecondsRef.current = endSeconds;
+      clipEndSecondsRef.current = endMs === undefined ? null : Math.max(startSeconds, endMs / 1000);
       pendingPlayStartSecondsRef.current = startSeconds;
       if (audio.readyState >= 1) {
         playAfterSeek();
@@ -85,13 +89,39 @@ export function RecordingPlayer({ src, seekMs }: { src: string; seekMs: number |
       pendingPlayStartSecondsRef.current = null;
     };
 
+    const publishPlaybackPosition = () => {
+      dispatchPlaybackPosition(Math.round(audio.currentTime * 1000));
+      animationFrame = window.requestAnimationFrame(publishPlaybackPosition);
+    };
+
+    const startPublishingPlaybackPosition = () => {
+      if (animationFrame !== null) return;
+      animationFrame = window.requestAnimationFrame(publishPlaybackPosition);
+    };
+
+    const stopPublishingPlaybackPosition = () => {
+      if (animationFrame !== null) {
+        window.cancelAnimationFrame(animationFrame);
+        animationFrame = null;
+      }
+      dispatchPlaybackPosition(null);
+    };
+
     window.addEventListener("recording-play-segment", playSegment);
     audio.addEventListener("timeupdate", stopAtSegmentEnd);
     audio.addEventListener("seeking", clearSegmentOnManualSeek);
+    audio.addEventListener("play", startPublishingPlaybackPosition);
+    audio.addEventListener("pause", stopPublishingPlaybackPosition);
+    audio.addEventListener("ended", stopPublishingPlaybackPosition);
     return () => {
       window.removeEventListener("recording-play-segment", playSegment);
       audio.removeEventListener("timeupdate", stopAtSegmentEnd);
       audio.removeEventListener("seeking", clearSegmentOnManualSeek);
+      audio.removeEventListener("play", startPublishingPlaybackPosition);
+      audio.removeEventListener("pause", stopPublishingPlaybackPosition);
+      audio.removeEventListener("ended", stopPublishingPlaybackPosition);
+      if (animationFrame !== null) window.cancelAnimationFrame(animationFrame);
+      dispatchPlaybackPosition(null);
     };
   }, []);
 

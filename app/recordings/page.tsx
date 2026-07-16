@@ -1,9 +1,10 @@
 import Link from "next/link";
 import { AutoRefresh } from "@/components/auto-refresh";
+import { DeleteRecordingButton } from "@/components/delete-recording-button";
 import { RecordingUploadForm } from "@/components/recording-upload-form";
 import { StatusBadge } from "@/components/status-badge";
-import { listRecordings } from "@/lib/db/recordings";
-import { formatDate, formatDurationMs } from "@/lib/types/format";
+import { listPythonRecordings } from "@/app/data/recordings";
+import { formatDate, formatDurationMs } from "@/app/shared/format";
 
 export const dynamic = "force-dynamic";
 
@@ -15,7 +16,7 @@ export default async function RecordingsPage({
   const params = await searchParams;
   const status = params.status || "all";
   const page = Number(params.page || 1);
-  const data = await listRecordings({ status, page, pageSize: 10 });
+  const data = await listPythonRecordings({ status, page, pageSize: 10 });
   const hasActiveJobs = data.items.some((item) => item.status === "uploaded" || item.status === "processing");
 
   return (
@@ -95,11 +96,7 @@ export default async function RecordingsPage({
                   <td>{formatDate(item.uploadedAt)}</td>
                   <td>{formatDate(item.updatedAt)}</td>
                   <td>
-                    <form action={`/api/recordings/${item.id}/delete`} method="post">
-                      <button className="danger" type="submit">
-                        删除
-                      </button>
-                    </form>
+                    <DeleteRecordingButton recordingId={item.id} />
                   </td>
                 </tr>
               ))}

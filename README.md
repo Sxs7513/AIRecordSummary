@@ -32,13 +32,13 @@ Speaker diarization uses the gated pyannote model. Set this in `.env` before ret
 PYANNOTE_AUTH_TOKEN=your_huggingface_token
 ```
 
-Initialize the database manually when needed:
+Reset and initialize the development database manually when needed. This deletes all existing database records:
 
 ```bash
 npm run db:init
 ```
 
-The web backend also runs the same idempotent initialization on startup. It connects to `DB_ADMIN_DATABASE`, creates `DB_NAME` when missing, and then creates all Phase 1 tables and indexes from `sql/base.sql`.
+The Python web service does not initialize the database on startup; run this command after changing `sql/base.sql`.
 
 Install audio dependencies:
 
