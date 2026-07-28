@@ -4,7 +4,6 @@
 -- - transcription
 -- - speaker diarization
 -- - target speaker profile and samples
--- - background processing jobs
 
 create extension if not exists "pgcrypto";
 create extension if not exists pg_trgm;
@@ -536,55 +535,6 @@ where speaker_cluster_id is not null
 group by recording_id, speaker_cluster_id
 on conflict (recording_id, speaker_cluster_id) do nothing;
 
--- processing_jobs
--- 后台处理任务表。
--- 这张表记录每条录音在异步链路中的处理进度，包括转写、speaker diarization 和目标人物识别。
--- Worker 会基于这张表拉取任务、更新状态、记录重试次数和失败原因。
-create table if not exists processing_jobs (
-    id uuid primary key default gen_random_uuid(),
-    recording_id uuid not null references recordings(id) on delete cascade,
-    job_type text not null check (
-        job_type in ('transcription', 'speaker_diarization', 'speaker_identification', 'text_correction', 'embedding_indexing', 'summary')
-    ),
-    status text not null check (status in ('pending', 'running', 'completed', 'failed')),
-    attempt_count integer not null default 0 check (attempt_count >= 0),
-    error_message text,
-    started_at timestamptz,
-    finished_at timestamptz,
-    processing_duration_ms integer check (processing_duration_ms is null or processing_duration_ms >= 0),
-    created_at timestamptz not null default now(),
-    updated_at timestamptz not null default now()
-);
-
-comment on table processing_jobs is
-    '后台任务表，记录转写、speaker diarization、目标人物识别等异步任务的执行情况。';
-comment on column processing_jobs.id is
-    '后台任务主键。';
-comment on column processing_jobs.recording_id is
-    '关联 recordings.id，表示该任务属于哪条录音。';
-comment on column processing_jobs.job_type is
-    '任务类型。transcription 表示转写，speaker_diarization 表示说话人分离，speaker_identification 表示目标人物识别，text_correction 表示文本校正，embedding_indexing 表示检索索引，summary 表示录音总结。';
-comment on column processing_jobs.status is
-    '任务状态。pending 表示待执行，running 表示执行中，completed 表示完成，failed 表示失败。';
-comment on column processing_jobs.attempt_count is
-    '任务重试次数统计，从 0 开始累计。';
-comment on column processing_jobs.error_message is
-    '任务失败原因或最近一次错误摘要。';
-comment on column processing_jobs.started_at is
-    '任务实际开始执行时间。';
-comment on column processing_jobs.finished_at is
-    '任务执行结束时间，无论成功或失败都应在结束时写入。';
-comment on column processing_jobs.processing_duration_ms is
-    '任务实际处理耗时，单位毫秒。任务成功或失败结束时由应用层根据 started_at 和 finished_at 计算写入。';
-comment on column processing_jobs.created_at is
-    '任务记录创建时间。';
-comment on column processing_jobs.updated_at is
-    '任务记录最后更新时间。';
-
-create index if not exists processing_jobs_recording_id_idx on processing_jobs (recording_id);
-create index if not exists processing_jobs_status_idx on processing_jobs (status);
-create index if not exists processing_jobs_type_status_idx on processing_jobs (job_type, status);
-
 create table if not exists recording_summaries (
     id uuid primary key default gen_random_uuid(),
     recording_id uuid not null references recordings(id) on delete cascade,
@@ -655,25 +605,6 @@ create index if not exists recording_search_chunks_text_trgm_gist_idx
     on recording_search_chunks using gist (normalized_text gist_trgm_ops(siglen=64));
 create index if not exists recording_search_chunks_embedding_hnsw_idx
     on recording_search_chunks using hnsw (embedding halfvec_cosine_ops);
-
-create table if not exists search_queries (
-    id uuid primary key default gen_random_uuid(),
-    query_text text not null,
-    normalized_query text not null,
-    filters jsonb not null default '{}'::jsonb,
-    result_count integer not null default 0,
-    latency_ms integer check (latency_ms is null or latency_ms >= 0),
-    created_at timestamptz not null default now()
-);
-
-create table if not exists search_result_clicks (
-    id uuid primary key default gen_random_uuid(),
-    search_query_id uuid references search_queries(id) on delete set null,
-    recording_id uuid not null references recordings(id) on delete cascade,
-    search_chunk_id uuid references recording_search_chunks(id) on delete set null,
-    target_ms integer check (target_ms is null or target_ms >= 0),
-    created_at timestamptz not null default now()
-);
 
 -- Pipeline runtime
 -- Pipeline runs and stage runs are persisted so separate workers can safely

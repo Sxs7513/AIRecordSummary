@@ -72,13 +72,12 @@ Useful pages:
 - `GET /api/recordings`
 - `POST /api/recordings`
 - `GET /api/recordings/:id`
-- `GET /api/jobs/:id`
 - `GET /api/speaker-profiles`
 - `POST /api/speaker-profiles`
 - `POST /api/speaker-profiles/:id/samples`
 
 ## Notes
 
-Uploaded files are stored under `uploads/` in development. Metadata, transcriptions, speaker diarization segments, target-speaker matches, and processing jobs are all persisted in PostgreSQL.
+Uploaded files are stored under `uploads/` in development. Metadata, transcriptions, speaker diarization segments, target-speaker matches, pipeline runs, and stage runs are persisted in PostgreSQL.
 
-When the Next.js backend starts, `instrumentation.ts` initializes PostgreSQL and starts a real `worker_threads.Worker`. Uploading a recording inserts the first `processing_jobs` row, sends a PostgreSQL `NOTIFY`, and immediately wakes the worker thread. Job completion writes results back to PostgreSQL; processing pages poll and refresh while a recording is `uploaded` or `processing`.
+The Python backend owns database initialization and background pipeline execution. Recording processing progress is tracked by `pipeline_runs` and `stage_runs`.
