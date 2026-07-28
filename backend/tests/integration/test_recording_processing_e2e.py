@@ -13,17 +13,24 @@ import pytest
 from psycopg import sql
 from sqlalchemy import Connection, Engine, create_engine, text
 
-from application.recording_processing import StartRecordingProcessing
-from audio_processing.contracts import RecordingId
-from audio_processing.hooks import RecordingProcessingHooks
-from audio_processing.registry import build_recording_stage_registry
-from audio_processing.stages.align_transcript import AlignTranscriptStage
-from audio_processing.stages.build_utterances import BuildUtterancesStage
-from audio_processing.stages.correct_text import CorrectAsrWindowsStage, LocalTextCorrector
-from audio_processing.stages.diarize_pyannote import PyannoteDiarizeStage
-from audio_processing.stages.normalize_audio import NormalizeAudioStage
-from audio_processing.stages.preprocess_asr_audio import PreprocessAsrAudioStage
-from audio_processing.stages.recording_models import (
+from l1_foundation.pipeline.contracts import ArtifactPayload, ArtifactRef, PipelineRunId, PipelineSubjectId, StageContext, StageRunId
+from l1_foundation.pipeline.runtime.artifact_store import ArtifactStore
+from l1_foundation.pipeline.runtime.coordinator import PipelineCoordinator
+from l1_foundation.pipeline.runtime.executor import PipelineExecutor
+from l1_foundation.pipeline.runtime.repository import PipelineRepository
+from l1_foundation.settings import REPOSITORY_ROOT, Settings, get_settings
+from l1_foundation.task_runtime.scheduler import ResourceScheduler
+from l2_core.application.recording_processing import StartRecordingProcessing
+from l2_core.audio_processing.contracts import RecordingId
+from l2_core.audio_processing.hooks import RecordingProcessingHooks
+from l2_core.audio_processing.registry import build_recording_stage_registry
+from l2_core.audio_processing.stages.align_transcript import AlignTranscriptStage
+from l2_core.audio_processing.stages.build_utterances import BuildUtterancesStage
+from l2_core.audio_processing.stages.correct_text import CorrectAsrWindowsStage, LocalTextCorrector
+from l2_core.audio_processing.stages.diarize_pyannote import PyannoteDiarizeStage
+from l2_core.audio_processing.stages.normalize_audio import NormalizeAudioStage
+from l2_core.audio_processing.stages.preprocess_asr_audio import PreprocessAsrAudioStage
+from l2_core.audio_processing.stages.recording_models import (
     AlignTranscriptInput,
     BuildUtterancesInput,
     CorrectAsrWindowsInput,
@@ -33,16 +40,9 @@ from audio_processing.stages.recording_models import (
     PreprocessAsrAudioInput,
     TranscribeQwenAsrInput,
 )
-from audio_processing.stages.summary.stage import GenerateSummaryStage
-from audio_processing.stages.transcribe_qwen_asr import QwenAsrTranscribeStage
-from pipeline.contracts import ArtifactPayload, ArtifactRef, PipelineRunId, PipelineSubjectId, StageContext, StageRunId
-from pipeline.runtime.artifact_store import ArtifactStore
-from pipeline.runtime.coordinator import PipelineCoordinator
-from pipeline.runtime.executor import PipelineExecutor
-from pipeline.runtime.repository import PipelineRepository
+from l2_core.audio_processing.stages.summary.stage import GenerateSummaryStage
+from l2_core.audio_processing.stages.transcribe_qwen_asr import QwenAsrTranscribeStage
 from scripts.initialize_database import initialize_database
-from settings import REPOSITORY_ROOT, Settings, get_settings
-from task_runtime.scheduler import ResourceScheduler
 
 pytestmark = pytest.mark.integration
 

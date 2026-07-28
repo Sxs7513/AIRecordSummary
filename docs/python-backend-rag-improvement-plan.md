@@ -2,7 +2,7 @@
 
 ## 1. 文档目标
 
-本文档用于管理 `backend/src/rag` 的后续改造。改造采用小步提交：
+本文档用于管理 `backend/packages/l2_core/rag` 的后续改造。改造采用小步提交：
 
 - 每一步只解决一个明确问题；
 - 每一步都可以独立测试、上线和回滚；
@@ -105,7 +105,7 @@ route
 新增：
 
 ```text
-backend/src/rag/retrieval/normalization.py
+backend/packages/l2_core/rag/retrieval/normalization.py
 ```
 
 提供：

@@ -8,8 +8,8 @@ from typing import Any, cast
 
 import pytest
 
-from audio_processing.stages.recording_models import DiarizationSegment
-from audio_processing.stages.transcribe_qwen_asr.engine import QwenAsrConfig, QwenAsrEngine, QwenAsrModel
+from l2_core.audio_processing.stages.recording_models import DiarizationSegment
+from l2_core.audio_processing.stages.transcribe_qwen_asr.engine import QwenAsrConfig, QwenAsrEngine, QwenAsrModel
 
 
 class FakeBatchModel:

@@ -7,10 +7,10 @@ from uuid import UUID, uuid4
 
 from sqlalchemy import Engine
 
-from rag.contracts import ResolvedFilters
-from rag.normalization import normalize_search_text
-from rag.retrieval import RagRetriever
-from settings import Settings
+from l1_foundation.settings import Settings
+from l2_core.rag.contracts import ResolvedFilters
+from l2_core.rag.normalization import normalize_search_text
+from l2_core.rag.retrieval import RagRetriever
 
 
 class FakeMappingsResult:

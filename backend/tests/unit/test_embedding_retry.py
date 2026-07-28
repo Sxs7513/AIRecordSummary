@@ -10,8 +10,8 @@ from uuid import uuid4
 import pytest
 from sqlalchemy import Engine
 
-from application.recordings import RecordingService, RecordingStageNotRetryableError
-from infrastructure.storage.local import LocalStorage
+from l1_foundation.infrastructure.storage.local import LocalStorage
+from l2_core.application.recordings import RecordingService, RecordingStageNotRetryableError
 
 
 class FakeResult:

@@ -3,14 +3,14 @@ from pathlib import Path
 from typing import cast
 from uuid import uuid4
 
-from audio_processing.stages.correct_text import CorrectAsrWindowsStage, LocalTextCorrector
-from audio_processing.stages.recording_models import (
+from l1_foundation.pipeline.contracts import ArtifactPayload, PipelineRunId, PipelineSubjectId, StageContext, StageRunId
+from l1_foundation.pipeline.runtime.artifact_store import ArtifactStore
+from l2_core.audio_processing.stages.correct_text import CorrectAsrWindowsStage, LocalTextCorrector
+from l2_core.audio_processing.stages.recording_models import (
     AsrWindowTranscript,
     AsrWindowTranscriptOutput,
     CorrectAsrWindowsInput,
 )
-from pipeline.contracts import ArtifactPayload, PipelineRunId, PipelineSubjectId, StageContext, StageRunId
-from pipeline.runtime.artifact_store import ArtifactStore
 
 
 class FakeCorrector:

@@ -1,5 +1,5 @@
-from audio_processing.stages.diarize_pyannote import PyannoteDiarizeStage
-from audio_processing.stages.recording_models import DiarizationSegment
+from l2_core.audio_processing.stages.diarize_pyannote import PyannoteDiarizeStage
+from l2_core.audio_processing.stages.recording_models import DiarizationSegment
 
 
 def _segment(speaker: str, start_ms: int, end_ms: int) -> DiarizationSegment:

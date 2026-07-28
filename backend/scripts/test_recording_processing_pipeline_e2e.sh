@@ -39,6 +39,5 @@ cd "${BACKEND_DIR}"
 exec env \
   RUN_PIPELINE_E2E=1 \
   AUDIO_E2E_FILE="${AUDIO_FILE}" \
-  PYTHONPATH="src${PYTHONPATH:+:${PYTHONPATH}}" \
   "${PYTHON_BIN}" -m pytest -o log_cli=true -o log_cli_level=INFO \
   tests/integration/test_recording_processing_e2e.py::test_real_audio_recording_processing_pipeline_e2e

@@ -5,9 +5,9 @@ from pathlib import Path
 import psycopg
 from psycopg import sql
 
-from auth.service import AuthService
-from infrastructure.db.session import create_database_engine
-from settings import Settings, get_settings
+from l1_foundation.infrastructure.db.session import create_database_engine
+from l1_foundation.settings import Settings, get_settings
+from l2_core.auth.service import AuthService
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 BASE_SCHEMA_PATH = REPOSITORY_ROOT / "sql" / "base.sql"

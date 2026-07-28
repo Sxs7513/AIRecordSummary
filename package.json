@@ -4,12 +4,16 @@
   "private": true,
   "scripts": {
     "dev": "next dev -H 127.0.0.1",
-    "dev:python-web": "cd backend && .venv/bin/uvicorn main:app --app-dir src --reload --no-access-log",
+    "dev:python-web": "npm run dev:production-api",
+    "dev:production-api": "cd backend && PYTHONPATH=packages:L3-App/shared-api/src .venv/bin/uvicorn main:app --app-dir L3-App/production-api/src --reload --no-access-log --port 8000",
+    "dev:evaluation-api": "cd backend && PYTHONPATH=packages:L3-App/shared-api/src .venv/bin/uvicorn main:app --app-dir L3-App/evaluation-api/src --reload --no-access-log --port 8001",
+    "dev:training-api": "cd backend && PYTHONPATH=packages:L3-App/shared-api/src .venv/bin/uvicorn main:app --app-dir L3-App/training-api/src --reload --no-access-log --port 8002",
     "build": "next build",
     "start": "next start -H 127.0.0.1",
     "db:init": "sh scripts/db/init-python-backend.sh",
     "db:init:evaluation": "sh scripts/db/init-evaluation.sh",
-    "worker:asr-lab": "cd backend && PYTHONPATH=src .venv/bin/python scripts/run_asr_lab_worker.py",
+    "worker:production": "cd backend && PYTHONPATH=packages .venv/bin/python L3-App/production-worker/src/main.py",
+    "worker:asr-lab": "cd backend && PYTHONPATH=packages .venv/bin/python L3-App/asr-compute-worker/src/main.py",
     "typecheck": "tsc --noEmit",
     "lint": "next lint"
   },

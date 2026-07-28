@@ -9,7 +9,7 @@ from uuid import uuid4
 
 from langchain_core.messages import BaseMessage
 
-from rag.contracts import (
+from l2_core.rag.contracts import (
     AnswerPlan,
     AnswerPlanItem,
     Evidence,
@@ -24,9 +24,9 @@ from rag.contracts import (
     RagRoute,
     ResolvedFilters,
 )
-from rag.graph import RagGraph
-from rag.routing import AMBIGUOUS_RECORDING_SCOPE_MESSAGE, ROUTE_UNRESOLVED_MESSAGE
-from rag.streaming import ThinkTagFilter
+from l2_core.rag.graph import RagGraph
+from l2_core.rag.routing import AMBIGUOUS_RECORDING_SCOPE_MESSAGE, ROUTE_UNRESOLVED_MESSAGE
+from l2_core.rag.streaming import ThinkTagFilter
 
 
 class FakeModel:

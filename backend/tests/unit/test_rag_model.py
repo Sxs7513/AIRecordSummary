@@ -7,9 +7,9 @@ from typing import cast
 import pytest
 from langchain_core.messages import HumanMessage
 
-import rag.model as rag_model
-from rag.model import LlamaModel, LocalLlamaChatModel
-from settings import Settings
+import l2_core.rag.model as rag_model
+from l1_foundation.settings import Settings
+from l2_core.rag.model import LlamaModel, LocalLlamaChatModel
 
 
 class FakeLlama:

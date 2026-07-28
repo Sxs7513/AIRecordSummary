@@ -52,6 +52,16 @@ Install audio dependencies:
 scripts/install_audio_dependencies.sh
 ```
 
+The installer creates two isolated Python environments:
+
+```text
+backend/.venv
+  Production APIs, pipeline workers, qwen-asr inference and shared packages
+
+backend/L2-Core/trainers/qwen-asr-lora/.venv
+  Qwen3-ASR-1.7B-hf, Transformers 5.13+ and PEFT LoRA training/evaluation
+```
+
 The backend can also run this automatically on startup. It is enabled by default in `.env`:
 
 ```bash
@@ -62,16 +72,29 @@ Set it to `false` if you want startup to fail fast instead of installing Python 
 
 ## Run
 
-Start the web app:
+Start the frontend and three Python API entry points:
 
 ```bash
 npm run dev
+npm run dev:production-api
+npm run dev:evaluation-api
+npm run dev:training-api
 ```
+
+The APIs listen on ports 8000, 8001, and 8002 respectively.
+`npm run dev:python-web` remains as an alias for the production API.
 
 Run the isolated ASR evaluation and LoRA training worker in another terminal:
 
 ```bash
 npm run worker:asr-lab
+```
+
+When `PIPELINE_EMBEDDED_WORKERS_ENABLED=false`, also start the standalone
+production pipeline worker:
+
+```bash
+npm run worker:production
 ```
 
 Useful pages:

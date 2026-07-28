@@ -1,4 +1,4 @@
-from conversations.service import ConversationService
+from l2_core.conversations.service import ConversationService
 
 
 def test_conversation_source_persistence_removes_retrieved_text() -> None:

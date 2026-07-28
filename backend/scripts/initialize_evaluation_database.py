@@ -5,7 +5,7 @@ from typing import cast
 
 import psycopg
 
-from settings import Settings, get_settings
+from l1_foundation.settings import Settings, get_settings
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 EVALUATION_SCHEMA_PATH = REPOSITORY_ROOT / "sql" / "evaluation.sql"

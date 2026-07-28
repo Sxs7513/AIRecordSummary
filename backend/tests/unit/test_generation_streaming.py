@@ -3,10 +3,10 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
-from api.routes.generations import encode_sse
-from audio_processing.stages.summary.stage import SafeTextStream
-from generation.contracts import GenerationEvent
-from generation.hub import GenerationStreamHub
+from l2_core.audio_processing.stages.summary.stage import SafeTextStream
+from l2_core.generation.contracts import GenerationEvent
+from l2_core.generation.hub import GenerationStreamHub
+from routes.generations import encode_sse
 
 
 def test_safe_text_stream_never_emits_a_leading_thinking_block() -> None:

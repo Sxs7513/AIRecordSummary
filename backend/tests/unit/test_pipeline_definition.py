@@ -2,12 +2,12 @@ import asyncio
 
 import pytest
 
-from audio_processing.definition import build_recording_processing, recording_processing
-from audio_processing.stages.noop import NoopStage
-from pipeline.contracts import ResourceQueue, RetryPolicy
-from pipeline.definitions.graph import PipelineDefinition, PipelineNode
-from pipeline.example import build_example_registry, example_pipeline, run_example
-from pipeline.registry import StageRegistry
+from l1_foundation.pipeline.contracts import ResourceQueue, RetryPolicy
+from l1_foundation.pipeline.definitions.graph import PipelineDefinition, PipelineNode
+from l1_foundation.pipeline.example import build_example_registry, example_pipeline, run_example
+from l1_foundation.pipeline.registry import StageRegistry
+from l2_core.audio_processing.definition import build_recording_processing, recording_processing
+from l2_core.audio_processing.stages.noop import NoopStage
 
 
 def test_recording_processing_uses_diarization_segments_for_qwen_asr() -> None:

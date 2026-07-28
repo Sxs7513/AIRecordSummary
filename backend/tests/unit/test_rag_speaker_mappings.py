@@ -1,7 +1,7 @@
 from uuid import uuid4
 
-from rag.contracts import ResolvedFilters
-from rag.retrieval import RagRetriever
+from l2_core.rag.contracts import ResolvedFilters
+from l2_core.rag.retrieval import RagRetriever
 
 
 def test_chunk_person_filter_uses_recording_speaker_mapping_and_chunk_clusters() -> None:

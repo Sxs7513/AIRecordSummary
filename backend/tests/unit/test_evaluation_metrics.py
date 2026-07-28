@@ -1,4 +1,4 @@
-from evaluation.metrics import character_error_rate, micro_error_rate, word_error_rate
+from l2_core.evaluation.metrics import character_error_rate, micro_error_rate, word_error_rate
 
 
 def test_character_error_rate_records_substitution_deletion_and_insertion() -> None:

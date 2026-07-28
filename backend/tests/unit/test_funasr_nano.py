@@ -1,5 +1,5 @@
-from audio_processing.stages.recording_models import DiarizationSegment
-from audio_processing.stages.transcribe_funasr_nano.engine import build_continuous_speech_windows
+from l2_core.audio_processing.stages.recording_models import DiarizationSegment
+from l2_core.audio_processing.stages.transcribe_funasr_nano.engine import build_continuous_speech_windows
 
 
 def _segment(cluster: str, start_ms: int, end_ms: int) -> DiarizationSegment:

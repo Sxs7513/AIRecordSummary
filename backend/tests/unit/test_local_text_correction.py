@@ -5,9 +5,9 @@ from typing import cast
 
 import pytest
 
-from audio_processing.stages.correct_text import LocalTextCorrector
-from audio_processing.stages.correct_text.local_llm import LlamaModel, LocalLlmCorrector
-from settings import REPOSITORY_ROOT
+from l1_foundation.settings import REPOSITORY_ROOT
+from l2_core.audio_processing.stages.correct_text import LocalTextCorrector
+from l2_core.audio_processing.stages.correct_text.local_llm import LlamaModel, LocalLlmCorrector
 
 
 def make_corrector(tmp_path: Path, *, pycorrector_enabled: bool = False, llm_enabled: bool = False) -> LocalTextCorrector:
@@ -84,8 +84,9 @@ def test_local_text_corrector_falls_back_when_optional_providers_fail(tmp_path: 
 
 
 def test_backend_stages_do_not_execute_legacy_lib_scripts() -> None:
-    qwen_stage = (REPOSITORY_ROOT / "backend/src/audio_processing/stages/transcribe_qwen_asr/__init__.py").read_text(encoding="utf-8")
-    text_stage = (REPOSITORY_ROOT / "backend/src/audio_processing/stages/correct_text/__init__.py").read_text(encoding="utf-8")
+    audio_processing_root = REPOSITORY_ROOT / "backend/packages/l2_core/audio_processing"
+    qwen_stage = (audio_processing_root / "stages/transcribe_qwen_asr/__init__.py").read_text(encoding="utf-8")
+    text_stage = (audio_processing_root / "stages/correct_text/__init__.py").read_text(encoding="utf-8")
 
     assert "lib/audio-transcoding-analysis" not in qwen_stage
     assert "lib/audio-transcoding-analysis" not in text_stage

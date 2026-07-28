@@ -2,8 +2,8 @@ from uuid import UUID
 
 import pytest
 
-from evaluation.contracts import ApprovedAnnotation, DatasetSplit
-from evaluation.datasets import build_dataset_preview
+from l2_core.evaluation.contracts import ApprovedAnnotation, DatasetSplit
+from l2_core.evaluation.datasets import build_dataset_preview
 
 
 def _annotation(

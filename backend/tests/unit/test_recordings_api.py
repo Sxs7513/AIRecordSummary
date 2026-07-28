@@ -7,11 +7,11 @@ from uuid import UUID, uuid4
 from fastapi.testclient import TestClient
 from httpx import Response
 
-from api.dependencies import get_recording_service, get_recording_summary_regeneration_service, require_current_user
-from application.recordings import RecordingNotFoundError, RecordingNotRetryableError
-from auth.contracts import CurrentUser
-from main import create_app
-from settings import Settings
+from app_factory import create_app
+from dependencies import get_recording_service, get_recording_summary_regeneration_service, require_current_user
+from l1_foundation.settings import Settings
+from l2_core.application.recordings import RecordingNotFoundError, RecordingNotRetryableError
+from l2_core.auth.contracts import CurrentUser
 
 
 def _settings() -> Settings:

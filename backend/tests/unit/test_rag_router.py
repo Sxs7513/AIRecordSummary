@@ -2,10 +2,10 @@ from datetime import date, datetime
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
-from rag.contracts import InferredFilters, RagRoute, ResolvedFilters, TimeRange
-from rag.retrieval import RagRetriever
-from rag.routing import parse_route_response
-from rag.scope import make_filters, resolve_date_range
+from l2_core.rag.contracts import InferredFilters, RagRoute, ResolvedFilters, TimeRange
+from l2_core.rag.retrieval import RagRetriever
+from l2_core.rag.routing import parse_route_response
+from l2_core.rag.scope import make_filters, resolve_date_range
 
 
 def test_relative_date_is_resolved_by_python_not_the_model() -> None:

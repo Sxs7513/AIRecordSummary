@@ -8,6 +8,7 @@ tsconfig.tsbuildinfo
 model-cache/
 .env
 **/__pycache__/**
+**/.venv/
 .venv-audio
 .venv-clearvoice
 uploads/**

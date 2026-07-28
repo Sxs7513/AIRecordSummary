@@ -8,9 +8,9 @@ from uuid import UUID, uuid4
 
 from sqlalchemy import Engine
 
-from audio_processing.contracts import RecordingId
-from audio_processing.projections import RecordingProjectionService
-from audio_processing.stages.recording_models import EmbeddedSearchChunk, EmbeddingIndexingOutput
+from l2_core.audio_processing.contracts import RecordingId
+from l2_core.audio_processing.projections import RecordingProjectionService
+from l2_core.audio_processing.stages.recording_models import EmbeddedSearchChunk, EmbeddingIndexingOutput
 
 
 class FakeResult:

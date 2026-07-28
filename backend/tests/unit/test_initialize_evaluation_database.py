@@ -3,8 +3,8 @@ from typing import Any, cast
 
 import pytest
 
+from l1_foundation.settings import Settings
 from scripts import initialize_evaluation_database as evaluation_database_script
-from settings import Settings
 
 
 def _settings() -> Settings:

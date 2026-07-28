@@ -67,10 +67,10 @@ flowchart LR
 
 ## 4. 模块设计
 
-将当前 `backend/src/rag/retrieval.py` 收敛为一个检索模块：
+将当前 `backend/packages/l2_core/rag/retrieval.py` 收敛为一个检索模块：
 
 ```text
-backend/src/rag/retrieval/
+backend/packages/l2_core/rag/retrieval/
 ├── __init__.py
 ├── contracts.py
 ├── filters.py

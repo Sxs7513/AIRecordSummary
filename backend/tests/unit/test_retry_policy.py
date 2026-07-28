@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from audio_processing.definition import recording_processing
-from pipeline.contracts import RetryPolicy
+from l1_foundation.pipeline.contracts import RetryPolicy
+from l2_core.audio_processing.definition import recording_processing
 
 
 def test_recording_processing_has_no_retry_attempt_limit() -> None:

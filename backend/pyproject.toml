@@ -8,7 +8,6 @@ version = "0.1.0"
 description = "Python backend for AI Record Summary"
 requires-python = ">=3.14.4,<3.15"
 dependencies = [
-  "datasets>=4,<5",
   "fastapi>=0.120,<1",
   "langchain>=1,<2",
   "langgraph>=1,<2",
@@ -29,13 +28,28 @@ dev = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src"]
+packages = [
+  "packages/l1_foundation",
+  "packages/l2_core",
+]
 
 [tool.pyright]
 pythonVersion = "3.14"
 typeCheckingMode = "strict"
-include = ["src", "tests"]
-extraPaths = ["src"]
+include = [
+  "tests",
+  "packages",
+  "L3-App",
+]
+extraPaths = [
+  "packages",
+  "L3-App/shared-api/src",
+  "L3-App/production-api/src",
+  "L3-App/evaluation-api/src",
+  "L3-App/training-api/src",
+  "L3-App/production-worker/src",
+  "L3-App/asr-compute-worker/src",
+]
 venvPath = "."
 venv = ".venv"
 reportMissingTypeStubs = false
@@ -43,13 +57,34 @@ reportMissingTypeStubs = false
 [tool.ruff]
 target-version = "py314"
 line-length = 160
-src = ["src", "tests"]
+src = ["packages", "L2-Core/trainers", "L3-App", "tests"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
 
+[tool.ruff.lint.isort]
+known-first-party = [
+  "access",
+  "app_factory",
+  "dependencies",
+  "l1_foundation",
+  "l2_core",
+  "router",
+  "routes",
+  "scripts",
+]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src"]
+pythonpath = [
+  ".",
+  "packages",
+  "L3-App/shared-api/src",
+  "L3-App/production-api/src",
+  "L3-App/evaluation-api/src",
+  "L3-App/training-api/src",
+  "L3-App/production-worker/src",
+  "L3-App/asr-compute-worker/src",
+]
 addopts = "-q"
 markers = ["integration: opt-in tests that require local audio models"]

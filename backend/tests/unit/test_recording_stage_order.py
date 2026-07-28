@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from application.recordings import RecordingService
-from audio_processing.definition import build_recording_processing
+from l2_core.application.recordings import RecordingService
+from l2_core.audio_processing.definition import build_recording_processing
 
 
 def test_recording_processing_stages_follow_the_declared_graph_order() -> None:

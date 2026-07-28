@@ -2,10 +2,10 @@ import asyncio
 from pathlib import Path
 from uuid import uuid4
 
-from audio_processing.stages.build_utterances import BuildUtterancesStage
-from audio_processing.stages.recording_models import BuildUtterancesInput, TranscriptOutput, TranscriptSegment
-from pipeline.contracts import ArtifactPayload, PipelineRunId, PipelineSubjectId, StageContext, StageRunId
-from pipeline.runtime.artifact_store import ArtifactStore
+from l1_foundation.pipeline.contracts import ArtifactPayload, PipelineRunId, PipelineSubjectId, StageContext, StageRunId
+from l1_foundation.pipeline.runtime.artifact_store import ArtifactStore
+from l2_core.audio_processing.stages.build_utterances import BuildUtterancesStage
+from l2_core.audio_processing.stages.recording_models import BuildUtterancesInput, TranscriptOutput, TranscriptSegment
 
 
 def _segment(speaker: str, start_ms: int, end_ms: int, text: str) -> TranscriptSegment:

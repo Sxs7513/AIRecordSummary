@@ -1,8 +1,8 @@
 from pathlib import Path
 from typing import Any
 
+from l1_foundation.settings import Settings
 from scripts import initialize_database as database_script
-from settings import Settings
 
 
 def test_base_schema_only_creates_missing_tables_and_indexes() -> None:

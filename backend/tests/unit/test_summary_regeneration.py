@@ -5,10 +5,10 @@ from uuid import uuid4
 
 from sqlalchemy import create_engine, text
 
-from audio_processing.stages.summary.regeneration import RecordingSummaryRegenerationService
-from audio_processing.stages.summary.stage import GenerateSummaryStage
-from generation.service import GenerationService
-from task_runtime.scheduler import ResourceScheduler
+from l1_foundation.task_runtime.scheduler import ResourceScheduler
+from l2_core.audio_processing.stages.summary.regeneration import RecordingSummaryRegenerationService
+from l2_core.audio_processing.stages.summary.stage import GenerateSummaryStage
+from l2_core.generation.service import GenerationService
 
 
 def test_summary_regeneration_loads_only_materialized_utterance_columns() -> None:

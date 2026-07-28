@@ -1,4 +1,4 @@
-from rag.prompts import answer_plan_prompt, answer_prompt, grade_prompt, route_prompt
+from l2_core.rag.prompts import answer_plan_prompt, answer_prompt, grade_prompt, route_prompt
 
 
 def test_route_prompt_includes_json_schema_and_exclusive_json_instruction() -> None:

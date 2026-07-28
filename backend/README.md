@@ -5,29 +5,45 @@
 - Python 3.14.4
 - PostgreSQL
 
-The backend reads the existing repository-root `.env` file directly. `backend/src/settings.py` only converts those values into typed Python settings; it is not a second configuration file. Do not commit real credentials.
+The backend reads the existing repository-root `.env` file directly.
+`backend/packages/l1_foundation/settings` converts those values
+into typed Python settings; it is not a second configuration file. Do not
+commit real credentials.
 
-## Install and run
+## Install
 
 ```bash
 cd backend
 python3.14 -m venv .venv
 .venv/bin/python -m pip install -e '.[dev]'
 cd ..
+scripts/install_audio_dependencies.sh
 scripts/db/init-python-backend.sh
-cd backend
-.venv/bin/uvicorn main:app --app-dir src --reload --no-access-log
 ```
 
-From the repository root, the same development server can be started with:
+The audio installer installs the aggregate backend project and creates the
+isolated Qwen HF Trainer environment under:
+
+```text
+backend/L2-Core/trainers/qwen-asr-lora/.venv
+```
+
+## Run
+
+From the repository root:
 
 ```bash
-npm run dev:python-web
+npm run dev:production-api
+npm run dev:evaluation-api
+npm run dev:training-api
+npm run worker:asr-lab
 ```
 
-The Uvicorn HTTP access log is disabled so terminal output stays focused on
-pipeline stages and model progress. Application and worker errors are still
-logged.
+The APIs listen on ports 8000, 8001, and 8002. `npm run dev:python-web` is a
+backward-compatible alias for `npm run dev:production-api`.
+
+The Uvicorn access logs are disabled so terminal output stays focused on
+pipeline stages and model progress.
 
 The Web application starts a long-lived CPU worker and a single GPU scheduler
 as part of its lifespan. The GPU scheduler always checks `gpu_high` before
@@ -40,9 +56,9 @@ as independent processes. In that case, start one process per queue:
 
 ```bash
 cd backend
-PYTHONPATH=src .venv/bin/python -m workers.main
-PIPELINE_WORKER_QUEUE=gpu_high PYTHONPATH=src .venv/bin/python -m workers.main
-PIPELINE_WORKER_QUEUE=gpu_normal PYTHONPATH=src .venv/bin/python -m workers.main
+PYTHONPATH=packages .venv/bin/python L3-App/production-worker/src/main.py
+PIPELINE_WORKER_QUEUE=gpu_high PYTHONPATH=packages .venv/bin/python L3-App/production-worker/src/main.py
+PIPELINE_WORKER_QUEUE=gpu_normal PYTHONPATH=packages .venv/bin/python L3-App/production-worker/src/main.py
 ```
 
 GPU workers do not launch model-specific runner subprocesses. Both embedded
@@ -50,7 +66,9 @@ and independent workers use `backend/.venv`, which contains the backend and
 audio-model dependencies. The root `.env` retains `*_PYTHON_BIN` entries for
 the legacy service, but the Python backend no longer reads them.
 
-Run `scripts/install_audio_dependencies.sh` to install audio-model dependencies into `backend/.venv`. The legacy root `.venv-audio` is no longer used by the Python backend.
+Run `scripts/install_audio_dependencies.sh` to install production audio-model
+dependencies into `backend/.venv` and HF training dependencies into the
+Trainer's isolated `.venv`. The legacy root `.venv-audio` is no longer used.
 
 ## Real-audio pipeline test
 
@@ -59,7 +77,7 @@ The default test suite never loads audio models. To run the opt-in end-to-end te
 ```bash
 cd backend
 RUN_AUDIO_E2E=1 AUDIO_E2E_FILE=/absolute/path/to/short.wav \
-  PYTHONPATH=src .venv/bin/python -m pytest tests/integration/test_recording_processing_e2e.py
+  .venv/bin/python -m pytest tests/integration/test_recording_processing_e2e.py
 ```
 
 It exercises `normalize → diarize → Qwen ASR → utterances → correction → summary`. It requires the models referenced by the root `.env` to be available under the repository `model-cache` directory.
@@ -68,7 +86,7 @@ The database-backed E2E additionally verifies the declared `recording_processing
 
 ```bash
 cd backend
-RUN_PIPELINE_E2E=1 AUDIO_E2E_FILE=/absolute/path/to/short.wav PYTHONPATH=src \
+RUN_PIPELINE_E2E=1 AUDIO_E2E_FILE=/absolute/path/to/short.wav \
   .venv/bin/python -m pytest tests/integration/test_recording_processing_e2e.py
 ```
 
@@ -110,7 +128,7 @@ pipeline run and keeps the failed run intact for diagnosis.
 ## Checks
 
 ```bash
-.venv/bin/ruff check src tests
+.venv/bin/ruff check packages L2-Core/trainers L3-App tests scripts
 .venv/bin/pyright
 .venv/bin/pytest
 ```

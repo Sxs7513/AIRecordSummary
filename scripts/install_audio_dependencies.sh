@@ -4,6 +4,8 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VENV_DIR="${ROOT_DIR}/backend/.venv"
+QWEN_ASR_TRAINER_DIR="${ROOT_DIR}/backend/L2-Core/trainers/qwen-asr-lora"
+QWEN_ASR_TRAINER_VENV="${QWEN_ASR_TRAINER_DIR}/.venv"
 PIP_CONSTRAINTS_FILE="${ROOT_DIR}/scripts/audio-python-constraints.txt"
 PYTHON_BIN_DEFAULT="python3.14"
 PYTHON_VERSION_MIN="3.14"
@@ -48,6 +50,11 @@ brew_install() {
 python_meets_min_version() {
   local python_bin="$1"
   "${python_bin}" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' >/dev/null 2>&1
+}
+
+python_supports_qwen_trainer() {
+  local python_bin="$1"
+  "${python_bin}" -c 'import sys; raise SystemExit(0 if (3, 12) <= sys.version_info[:2] < (3, 15) else 1)' >/dev/null 2>&1
 }
 
 find_supported_python() {
@@ -137,6 +144,7 @@ load_env_file() {
   AUDIO_MODEL_CACHE_ROOT="${AUDIO_MODEL_CACHE_ROOT:-model-cache}"
   ASR_PROVIDER="${ASR_PROVIDER:-qwen_asr}"
   QWEN_ASR_MODEL="${QWEN_ASR_MODEL:-Qwen/Qwen3-ASR-1.7B}"
+  QWEN_ASR_TRAINING_MODEL="${QWEN_ASR_TRAINING_MODEL:-Qwen/Qwen3-ASR-1.7B-hf}"
   TRANSCRIPT_ALIGNMENT_ENABLED="${TRANSCRIPT_ALIGNMENT_ENABLED:-true}"
   TRANSCRIPT_ALIGNMENT_MODEL="${TRANSCRIPT_ALIGNMENT_MODEL:-Qwen/Qwen3-ForcedAligner-0.6B}"
   FUNASR_NANO_MODEL="${FUNASR_NANO_MODEL:-FunAudioLLM/Fun-ASR-Nano-2512}"
@@ -739,17 +747,58 @@ ensure_qwen_asr() {
     log "Installing Qwen3-ASR runtime via ${PIP_INDEX_URL}."
     pip_install_with_pypi_fallback qwen-asr
   fi
-  if python_has_module peft; then
-    log "PEFT already installed for ASR Lab LoRA training."
-  else
-    log "Installing PEFT for ASR Lab LoRA training."
-    pip_install_with_pypi_fallback peft
-  fi
   local hf_hub_cache="${ROOT_DIR}/${AUDIO_MODEL_CACHE_ROOT}/huggingface/hub"
   ensure_huggingface_snapshot "${QWEN_ASR_MODEL}" "${hf_hub_cache}" "Qwen3-ASR"
   if [[ "${TRANSCRIPT_ALIGNMENT_ENABLED}" == "true" ]]; then
     ensure_huggingface_snapshot "${TRANSCRIPT_ALIGNMENT_MODEL}" "${hf_hub_cache}" "Qwen3-ForcedAligner"
   fi
+}
+
+ensure_qwen_asr_trainer() {
+  local trainer_python=""
+  if [[ -x "${QWEN_ASR_TRAINER_VENV}/bin/python" ]]; then
+    trainer_python="${QWEN_ASR_TRAINER_VENV}/bin/python"
+    log "Qwen ASR Trainer virtual environment already exists."
+  else
+    local candidate
+    for candidate in "${QWEN_ASR_TRAINER_BOOTSTRAP_PYTHON:-}" python3.12 python3.13 python3.14 python3; do
+      if [[ -n "${candidate}" ]] && command_exists "${candidate}" && python_supports_qwen_trainer "${candidate}"; then
+        trainer_python="${candidate}"
+        break
+      fi
+    done
+    if [[ -z "${trainer_python}" ]]; then
+      fail "No Python 3.12+ interpreter is available for the isolated Qwen ASR Trainer."
+    fi
+    log "Creating isolated Qwen ASR Trainer environment with ${trainer_python}."
+    "${trainer_python}" -m venv "${QWEN_ASR_TRAINER_VENV}"
+    trainer_python="${QWEN_ASR_TRAINER_VENV}/bin/python"
+  fi
+
+  log "Installing isolated Qwen ASR Trainer dependencies from ${QWEN_ASR_TRAINER_DIR}."
+  local trainer_lock="${QWEN_ASR_TRAINER_DIR}/requirements.lock"
+  local trainer_install_args=(-e "${QWEN_ASR_TRAINER_DIR}")
+  if [[ -s "${trainer_lock}" ]]; then
+    log "Installing Qwen ASR Trainer from the validated requirements.lock."
+    if ! "${trainer_python}" -m pip install --index-url "${PIP_INDEX_URL}" --trusted-host "${PIP_TRUSTED_HOST}" -r "${trainer_lock}"; then
+      warn "Trainer lock install from ${PIP_INDEX_URL} failed, retrying with official PyPI."
+      "${trainer_python}" -m pip install --index-url "https://pypi.org/simple" -r "${trainer_lock}"
+    fi
+    trainer_install_args=(--no-deps -e "${QWEN_ASR_TRAINER_DIR}")
+  else
+    warn "Trainer requirements.lock is not present yet; resolving dependencies from pyproject.toml."
+  fi
+  if ! "${trainer_python}" -m pip install --index-url "${PIP_INDEX_URL}" --trusted-host "${PIP_TRUSTED_HOST}" "${trainer_install_args[@]}"; then
+    warn "Trainer package install from ${PIP_INDEX_URL} failed, retrying with official PyPI."
+    "${trainer_python}" -m pip install --index-url "https://pypi.org/simple" "${trainer_install_args[@]}"
+  fi
+
+  local hf_hub_cache="${ROOT_DIR}/${AUDIO_MODEL_CACHE_ROOT}/huggingface/hub"
+  mkdir -p "${hf_hub_cache}"
+  log "Ensuring Qwen HF training model is downloaded: ${QWEN_ASR_TRAINING_MODEL}"
+  "${trainer_python}" -c \
+    'import sys; from huggingface_hub import snapshot_download; print(snapshot_download(repo_id=sys.argv[1], cache_dir=sys.argv[2]))' \
+    "${QWEN_ASR_TRAINING_MODEL}" "${hf_hub_cache}"
 }
 
 ensure_pyannote() {
@@ -887,6 +936,7 @@ print_summary() {
   log "Backend audio dependency environment is ready."
   log "Virtual environment: ${VENV_DIR}"
   log "Python binary: ${VENV_PYTHON}"
+  log "Qwen ASR Trainer environment: ${QWEN_ASR_TRAINER_VENV}"
   log "To activate manually: source ${VENV_DIR}/bin/activate"
 }
 
@@ -909,6 +959,7 @@ main() {
   ensure_whisper
   ensure_funasr_nano
   ensure_qwen_asr
+  ensure_qwen_asr_trainer
   ensure_pyannote
   ensure_speechbrain
   ensure_pycorrector

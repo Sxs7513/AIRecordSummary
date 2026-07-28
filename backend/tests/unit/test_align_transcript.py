@@ -1,4 +1,4 @@
-from audio_processing.stages.align_transcript import AlignTranscriptStage
+from l2_core.audio_processing.stages.align_transcript import AlignTranscriptStage
 
 
 def test_restore_unaligned_text_attaches_chinese_punctuation_to_timed_tokens() -> None:

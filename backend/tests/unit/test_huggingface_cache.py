@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-import infrastructure.huggingface as huggingface_cache
+import l1_foundation.infrastructure.huggingface as huggingface_cache
 
 
 class FakeHuggingFaceHub:

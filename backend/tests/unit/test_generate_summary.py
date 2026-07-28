@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from audio_processing.stages.recording_models import Utterance
-from audio_processing.stages.summary.stage import GenerateSummaryStage
-from pipeline.runtime.artifact_store import ArtifactStore
+from l1_foundation.pipeline.runtime.artifact_store import ArtifactStore
+from l2_core.audio_processing.stages.recording_models import Utterance
+from l2_core.audio_processing.stages.summary.stage import GenerateSummaryStage
 
 
 def test_rolling_summary_requires_explicit_enablement_and_duration_threshold(tmp_path: Path) -> None:

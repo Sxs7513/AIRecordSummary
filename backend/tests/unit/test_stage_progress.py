@@ -3,9 +3,9 @@ from __future__ import annotations
 from typing import cast
 from uuid import uuid4
 
-from pipeline.contracts import StageRunId
-from pipeline.runtime.executor import PipelineProgressReporter
-from pipeline.runtime.repository import PipelineRepository
+from l1_foundation.pipeline.contracts import StageRunId
+from l1_foundation.pipeline.runtime.executor import PipelineProgressReporter
+from l1_foundation.pipeline.runtime.repository import PipelineRepository
 
 
 class FakeRepository:

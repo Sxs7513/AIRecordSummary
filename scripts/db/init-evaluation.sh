@@ -13,4 +13,4 @@ if [ ! -x "$PYTHON_BIN" ]; then
 fi
 
 cd "$BACKEND_ROOT"
-PYTHONPATH="src${PYTHONPATH:+:$PYTHONPATH}" exec "$PYTHON_BIN" scripts/initialize_evaluation_database.py
+exec env PYTHONPATH=packages "$PYTHON_BIN" scripts/initialize_evaluation_database.py

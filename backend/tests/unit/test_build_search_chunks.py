@@ -3,11 +3,11 @@ from pathlib import Path
 from typing import Any, cast
 from uuid import uuid4
 
-from audio_processing.stages.build_search_chunks import BuildSearchChunksStage
-from audio_processing.stages.build_search_chunks.contracts import TopicSection
-from audio_processing.stages.recording_models import BuildSearchChunksInput, Utterance, UtterancesOutput
-from pipeline.contracts import ArtifactPayload, PipelineRunId, PipelineSubjectId, StageContext, StageRunId
-from pipeline.runtime.artifact_store import ArtifactStore
+from l1_foundation.pipeline.contracts import ArtifactPayload, PipelineRunId, PipelineSubjectId, StageContext, StageRunId
+from l1_foundation.pipeline.runtime.artifact_store import ArtifactStore
+from l2_core.audio_processing.stages.build_search_chunks import BuildSearchChunksStage
+from l2_core.audio_processing.stages.build_search_chunks.contracts import TopicSection
+from l2_core.audio_processing.stages.recording_models import BuildSearchChunksInput, Utterance, UtterancesOutput
 
 
 def test_build_search_chunks_keeps_source_utterance_provenance(tmp_path: Path) -> None:

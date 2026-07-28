@@ -1,10 +1,10 @@
 from uuid import uuid4
 
-from application.recording_processing import StartRecordingProcessing
-from audio_processing.contracts import RecordingId
-from audio_processing.definition import recording_processing
-from pipeline.contracts import ArtifactRef, PipelineRunId
-from pipeline.definitions.graph import PipelineDefinition
+from l1_foundation.pipeline.contracts import ArtifactRef, PipelineRunId
+from l1_foundation.pipeline.definitions.graph import PipelineDefinition
+from l2_core.application.recording_processing import StartRecordingProcessing
+from l2_core.audio_processing.contracts import RecordingId
+from l2_core.audio_processing.definition import recording_processing
 
 
 class FakePipelineRepository:

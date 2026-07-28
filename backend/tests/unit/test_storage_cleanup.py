@@ -4,8 +4,8 @@ from pathlib import Path
 
 from sqlalchemy import create_engine, text
 
-from application.storage_cleanup import StorageCleanupService
-from infrastructure.storage.local import LocalStorage
+from l1_foundation.infrastructure.storage.local import LocalStorage
+from l2_core.application.storage_cleanup import StorageCleanupService
 
 
 def test_cleanup_removes_only_intermediates_for_inactive_pipeline_runs(tmp_path: Path) -> None:

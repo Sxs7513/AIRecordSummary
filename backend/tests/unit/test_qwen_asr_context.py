@@ -3,8 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from audio_processing.stages.transcribe_funasr_nano.context import build_funasr_hotwords
-from audio_processing.stages.transcribe_qwen_asr.context import build_qwen_asr_context
+from l2_core.audio_processing.stages.transcribe_funasr_nano.context import build_funasr_hotwords
+from l2_core.audio_processing.stages.transcribe_qwen_asr.context import build_qwen_asr_context
 
 
 def test_build_qwen_asr_context_uses_hotwords_before_phrases(tmp_path: Path) -> None:

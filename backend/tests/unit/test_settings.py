@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from settings import REPOSITORY_ROOT, Settings
+from l1_foundation.settings import REPOSITORY_ROOT, Settings
 
 
 def settings_payload(**overrides: object) -> dict[str, object]:
@@ -26,6 +26,11 @@ def test_default_asr_provider_is_qwen() -> None:
 
     assert settings.asr_provider == "qwen_asr"
     assert settings.qwen_asr_model == "Qwen/Qwen3-ASR-1.7B"
+    assert settings.asr_lab_training_model == "Qwen/Qwen3-ASR-1.7B-hf"
+    assert settings.asr_lab_training_module == "airecord_qwen_asr_trainer"
+    assert settings.resolved_asr_lab_training_python_bin == (
+        REPOSITORY_ROOT / "backend/L2-Core/trainers/qwen-asr-lora/.venv/bin/python"
+    ).resolve()
 
 
 def test_funasr_nano_can_be_selected_as_the_recording_asr_provider() -> None:

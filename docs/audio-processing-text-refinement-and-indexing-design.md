@@ -391,7 +391,7 @@ build_utterances_and_embedding
 不新增独立 pipeline 节点。主题边界识别和确定性构建都属于“从最终连续发言生成检索分块”这一项业务职责，应内聚在 `build_search_chunks` 目录：
 
 ```text
-backend/src/audio_processing/stages/build_search_chunks/
+backend/packages/l2_core/audio_processing/stages/build_search_chunks/
 ├── __init__.py
 ├── stage.py
 ├── contracts.py
@@ -555,7 +555,8 @@ correct_text
 
 ## 10. 配置建议
 
-新增配置建议使用根目录 `.env`，由 `backend/src/settings.py` 转换为强类型配置：
+新增配置建议使用根目录 `.env`，由
+`backend/packages/l1_foundation/settings` 转换为强类型配置：
 
 ```dotenv
 # 校正单元
@@ -588,7 +589,7 @@ RAG_CHUNK_CONTEXT_WINDOW_UTTERANCES=1
 建议的最终目录：
 
 ```text
-backend/src/audio_processing/stages/
+backend/packages/l2_core/audio_processing/stages/
 ├── correct_text/
 │   ├── __init__.py
 │   ├── stage.py

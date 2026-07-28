@@ -1,5 +1,9 @@
 # ASR Lab 评测与训练平台设计
 
+> 后端目录和运行入口已经按 `docs/python-backend-layered-monorepo-architecture-design.md`
+> 完成物理分层迁移。本文件中后续出现的 `backend/src/*` 仅是早期方案的
+> 历史路径；新代码归属、依赖环境和启动入口以分层 Monorepo 文档为准。
+
 ## 1. 文档目标
 
 本文档描述一个面向 ASR 的轻量数据、评测和训练平台。第一阶段解决以下问题：
@@ -19,11 +23,11 @@
 第一版闭环已经实现：
 
 - `sql/evaluation.sql`：评测、训练和模型版本独立 schema；
-- `backend/src/evaluation`：版本化数据集、确定性 group split、标准化、CER/WER 和 edit operations；
-- `backend/src/asr_lab`：标注服务、冻结服务、Qwen/LoRA 模型运行时和统一单 GPU worker；
-- `backend/src/api/routes/asr_lab.py`：数据集、音频、标注、版本、评测、训练和模型 API；
-- `backend/scripts/train_qwen_asr_lora.py`：基于原始 Qwen3-ASR 权重的 PEFT LoRA 训练入口；
-- `backend/scripts/run_asr_lab_worker.py`：与 Web/生产 pipeline 隔离的离线 worker；
+- `backend/packages/l2_core/evaluation`：通用评测与数据版本边界；
+- `backend/packages/l2_core/asr_lab`：标注、冻结和训练任务编排边界；
+- `backend/L2-Core/trainers/qwen-asr-lora`：独立 HF Trainer，使用 `Qwen/Qwen3-ASR-1.7B-hf`；
+- `backend/L3-App/evaluation-api`、`training-api`：拆分后的控制面 API；
+- `backend/L3-App/asr-compute-worker`：统一单 GPU 评测与训练调度入口；
 - `app/asr-lab` 和 `components/asr-lab`：数据标注、模型评测和训练记录页面。
 
 启动顺序：
@@ -37,14 +41,18 @@ npm run dev
 npm run worker:asr-lab
 ```
 
-真实 LoRA 训练还要求 ASR Lab worker 环境安装 `peft`、`datasets`、`qwen-asr`、`torch` 和 `librosa`。其中 `datasets` 由 `backend/pyproject.toml` 直接管理，其余音频运行时和 PEFT 依赖由 `scripts/install_audio_dependencies.sh` 安装检查。训练需要的 GPU/统一内存取决于数据长度、LoRA target 和 batch 配置，首次使用前必须在训练机上做显存验证。
+真实 LoRA 训练依赖由 Trainer 自己的 `pyproject.toml` 和 `.venv` 管理，包括
+`transformers>=5.13`、`peft`、`datasets`、`torch` 和 `librosa`。生产
+`backend/.venv` 不再安装训练依赖。`scripts/install_audio_dependencies.sh`
+会分别安装生产环境和 Trainer 环境。训练需要的显存取决于数据长度、LoRA
+target 和 batch 配置，首次使用前必须在训练机上做 smoke test。
 
 ## 2. 核心结论
 
 ### 2.1 代码与部署边界
 
 - 前端继续放在当前 Next.js 项目中，新增 `app/asr-lab`；
-- 后端继续放在 `backend/src`，新增通用 `evaluation` 和 ASR 专用 `asr_lab`；
+- 后端代码已迁移到 L1/L2/L3 分层 Monorepo，`backend/src` 不再承载源码；
 - API、鉴权、PostgreSQL 和对象存储复用现有基础设施；
 - 统一 ASR Lab worker 必须与线上 API、生产 ASR pipeline worker 分进程运行；
 - 第一版不新建独立仓库或独立微服务。
@@ -74,7 +82,7 @@ app/sdk/asr-lab/
 ├── types.ts
 └── store.ts
 
-backend/src/evaluation/
+backend/packages/l2_core/evaluation/
 ├── __init__.py
 ├── contracts.py
 ├── datasets.py
@@ -83,7 +91,7 @@ backend/src/evaluation/
 ├── metrics.py
 └── registry.py
 
-backend/src/asr_lab/
+backend/packages/l2_core/asr_lab/
 ├── __init__.py
 ├── annotation.py
 ├── dataset_builder.py
@@ -93,7 +101,7 @@ backend/src/asr_lab/
 ├── training.py
 └── model_registry.py
 
-backend/src/api/routes/
+backend/L3-App/shared-api/src/routes/
 ├── evaluation_datasets.py
 ├── evaluation_runs.py
 ├── training_runs.py
@@ -552,7 +560,7 @@ zh_asr_v1
 
 ### 8.1 `evaluation` 通用底座
 
-`backend/src/evaluation` 不依赖具体 ASR 模型：
+`backend/packages/l2_core/evaluation` 不依赖具体 ASR 模型：
 
 ```text
 contracts.py
@@ -1176,13 +1184,13 @@ error_type
 ASR 第一版完成后，可以在不修改通用底座的前提下增加：
 
 ```text
-backend/src/rag/evaluators.py
+backend/packages/l2_core/rag/evaluators.py
   route filter accuracy
   retrieval recall@k / MRR
   evidence precision
   answer groundedness
 
-backend/src/evaluation/
+backend/packages/l2_core/evaluation/
   继续复用 dataset version
   evaluation run
   case result
