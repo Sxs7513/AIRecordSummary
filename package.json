@@ -8,7 +8,8 @@
     "build": "next build",
     "start": "next start -H 127.0.0.1",
     "db:init": "sh scripts/db/init-python-backend.sh",
-    "db:init:python": "sh scripts/db/init-python-backend.sh",
+    "db:init:evaluation": "sh scripts/db/init-evaluation.sh",
+    "worker:asr-lab": "cd backend && PYTHONPATH=src .venv/bin/python scripts/run_asr_lab_worker.py",
     "typecheck": "tsc --noEmit",
     "lint": "next lint"
   },

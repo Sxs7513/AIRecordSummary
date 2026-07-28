@@ -739,7 +739,12 @@ ensure_qwen_asr() {
     log "Installing Qwen3-ASR runtime via ${PIP_INDEX_URL}."
     pip_install_with_pypi_fallback qwen-asr
   fi
-
+  if python_has_module peft; then
+    log "PEFT already installed for ASR Lab LoRA training."
+  else
+    log "Installing PEFT for ASR Lab LoRA training."
+    pip_install_with_pypi_fallback peft
+  fi
   local hf_hub_cache="${ROOT_DIR}/${AUDIO_MODEL_CACHE_ROOT}/huggingface/hub"
   ensure_huggingface_snapshot "${QWEN_ASR_MODEL}" "${hf_hub_cache}" "Qwen3-ASR"
   if [[ "${TRANSCRIPT_ALIGNMENT_ENABLED}" == "true" ]]; then

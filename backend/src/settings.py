@@ -38,6 +38,12 @@ class Settings(BaseSettings):
     qwen_asr_context: str = Field(default="", validation_alias="QWEN_ASR_CONTEXT")
     qwen_asr_max_context_items: int = Field(default=200, ge=0, validation_alias="QWEN_ASR_MAX_CONTEXT_ITEMS")
     qwen_asr_max_inference_batch_size: int = Field(default=4, ge=1, validation_alias="QWEN_ASR_MAX_INFERENCE_BATCH_SIZE")
+    asr_lab_training_python_bin: Path = Field(default=Path("backend/.venv/bin/python"), validation_alias="ASR_LAB_TRAINING_PYTHON_BIN")
+    asr_lab_training_script: Path = Field(
+        default=Path("backend/scripts/train_qwen_asr_lora.py"),
+        validation_alias="ASR_LAB_TRAINING_SCRIPT",
+    )
+    asr_lab_worker_poll_seconds: float = Field(default=2.0, ge=0.2, le=60, validation_alias="ASR_LAB_WORKER_POLL_SECONDS")
     qwen_asr_enhance_low_volume_segments: bool = Field(default=True, validation_alias="QWEN_ASR_ENHANCE_LOW_VOLUME_SEGMENTS")
     asr_preprocess_recording_enabled: bool = Field(
         default=False, validation_alias=AliasChoices("ASR_AUDIO_PREPROCESSING_ENABLED", "ASR_PREPROCESS_RECORDING_ENABLED")
@@ -158,6 +164,14 @@ class Settings(BaseSettings):
     @property
     def resolved_audio_model_cache_root(self) -> Path:
         return self._resolve_repository_path(self.audio_model_cache_root)
+
+    @property
+    def resolved_asr_lab_training_python_bin(self) -> Path:
+        return self._resolve_repository_path(self.asr_lab_training_python_bin)
+
+    @property
+    def resolved_asr_lab_training_script(self) -> Path:
+        return self._resolve_repository_path(self.asr_lab_training_script)
 
     @property
     def resolved_funasr_nano_cache_dir(self) -> Path:

@@ -21,5 +21,5 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   if (isLoginPage) return <main className="login-main">{children}</main>;
   if (loading || user === null) return <main className="auth-loading">正在验证登录状态…</main>;
   if (isChatPage) return <main className="chat-main">{children}</main>;
-  return <div className="shell"><aside className="sidebar"><p className="brand">AI 录音检索</p><nav className="nav"><Link href="/chat">问录音</Link><Link href="/recordings">录音管理</Link><Link href="/account">账号</Link></nav></aside><main className="main">{children}</main></div>;
+  return <div className="shell"><aside className="sidebar"><p className="brand">AI 录音检索</p><nav className="nav"><Link href="/chat">问录音</Link><Link href="/recordings">录音管理</Link><Link href="/asr-lab">ASR Lab</Link><Link href="/account">账号</Link></nav></aside><main className="main">{children}</main></div>;
 }

@@ -40,6 +40,12 @@ npm run db:init
 
 The Python web service does not initialize the database on startup; run this command after changing `sql/base.sql`.
 
+Initialize the ASR Lab tables in the same database after the base schema:
+
+```bash
+npm run db:init:evaluation
+```
+
 Install audio dependencies:
 
 ```bash
@@ -62,10 +68,17 @@ Start the web app:
 npm run dev
 ```
 
+Run the isolated ASR evaluation and LoRA training worker in another terminal:
+
+```bash
+npm run worker:asr-lab
+```
+
 Useful pages:
 
 - `http://localhost:3000/recordings`
 - `http://localhost:3000/speaker-profiles`
+- `http://localhost:3000/asr-lab`
 
 ## Phase 1 Routes
 

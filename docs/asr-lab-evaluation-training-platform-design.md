@@ -14,6 +14,31 @@
 
 平台先聚焦 ASR，但底层的 Dataset、Run、Artifact、Metric 和 Model Version 使用通用命名和契约，为后续接入 RAG、摘要和全链路评测预留扩展能力。
 
+### 1.1 当前实现状态
+
+第一版闭环已经实现：
+
+- `sql/evaluation.sql`：评测、训练和模型版本独立 schema；
+- `backend/src/evaluation`：版本化数据集、确定性 group split、标准化、CER/WER 和 edit operations；
+- `backend/src/asr_lab`：标注服务、冻结服务、Qwen/LoRA 模型运行时和统一单 GPU worker；
+- `backend/src/api/routes/asr_lab.py`：数据集、音频、标注、版本、评测、训练和模型 API；
+- `backend/scripts/train_qwen_asr_lora.py`：基于原始 Qwen3-ASR 权重的 PEFT LoRA 训练入口；
+- `backend/scripts/run_asr_lab_worker.py`：与 Web/生产 pipeline 隔离的离线 worker；
+- `app/asr-lab` 和 `components/asr-lab`：数据标注、模型评测和训练记录页面。
+
+启动顺序：
+
+```bash
+npm run db:init
+npm run db:init:evaluation
+npm run dev
+
+# 独立终端
+npm run worker:asr-lab
+```
+
+真实 LoRA 训练还要求 ASR Lab worker 环境安装 `peft`、`datasets`、`qwen-asr`、`torch` 和 `librosa`。其中 `datasets` 由 `backend/pyproject.toml` 直接管理，其余音频运行时和 PEFT 依赖由 `scripts/install_audio_dependencies.sh` 安装检查。训练需要的 GPU/统一内存取决于数据长度、LoRA target 和 batch 配置，首次使用前必须在训练机上做显存验证。
+
 ## 2. 核心结论
 
 ### 2.1 代码与部署边界
@@ -21,7 +46,7 @@
 - 前端继续放在当前 Next.js 项目中，新增 `app/asr-lab`；
 - 后端继续放在 `backend/src`，新增通用 `evaluation` 和 ASR 专用 `asr_lab`；
 - API、鉴权、PostgreSQL 和对象存储复用现有基础设施；
-- 训练执行器必须与线上 API、ASR 推理 worker 分进程部署；
+- 统一 ASR Lab worker 必须与线上 API、生产 ASR pipeline worker 分进程运行；
 - 第一版不新建独立仓库或独立微服务。
 
 建议目录：
@@ -89,6 +114,23 @@ backend/src/api/routes/
 
 高级训练参数可以放在折叠区域中，但默认入口只暴露基础模型、数据集版本、训练预设和候选模型名称。
 
+### 2.3 数据库初始化边界
+
+评测相关表单独维护在：
+
+```text
+sql/evaluation.sql
+```
+
+它与 `sql/base.sql` 使用同一个 PostgreSQL 数据库和 `public` schema，但不会被隐式拼接到主库初始化中。初始化顺序：
+
+```bash
+npm run db:init
+npm run db:init:evaluation
+```
+
+第二条命令会先验证 `users`、`workspaces` 和 `recordings` 已存在，然后在事务和独立 advisory lock 中幂等执行评测 SQL。评测 SQL 不建新数据库、不删除表，也不清理已有数据。
+
 ## 3. 范围与非目标
 
 ### 3.1 第一阶段范围
@@ -124,14 +166,11 @@ flowchart LR
     UI["Next.js ASR Lab"] --> API["FastAPI API"]
     API --> DB[("PostgreSQL")]
     API --> Storage["评测 Artifact Storage"]
-    API --> Queue["gpu_training 队列"]
-    Queue --> Worker["独立 Training Worker"]
+    API --> Queue["ASR Lab 任务表"]
+    Queue --> Worker["统一 ASR Lab Worker（单 GPU 串行）"]
+    Worker --> Registry["ASR Evaluator Registry"]
     Worker --> Storage
     Worker --> DB
-    API --> EvalWorker["ASR Evaluation Worker"]
-    EvalWorker --> Registry["ASR Evaluator Registry"]
-    EvalWorker --> Storage
-    EvalWorker --> DB
 
     Registry --> Base["基础模型适配器"]
     Registry --> Lora["LoRA 模型适配器"]
@@ -144,14 +183,13 @@ flowchart LR
 Web/API 进程
   负责上传、标注、冻结版本、创建任务、读取结果
 
-Evaluation worker
-  负责调用指定模型推理、计算指标、持久化 case result
-
-Training worker
-  负责构造 Qwen 数据、执行 LoRA 训练、保存 checkpoint、触发验证
+ASR Lab worker
+  单进程串行消费 evaluation_runs 和 training_runs
+  空闲时优先领取评测任务，其次领取训练任务
+  负责模型推理、指标计算、Qwen 数据构造、LoRA 训练和 checkpoint
 ```
 
-训练 worker 第一阶段可以部署在单独机器上，通过数据库任务表或专用 `gpu_training` 队列领取任务。它不得占用生产录音处理的 GPU worker。
+第一阶段只考虑单 GPU，因此评测和训练共用一个 ASR Lab worker，不并发加载两套模型。该 worker 可以与 Web 部署在同一台机器，但必须保持独立进程；它仍不得与生产录音处理的嵌入式 worker 同进程运行。
 
 ## 5. 领域模型
 
@@ -200,6 +238,7 @@ updated_at          timestamptz
 ```text
 id                  uuid
 workspace_id        uuid
+dataset_id          uuid
 recording_id        uuid nullable   # 导入现有录音时使用
 artifact_uri        text nullable   # ASR Lab 独立上传时使用
 checksum            text
@@ -212,9 +251,9 @@ created_by_user_id  uuid
 created_at          timestamptz
 ```
 
-`recording_id` 和 `artifact_uri` 至少存在一个。Lab 独立上传的音频不能仅依赖现有 `artifacts` 表，因为现有 artifact 关联 `pipeline_runs`，删除 pipeline run 时可能级联删除，不适合作为长期训练数据来源。
+`recording_id` 和 `artifact_uri` 必须且只能存在一个，避免同一 asset 出现两个含义不同的源。Lab 独立上传的音频不能仅依赖现有 `artifacts` 表，因为现有 artifact 关联 `pipeline_runs`，删除 pipeline run 时可能级联删除，不适合作为长期训练数据来源。
 
-#### `annotations`
+#### `evaluation_annotations`
 
 保存可编辑的人工作业。
 
@@ -299,7 +338,6 @@ workspace_id          uuid
 dataset_version_id    uuid
 evaluator_type        text       # asr
 status                text       # queued/running/succeeded/failed/cancelled
-model_version_ids     uuid[]
 split                 text       # 通常为 test 或 validation
 config_snapshot       jsonb
 code_commit           text nullable
@@ -310,6 +348,18 @@ created_by_user_id    uuid
 created_at            timestamptz
 updated_at            timestamptz
 ```
+
+模型列表不使用无法施加逐项外键约束的 `uuid[]`，而是通过 `evaluation_run_models` 保存：
+
+```text
+evaluation_run_id     uuid
+model_version_id      uuid
+role                  text       # baseline / candidate / peer
+position              integer
+created_at            timestamptz
+```
+
+主键为 `(evaluation_run_id, model_version_id)`；同一 run 只允许一个 baseline，并通过 `position` 保持稳定展示顺序。
 
 #### `evaluation_case_results`
 
@@ -548,7 +598,7 @@ annotation.py
   校验区间、文本、状态流转和审批权限
 
 dataset_builder.py
-  将 approved annotations 冻结成 evaluation_cases
+  将 approved evaluation_annotations 冻结成 evaluation_cases
 
 normalization.py
   ASR 文本标准化和版本注册
@@ -1105,7 +1155,7 @@ error_type
 
 - Qwen JSONL 导出；
 - LoRA 训练预设；
-- 独立 training worker；
+- 独立于 Web 的统一 ASR Lab worker；
 - training run、日志、checkpoint；
 - validation 自动评测；
 - 候选 model version；
@@ -1166,6 +1216,6 @@ ASR 转写 -> RAG
 2. 前端上传、区间标注和人工确认；
 3. 冻结数据集与防泄漏切分；
 4. ASR 基线评测和模型对比页面；
-5. 最后接入 LoRA training worker 和一键训练。
+5. 最后接入统一 ASR Lab worker 中的 LoRA 执行器和一键训练。
 
 其中第 1 至第 4 步先形成可靠的人工数据和质量基线，第 5 步再开始真实训练。这样训练得到的提升可以立即在冻结测试集上验证，而不是只凭少量样例主观判断。

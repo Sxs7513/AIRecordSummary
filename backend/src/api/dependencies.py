@@ -7,6 +7,7 @@ from sqlalchemy import Engine
 
 from access.generations import GenerationAccessService
 from application.recordings import RecordingService
+from asr_lab.service import AsrLabService
 from audio_processing.stages.summary.regeneration import RecordingSummaryRegenerationService
 from auth.contracts import CurrentUser
 from auth.service import AuthenticationError, AuthService
@@ -62,6 +63,13 @@ def get_storage(request: Request) -> LocalStorage:
 
 DatabaseEngineDependency = Annotated[Engine, Depends(get_database_engine)]
 StorageDependency = Annotated[LocalStorage, Depends(get_storage)]
+
+
+def get_asr_lab_service(request: Request) -> AsrLabService:
+    return AsrLabService(request.app.state.database_engine, request.app.state.storage)
+
+
+AsrLabServiceDependency = Annotated[AsrLabService, Depends(get_asr_lab_service)]
 
 
 def get_generation_access_service(request: Request) -> GenerationAccessService:
