@@ -6,7 +6,7 @@
 
 1. `packages/l1_foundation`：与具体业务无关的基础能力包集合；
 2. `packages/l2_core`：录音处理、RAG、评测等核心业务能力包集合；
-3. `L3-App`：生产 API、评测 API、训练 API、Worker 和 CLI 等可运行入口集合。
+3. `packages/l3_app`：生产 API、评测 API、训练 API、Worker 和 CLI 等可运行入口集合。
 
 本次重构首先解决代码与依赖边界问题，不要求立即拆分仓库、数据库、机器或 GPU。第一阶段仍然可以：
 
@@ -20,14 +20,14 @@
 
 截至当前版本：
 
-- 已建立 `packages/l1_foundation`、`packages/l2_core` 和 `L3-App` 物理目录；
+- 已建立 `packages/l1_foundation`、`packages/l2_core` 和 `packages/l3_app` 物理目录；
 - L1/L2/L3 共享 `backend/pyproject.toml` 和 `backend/.venv`；
 - 只有存在依赖冲突的 Qwen HF Trainer 保留独立 `pyproject.toml` 和 `.venv`；
 - 原 `backend/src` 下的实现已全部物理迁入对应的 L1/L2/L3；
 - 生产代码统一使用 `l1_foundation.*`、`l2_core.*` 显式分层 namespace；
 - 已拆出 production、evaluation、training 三套 FastAPI 入口；
 - 已拆出 production worker 和单 GPU ASR compute worker；
-- Qwen LoRA Trainer 已从 `backend/scripts` 迁到 `L2-Core/trainers/qwen-asr-lora`；
+- Qwen LoRA Trainer 已从 `backend/scripts` 迁到 `packages/l2_core/trainers/qwen-asr-lora`；
 - Trainer 已改用 `Qwen/Qwen3-ASR-1.7B-hf` 和 Transformers 原生训练接口；
 - Trainer 使用独立 `.venv`，生产 `qwen-asr` 推理继续使用 `backend/.venv`；
 - 评测 HF base/adapter 时，通过常驻子进程协议调用 Trainer 环境，避免每个 case 重复加载模型；
@@ -40,15 +40,16 @@
 
 ### 2.1 物理分层
 
-`backend/packages` 是 L1/L2 唯一的 Python import root。`l1_foundation`
-和 `l2_core` 是真实 Python package；L3 是可执行应用集合。
+`backend/packages` 是 L1、L2、L3 统一的 monorepo 物理根。`l1_foundation`
+和 `l2_core` 是主环境中的真实 Python package；`l3_app` 是同一根目录下
+的可执行应用集合，不作为业务代码的反向 import 目标。
 
 ```text
 backend/
-├── packages/
-│   ├── l1_foundation/
-│   └── l2_core/
-└── L3-App/
+└── packages/
+    ├── l1_foundation/
+    ├── l2_core/
+    └── l3_app/
 ```
 
 `packages` 本身不进入 import 名称，其下一层是顶层 Python package：
@@ -63,7 +64,7 @@ import：l1_foundation.pipeline
 全局依赖方向固定为：
 
 ```text
-L3-App → l2_core → l1_foundation
+packages/l3_app → l2_core → l1_foundation
 ```
 
 禁止：
@@ -132,45 +133,41 @@ backend/
 │   │   ├── pipeline/
 │   │   └── infrastructure/
 │   │
-│   └── l2_core/
-│       ├── __init__.py
-│       ├── access/
-│       ├── application/
-│       ├── audio_processing/
-│       ├── rag/
-│       ├── evaluation/
-│       ├── asr_lab/
-│       ├── auth/
-│       ├── conversations/
-│       └── generation/
-│
-├── L2-Core/
-│   └── trainers/
-│       └── qwen-asr-lora/
-│           ├── pyproject.toml
-│           ├── requirements.lock       # 在目标训练环境验证后生成
-│           ├── .python-version
-│           ├── src/airecord_qwen_asr_trainer/
-│           └── tests/
-│
-├── L3-App/
-│   ├── production-api/
-│   │   └── src/
+│   ├── l2_core/
+│   │   ├── __init__.py
+│   │   ├── access/
+│   │   ├── application/
+│   │   ├── audio_processing/
+│   │   ├── rag/
+│   │   ├── evaluation/
+│   │   ├── asr_lab/
+│   │   ├── auth/
+│   │   ├── conversations/
+│   │   ├── generation/
+│   │   └── trainers/
+│   │       └── qwen-asr-lora/
+│   │           ├── pyproject.toml
+│   │           ├── requirements.lock   # 在目标训练环境验证后生成
+│   │           ├── .python-version
+│   │           ├── qwen_asr_lora.py
+│   │           ├── trainer.py
+│   │           ├── inference.py
+│   │           ├── contracts.py
+│   │           ├── data.py
+│   │           └── tests/
 │   │
-│   ├── evaluation-api/
-│   │   └── src/
-│   │
-│   ├── training-api/
-│   │   └── src/
-│   │
-│   ├── production-worker/
-│   │   └── src/
-│   │
-│   ├── asr-compute-worker/
-│   │   └── src/
-│   │
-│   └── shared-api/
-│       └── src/
+│   └── l3_app/
+│       ├── production-api/
+│       │   ├── main.py
+│       │   └── app_factory.py
+│       ├── evaluation-api/
+│       │   └── main.py
+│       ├── training-api/
+│       │   └── main.py
+│       └── shared-api/
+│           ├── router.py
+│           ├── dependencies.py
+│           └── routes/
 │
 ├── migrations/
 │   ├── application.sql
@@ -349,7 +346,7 @@ L2 是可复用的核心业务能力层，不包含 HTTP route 或进程启动�
 
 `asr-lab` 是轻量编排包，不直接安装 Transformers、Torch、PEFT。
 
-## 6. L3-App
+## 6. packages/l3_app
 
 ### 6.1 production-api
 
@@ -402,14 +399,13 @@ L2 是可复用的核心业务能力层，不包含 HTTP route 或进程启动�
 ```
 
 训练 API 不在 HTTP 请求中加载模型或执行训练，只写入任务并返回 `run_id`。
+其 lifespan 在后台线程中持有统一的 `AsrLabWorker`，串行消费评测和训练任务。
 
-### 6.4 production-worker
+### 6.4 内嵌 Worker
 
-负责执行生产录音处理 pipeline。它可以安装生产 Qwen ASR 推理环境，但不安装 HF LoRA trainer。
+`production-api` 的 lifespan 直接启动录音处理 PipelineCoordinator。
 
-### 6.5 asr-compute-worker
-
-负责：
+`training-api` 的 lifespan 直接启动 `AsrLabWorker`，负责：
 
 - 轮询 evaluation run 和 training run；
 - 单 GPU 资源仲裁；
@@ -417,7 +413,7 @@ L2 是可复用的核心业务能力层，不包含 HTTP route 或进程启动�
 - 创建 trainer/inference 子进程；
 - 采集 stdout、stderr、退出码和结果 manifest；
 - 更新任务状态；
-- 处理取消和异常恢复。
+- 处理取消、进程关闭、任务回队和异常恢复。
 
 第一阶段调度优先级：
 
@@ -437,7 +433,7 @@ Frontend
 
 production-api
   → recording / audio-processing / rag
-  → production-worker
+  → lifespan: PipelineCoordinator
 
 evaluation-api
   → dataset-registry / model-registry / evaluation
@@ -446,8 +442,7 @@ evaluation-api
 training-api
   → dataset-registry / model-registry / asr-lab
   → training_runs
-
-asr-compute-worker
+  → lifespan: AsrLabWorker
   ├── evaluation run → inference subprocess
   └── training run   → Qwen HF trainer subprocess
 ```
@@ -459,21 +454,17 @@ asr-compute-worker
 ### 8.1 目录
 
 ```text
-backend/L2-Core/trainers/qwen-asr-lora/
+backend/packages/l2_core/trainers/qwen-asr-lora/
 ├── pyproject.toml
 ├── requirements.lock
 ├── .python-version
 ├── .venv/
-├── src/
-│   └── airecord_qwen_asr_trainer/
-│       ├── __init__.py
-│       ├── __main__.py
-│       ├── contracts.py
-│       ├── trainer.py
-│       ├── model_loader.py
-│       ├── data_collator.py
-│       ├── lora.py
-│       └── result_writer.py
+├── qwen_asr_lora.py
+├── contracts.py
+├── trainer.py
+├── inference.py
+├── data.py
+├── typing_utils.py
 └── tests/
 ```
 
@@ -503,7 +494,7 @@ dependencies = [
 ]
 
 [project.scripts]
-qwen-asr-lora-train = "airecord_qwen_asr_trainer.__main__:main"
+qwen-asr-lora = "qwen_asr_lora:main"
 
 [project.optional-dependencies]
 dev = [
@@ -513,7 +504,14 @@ dev = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/airecord_qwen_asr_trainer"]
+only-include = [
+  "qwen_asr_lora.py",
+  "contracts.py",
+  "trainer.py",
+  "inference.py",
+  "data.py",
+  "typing_utils.py",
+]
 ```
 
 实际版本需要在目标 CUDA、PyTorch 和操作系统环境中验证后写入 `requirements.lock`，不能只依赖无上限的浮动版本。锁定文件与目标运行平台相关；如果 macOS 开发环境和 Linux CUDA 训练环境的依赖不同，应分别维护对应的受控依赖文件。
@@ -564,8 +562,8 @@ Manifest 示例：
 启动方式：
 
 ```bash
-backend/L2-Core/trainers/qwen-asr-lora/.venv/bin/python \
-  -m airecord_qwen_asr_trainer \
+backend/packages/l2_core/trainers/qwen-asr-lora/.venv/bin/python \
+  -m qwen_asr_lora train \
   --manifest /absolute/path/training-manifest.json
 ```
 
@@ -574,13 +572,13 @@ backend/L2-Core/trainers/qwen-asr-lora/.venv/bin/python \
 仓库安装脚本使用 Python 标准库 `venv` 和项目现有的 `pip`，为 trainer 创建独立环境：
 
 ```bash
-python3.12 -m venv backend/L2-Core/trainers/qwen-asr-lora/.venv
+python3.12 -m venv backend/packages/l2_core/trainers/qwen-asr-lora/.venv
 
-backend/L2-Core/trainers/qwen-asr-lora/.venv/bin/python \
+backend/packages/l2_core/trainers/qwen-asr-lora/.venv/bin/python \
   -m pip install --upgrade pip
 
-backend/L2-Core/trainers/qwen-asr-lora/.venv/bin/python \
-  -e backend/L2-Core/trainers/qwen-asr-lora
+backend/packages/l2_core/trainers/qwen-asr-lora/.venv/bin/python \
+  -e backend/packages/l2_core/trainers/qwen-asr-lora
 ```
 
 首次安装从 `pyproject.toml` 解析依赖。目标训练环境通过 smoke test 后生成
@@ -590,8 +588,8 @@ Trainer 本身。
 运行时配置：
 
 ```env
-QWEN_ASR_TRAINER_PYTHON=backend/L2-Core/trainers/qwen-asr-lora/.venv/bin/python
-QWEN_ASR_TRAINER_MODULE=airecord_qwen_asr_trainer
+QWEN_ASR_TRAINER_PYTHON=backend/packages/l2_core/trainers/qwen-asr-lora/.venv/bin/python
+QWEN_ASR_TRAINER_MODULE=qwen_asr_lora
 QWEN_ASR_TRAINING_MODEL=Qwen/Qwen3-ASR-1.7B-hf
 ```
 
@@ -612,17 +610,19 @@ QWEN_ASR_TRAINING_MODEL=Qwen/Qwen3-ASR-1.7B-hf
 backend/.venv/bin/python -m pip install -e 'backend[dev]'
 ```
 
-L3 应用使用各自的 `src/main.py` 作为文件入口，共享同一个 backend 环境。
+L3 应用使用各自根目录下的 `main.py` 作为文件入口，共享同一个 backend 环境。
 
-Trainer 不安装到 `backend/.venv`，也不被 production、evaluation 或 training API 直接 import。它始终使用自己的 `.venv`，由 `asr-compute-worker` 通过 subprocess 调用。
+Trainer 不安装到 `backend/.venv`，也不被 production、evaluation 或 training API
+直接 import。它始终使用自己的 `.venv`，由 training-api lifespan 中的
+`AsrLabWorker` 通过 subprocess 调用。
 
 `requirements.lock` 在已验证的目标环境中更新。第一阶段可以使用现有 `pip` 生成环境快照，不额外引入锁定工具：
 
 ```bash
-backend/L2-Core/trainers/qwen-asr-lora/.venv/bin/python \
+backend/packages/l2_core/trainers/qwen-asr-lora/.venv/bin/python \
   -m pip freeze \
   --exclude-editable \
-  > backend/L2-Core/trainers/qwen-asr-lora/requirements.lock
+  > backend/packages/l2_core/trainers/qwen-asr-lora/requirements.lock
 ```
 
 依赖升级必须显式执行并经过训练 smoke test，不在普通安装过程中自动刷新锁定文件。
@@ -640,7 +640,7 @@ backend/scripts/train_qwen_asr_lora.py
 迁移后：
 
 ```text
-backend/L2-Core/trainers/qwen-asr-lora/src/airecord_qwen_asr_trainer/
+backend/packages/l2_core/trainers/qwen-asr-lora/
 ```
 
 承接：
@@ -655,11 +655,7 @@ backend/L2-Core/trainers/qwen-asr-lora/src/airecord_qwen_asr_trainer/
 - adapter 保存；
 - result manifest。
 
-L3 只保留极薄的进程入口和调度：
-
-```text
-backend/L3-App/asr-compute-worker/
-```
+L3 只保留 API 进程入口；worker 生命周期由对应 API 持有。
 
 `backend/scripts` 后续只保留：
 
@@ -739,12 +735,12 @@ asr-lab：
 | `backend/src/rag` | `backend/packages/l2_core/rag` |
 | `backend/src/evaluation` | `backend/packages/l2_core/evaluation` |
 | `backend/src/asr_lab` | `backend/packages/l2_core/asr_lab` |
-| `backend/scripts/train_qwen_asr_lora.py` | `backend/L2-Core/trainers/qwen-asr-lora` |
-| `backend/src/api` 生产路由 | `backend/L3-App/production-api` |
-| `backend/src/api/routes/asr_lab.py` 评测路由 | `backend/L3-App/evaluation-api` |
-| `backend/src/api/routes/asr_lab.py` 训练路由 | `backend/L3-App/training-api` |
-| 当前生产 pipeline worker | `backend/L3-App/production-worker` |
-| `backend/src/asr_lab/worker.py` | `backend/L3-App/asr-compute-worker` |
+| `backend/scripts/train_qwen_asr_lora.py` | `backend/packages/l2_core/trainers/qwen-asr-lora` |
+| `backend/src/api` 生产路由 | `backend/packages/l3_app/production-api` |
+| `backend/src/api/routes/asr_lab.py` 评测路由 | `backend/packages/l3_app/evaluation-api` |
+| `backend/src/api/routes/asr_lab.py` 训练路由 | `backend/packages/l3_app/training-api` |
+| 当前生产 pipeline worker | `backend/packages/l3_app/production-api` lifespan |
+| `backend/src/asr_lab/worker.py` | `backend/packages/l3_app/training-api` lifespan |
 
 ## 14. 分阶段迁移
 
@@ -758,7 +754,7 @@ asr-lab：
 
 ### Phase 1：独立 HF Trainer（代码迁移已完成）
 
-- 已创建 `L2-Core/trainers/qwen-asr-lora`；
+- 已创建 `packages/l2_core/trainers/qwen-asr-lora`；
 - 已创建独立 `pyproject.toml`；`.venv` 和 `requirements.lock` 在首次安装、验证目标训练环境后生成；
 - 使用 `Qwen/Qwen3-ASR-1.7B-hf`；
 - 将现有训练脚本逻辑迁入 trainer；
@@ -797,8 +793,8 @@ import boundary test。
 
 ### Phase 5：Worker 与部署收口（入口已完成，生产部署验证待完成）
 
-- production-worker 独立启动；
-- asr-compute-worker 统一调度；
+- production-api lifespan 内嵌 PipelineCoordinator；
+- training-api lifespan 内嵌统一 ASR Lab worker；
 - 训练和评测任务增加资源锁；
 - 完善结构化日志、取消、恢复和超时；
 - 生成开发与生产部署命令。
@@ -806,7 +802,7 @@ import boundary test。
 ## 15. 最终决策摘要
 
 1. 使用单仓库、多 Python project 的分层 Monorepo；
-2. `packages/l1_foundation`、`packages/l2_core` 是显式 Python namespace，`L3-App` 是应用入口目录；
+2. `packages/l1_foundation`、`packages/l2_core` 是显式 Python namespace，`packages/l3_app` 是应用入口目录；
 3. L3 API 拆为 production、evaluation、training 三个独立入口；
 4. 生产 Worker 与 ASR 计算 Worker 分开；
 5. ASR 评测和训练可由一个计算 Worker 串行调度，同一时间只占用一个 GPU；

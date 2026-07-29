@@ -58,6 +58,23 @@ def test_evaluation_only_group_never_enters_train() -> None:
     assert preview.test.case_count == 1
 
 
+def test_all_train_strategy_puts_every_training_annotation_in_train() -> None:
+    preview = build_dataset_preview(
+        [
+            _annotation(1, group="recording-a"),
+            _annotation(2, group="recording-b"),
+            _annotation(3, group="recording-c"),
+        ],
+        normalization_name="zh_asr",
+        normalization_version="v1",
+        split_strategy_name="all_train_v1",
+    )
+
+    assert preview.train.case_count == 3
+    assert preview.validation.case_count == 0
+    assert preview.test.case_count == 0
+
+
 def test_normalized_empty_reference_is_rejected_before_freeze() -> None:
     with pytest.raises(ValueError, match="empty after"):
         build_dataset_preview(

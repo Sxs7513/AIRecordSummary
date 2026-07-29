@@ -1,11 +1,19 @@
 {
   "python.defaultInterpreterPath": "${workspaceFolder}/backend/.venv/bin/python",
   "python.analysis.extraPaths": [
-    "${workspaceFolder}/backend/src"
+    "${workspaceFolder}/backend/packages",
+    "${workspaceFolder}/backend/packages/l2_core/trainers/qwen-asr-lora",
+    "${workspaceFolder}/backend/packages/l3_app/shared-api",
+    "${workspaceFolder}/backend/packages/l3_app/production-api",
+    "${workspaceFolder}/backend/packages/l3_app/evaluation-api",
+    "${workspaceFolder}/backend/packages/l3_app/training-api",
+    "${workspaceFolder}/backend/packages/l3_app/production-worker",
+    "${workspaceFolder}/backend/packages/l3_app/asr-compute-worker",
   ],
   "python.analysis.typeCheckingMode": "strict",
   "python.testing.pytestEnabled": true,
   "python.testing.pytestArgs": [
     "backend/tests"
-  ]
+  ],
+  "workbench.editor.enablePreview": false
 }

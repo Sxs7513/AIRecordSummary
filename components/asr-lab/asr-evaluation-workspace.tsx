@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState, type FormEvent } from "react";
-import { BarChart3, Play } from "lucide-react";
+import { BarChart3, Play, Trash2 } from "lucide-react";
 
 import { asrLabRequest, assetAudioUrl } from "@/app/sdk/asr-lab/client";
 import type {
@@ -90,6 +90,39 @@ export function AsrEvaluationWorkspace() {
     }
   }
 
+  async function cancelRun(run: EvaluationRun) {
+    setBusy(true);
+    setError(null);
+    try {
+      await asrLabRequest(`/api/evaluation/runs/${run.id}:cancel`, { method: "POST" });
+      await load();
+    } catch (caught) {
+      setError(message(caught));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function deleteRun(run: EvaluationRun) {
+    const confirmed = window.confirm(
+      `确定删除“${run.dataset_name} v${run.dataset_version_number} · ${run.split}”评测任务吗？`
+      + "逐切片识别结果和评测指标会一并删除；冻结数据版本和模型不会被删除。"
+    );
+    if (!confirmed) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await asrLabRequest(`/api/evaluation/runs/${run.id}`, { method: "DELETE" });
+      setDetail(null);
+      setSelectedRun("");
+      await load();
+    } catch (caught) {
+      setError(message(caught));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   const modelMetrics = useMemo(() => metricMap(detail?.metrics ?? []), [detail]);
   const groupedCases = useMemo(() => groupCaseResults(detail?.case_results ?? []), [detail]);
   const filteredCases = groupedCases.filter((group) => {
@@ -121,12 +154,21 @@ export function AsrEvaluationWorkspace() {
       </form>
 
       <section className="panel" style={{ marginTop: 16 }}>
-        <label>历史评测
-          <select value={selectedRun} onChange={(event) => setSelectedRun(event.target.value)}>
-            <option value="">选择评测任务</option>
-            {runs.map((item) => <option key={item.id} value={item.id}>{item.dataset_name} v{item.dataset_version_number} · {item.status} · {new Date(item.created_at).toLocaleString()}</option>)}
-          </select>
-        </label>
+        <div className="toolbar" style={{ alignItems: "end" }}>
+          <label style={{ flex: 1 }}>历史评测
+            <select value={selectedRun} onChange={(event) => setSelectedRun(event.target.value)}>
+              <option value="">选择评测任务</option>
+              {runs.map((item) => <option key={item.id} value={item.id}>{item.dataset_name} v{item.dataset_version_number} · {item.status} · {new Date(item.created_at).toLocaleString()}</option>)}
+            </select>
+          </label>
+          {detail?.run.status === "running" ? (
+            <button className="secondary" disabled={busy} onClick={() => void cancelRun(detail.run)}>取消评测</button>
+          ) : detail ? (
+            <button className="secondary" disabled={busy} onClick={() => void deleteRun(detail.run)}>
+              <Trash2 size={15} />删除评测任务
+            </button>
+          ) : null}
+        </div>
         {detail ? <RunProgress run={detail.run} /> : null}
       </section>
 
@@ -272,4 +314,3 @@ function formatTimestamp(ms: number) {
 function message(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
-

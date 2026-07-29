@@ -61,6 +61,13 @@ export type DatasetDetail = {
   versions: DatasetVersion[];
 };
 
+export type EncryptedProjectDataset = {
+  id: string;
+  file_name: string;
+  file_size_bytes: number;
+  updated_at: number;
+};
+
 export type SplitSummary = {
   group_count: number;
   case_count: number;
@@ -73,7 +80,22 @@ export type DatasetPreview = {
   test: SplitSummary;
   excluded_count: number;
   checksum: string;
-  cases: unknown[];
+  cases: DatasetPreviewCase[];
+};
+
+export type DatasetPreviewCase = {
+  annotation: {
+    id: string;
+    source_asset_id: string;
+    start_ms: number;
+    end_ms: number;
+    reference_text: string;
+    language: string | null;
+    train_allowed: boolean;
+    evaluation_allowed: boolean;
+  };
+  split: "train" | "validation" | "test";
+  normalized_reference_text: string;
 };
 
 export type ModelVersion = {
@@ -156,4 +178,3 @@ export type EvaluationRunDetail = {
   metrics: MetricValue[];
   case_results: CaseResult[];
 };
-

@@ -40,7 +40,7 @@ create unique index if not exists evaluation_datasets_workspace_active_name_uidx
 
 -- Exactly one source is present:
 -- - recording_id imports an existing production recording;
--- - artifact_uri points to an ASR Lab-owned upload.
+-- - artifact_uri points to a persisted ASR sample slice (or a legacy ASR Lab upload).
 create table if not exists evaluation_source_assets (
     id uuid primary key default gen_random_uuid(),
     workspace_id uuid not null references workspaces(id) on delete restrict,
@@ -65,7 +65,7 @@ create table if not exists evaluation_source_assets (
 );
 
 comment on table evaluation_source_assets is
-    'ASR Lab 的完整源音频。可导入已有录音，也可引用独立上传且不随 production pipeline 级联删除的文件。';
+    'ASR Lab 持久化音频资产。新标注保存独立 FLAC 切片；历史数据可能仍引用完整录音。';
 comment on column evaluation_source_assets.recording_id is
     '导入已有录音时使用；与 artifact_uri 必须且只能存在一个。';
 comment on column evaluation_source_assets.artifact_uri is

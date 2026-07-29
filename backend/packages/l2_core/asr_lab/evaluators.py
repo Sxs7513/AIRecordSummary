@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import subprocess
 import tempfile
@@ -9,6 +10,7 @@ from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import asdict
 from pathlib import Path
+from threading import Event
 from typing import Any, cast
 from uuid import UUID
 
@@ -17,6 +19,8 @@ from sqlalchemy import Connection, Engine, text
 from l2_core.asr_lab.model_runtime import build_asr_runtime
 from l2_core.asr_lab.normalization import normalize_text
 from l2_core.evaluation.metrics import character_error_rate, word_error_rate
+
+logger = logging.getLogger("evaluation")
 
 
 class AsrEvaluationWorker:
@@ -29,21 +33,27 @@ class AsrEvaluationWorker:
         model_cache_root: Path,
         *,
         hf_runtime_python: Path | None = None,
-        hf_runtime_module: str = "airecord_qwen_asr_trainer",
+        hf_runtime_module: str = "qwen_asr_lora",
+        context: str = "",
     ) -> None:
         self._engine = engine
         self._storage_root = storage_root.resolve()
         self._model_cache_root = model_cache_root.resolve()
-        self._hf_runtime_python = hf_runtime_python.resolve() if hf_runtime_python is not None else None
+        self._hf_runtime_python = hf_runtime_python.absolute() if hf_runtime_python is not None else None
         self._hf_runtime_module = hf_runtime_module
+        self._context = context
 
-    def run_once(self) -> bool:
+    def run_once(self, stop_event: Event | None = None) -> bool:
+        if stop_event is not None and stop_event.is_set():
+            return False
         run_id = self._claim()
         if run_id is None:
             return False
+        logger.info("ASR 评测：领取任务 run_id=%s", run_id)
         try:
-            self._execute(run_id)
+            self._execute(run_id, stop_event)
         except Exception as error:
+            logger.exception("ASR 评测：任务失败 run_id=%s error=%s", run_id, error)
             with self._engine.begin() as connection:
                 connection.execute(
                     text(
@@ -82,7 +92,10 @@ class AsrEvaluationWorker:
             ).scalar_one_or_none()
         return None if value is None else UUID(str(value))
 
-    def _execute(self, run_id: UUID) -> None:
+    def _execute(self, run_id: UUID, stop_event: Event | None) -> None:
+        if stop_event is not None and stop_event.is_set():
+            self._requeue(run_id)
+            return
         with self._engine.connect() as connection:
             run = dict(connection.execute(text("select * from evaluation_runs where id = :run_id"), {"run_id": run_id}).mappings().one())
             models = [
@@ -119,40 +132,99 @@ class AsrEvaluationWorker:
                     {"version_id": run["dataset_version_id"], "split": run["split"]},
                 ).mappings()
             ]
+        logger.info(
+            "ASR 评测：任务数据加载完成 run_id=%s dataset_version_id=%s split=%s models=%d cases=%d total_model_cases=%d",
+            run_id,
+            run["dataset_version_id"],
+            run["split"],
+            len(models),
+            len(cases),
+            len(models) * len(cases),
+        )
         config = cast(dict[str, Any], run["config_snapshot"])
         normalization_name = str(config.get("normalization_name", "zh_asr"))
         normalization_version = str(config.get("normalization_version", "v1"))
+        context_snapshot = config.get("asr_context")
+        context = context_snapshot if isinstance(context_snapshot, str) else self._context
+        logger.info(
+            "ASR 评测：加载统一热词上下文 run_id=%s context_chars=%d source=%s",
+            run_id,
+            len(context),
+            "run_snapshot" if isinstance(context_snapshot, str) else "current_config",
+        )
 
-        for model in models:
+        for model_index, model in enumerate(models, start=1):
             if self._cancel_requested(run_id):
                 self._finish_cancelled(run_id)
                 return
+            if stop_event is not None and stop_event.is_set():
+                self._requeue(run_id)
+                return
+            model_id = UUID(str(model["id"]))
+            logger.info(
+                "ASR 评测：开始模型 run_id=%s model_index=%d/%d model_id=%s model_name=%s model_version=%s base_model=%s adapter_uri=%s",
+                run_id,
+                model_index,
+                len(models),
+                model_id,
+                model.get("name"),
+                model.get("version"),
+                model.get("base_model_name"),
+                model.get("adapter_uri") or "none",
+            )
+            runtime_started = time.perf_counter()
             runtime = build_asr_runtime(
                 model,
                 storage_root=self._storage_root,
                 model_cache_root=self._model_cache_root,
                 hf_runtime_python=self._hf_runtime_python,
                 hf_runtime_module=self._hf_runtime_module,
+                context=context,
+            )
+            logger.info(
+                "ASR 评测：模型运行时就绪 run_id=%s model_id=%s load_duration_ms=%d",
+                run_id,
+                model_id,
+                round((time.perf_counter() - runtime_started) * 1000),
             )
             try:
-                for case in cases:
-                    if self._result_exists(run_id, UUID(str(model["id"])), UUID(str(case["id"]))):
+                for case_index, case in enumerate(cases, start=1):
+                    case_id = UUID(str(case["id"]))
+                    if self._result_exists(run_id, model_id, case_id):
+                        logger.info(
+                            "ASR 评测：跳过已有结果 run_id=%s model_id=%s case_id=%s progress=%d/%d",
+                            run_id,
+                            model_id,
+                            case_id,
+                            case_index,
+                            len(cases),
+                        )
                         continue
                     if self._cancel_requested(run_id):
                         self._finish_cancelled(run_id)
                         return
+                    if stop_event is not None and stop_event.is_set():
+                        self._requeue(run_id)
+                        return
                     self._evaluate_case(
                         run_id,
-                        model_id=UUID(str(model["id"])),
+                        model_id=model_id,
                         case=case,
                         runtime=runtime,
                         normalization_name=normalization_name,
                         normalization_version=normalization_version,
+                        case_index=case_index,
+                        case_count=len(cases),
                     )
             finally:
                 runtime.close()
-            self._aggregate_model(run_id, UUID(str(model["id"])))
+                logger.info("ASR 评测：模型运行时已释放 run_id=%s model_id=%s", run_id, model_id)
+            self._aggregate_model(run_id, model_id)
+            logger.info("ASR 评测：模型评测完成 run_id=%s model_id=%s", run_id, model_id)
 
+        if stop_event is not None and stop_event.is_set():
+            self._requeue(run_id)
+            return
         with self._engine.begin() as connection:
             connection.execute(
                 text(
@@ -184,6 +256,7 @@ class AsrEvaluationWorker:
                     ),
                     {"run_id": run_id},
                 )
+        logger.info("ASR 评测：任务完成 run_id=%s models=%d cases=%d", run_id, len(models), len(cases))
 
     def _evaluate_case(
         self,
@@ -194,9 +267,20 @@ class AsrEvaluationWorker:
         runtime: Any,
         normalization_name: str,
         normalization_version: str,
+        case_index: int,
+        case_count: int,
     ) -> None:
         case_id = UUID(str(case["id"]))
         source_path = self._source_path(case)
+        logger.info(
+            "ASR 评测：开始切片 run_id=%s model_id=%s case_id=%s progress=%d/%d source=%s",
+            run_id,
+            model_id,
+            case_id,
+            case_index,
+            case_count,
+            source_path.name,
+        )
         started = time.perf_counter()
         try:
             with self.cropped_audio(source_path, cast(int, case["start_ms"]), cast(int, case["end_ms"])) as sample_path:
@@ -239,7 +323,29 @@ class AsrEvaluationWorker:
                 self._insert_case_metric(connection, run_id, model_id, case_id, "cer", cer.value, cer.reference_units, details["cer"])
                 self._insert_case_metric(connection, run_id, model_id, case_id, "wer", wer.value, wer.reference_units, details["wer"])
                 self._increment_progress(connection, run_id, failed=False)
+            logger.info(
+                "ASR 评测：切片完成 run_id=%s model_id=%s case_id=%s progress=%d/%d duration_ms=%d cer=%.6f wer=%.6f reference_chars=%d hypothesis_chars=%d",
+                run_id,
+                model_id,
+                case_id,
+                case_index,
+                case_count,
+                duration_ms,
+                cer.value,
+                wer.value,
+                len(reference_normalized),
+                len(hypothesis_normalized),
+            )
         except Exception as error:
+            logger.exception(
+                "ASR 评测：切片失败 run_id=%s model_id=%s case_id=%s progress=%d/%d error=%s",
+                run_id,
+                model_id,
+                case_id,
+                case_index,
+                case_count,
+                error,
+            )
             with self._engine.begin() as connection:
                 connection.execute(
                     text(
@@ -307,6 +413,7 @@ class AsrEvaluationWorker:
                 {"run_id": run_id, "model_id": model_id},
             ).mappings().all()
             if not rows:
+                logger.warning("ASR 评测：模型没有成功结果，跳过聚合 run_id=%s model_id=%s", run_id, model_id)
                 return
             durations = sorted(cast(int, row["inference_duration_ms"]) for row in rows if row["inference_duration_ms"] is not None)
             for metric_name in ("cer", "wer"):
@@ -321,6 +428,7 @@ class AsrEvaluationWorker:
                 p95 = durations[min(len(durations) - 1, max(0, math.ceil(len(durations) * 0.95) - 1))]
                 self._upsert_model_metric(connection, run_id, model_id, "average_inference_duration_ms", average, len(durations))
                 self._upsert_model_metric(connection, run_id, model_id, "p95_inference_duration_ms", p95, len(durations))
+        logger.info("ASR 评测：模型指标聚合完成 run_id=%s model_id=%s succeeded_cases=%d", run_id, model_id, len(rows))
 
     @staticmethod
     def _upsert_model_metric(connection: Connection, run_id: UUID, model_id: UUID, name: str, value: float, count: int) -> None:
@@ -378,9 +486,25 @@ class AsrEvaluationWorker:
             return bool(connection.execute(text("select cancel_requested from evaluation_runs where id = :run_id"), {"run_id": run_id}).scalar_one())
 
     def _finish_cancelled(self, run_id: UUID) -> None:
+        logger.info("ASR 评测：任务已取消 run_id=%s", run_id)
         with self._engine.begin() as connection:
             connection.execute(
                 text("update evaluation_runs set status = 'cancelled', finished_at = now(), updated_at = now() where id = :run_id"),
+                {"run_id": run_id},
+            )
+
+    def _requeue(self, run_id: UUID) -> None:
+        logger.info("ASR 评测：停止信号触发，任务重新排队 run_id=%s", run_id)
+        with self._engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    update evaluation_runs
+                    set status = 'queued', finished_at = null,
+                        error_message = null, updated_at = now()
+                    where id = :run_id
+                    """
+                ),
                 {"run_id": run_id},
             )
 

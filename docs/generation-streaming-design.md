@@ -53,7 +53,7 @@ backend/packages/l2_core/generation/
 ├── service.py    # 调用方唯一入口：创建、查询、取消与 emitter 构造
 └── __init__.py
 
-backend/L3-App/shared-api/src/routes/generations.py  # GET run、HTTP SSE 续传和取消接口
+backend/packages/l3_app/shared-api/routes/generations.py  # GET run、HTTP SSE 续传和取消接口
 ```
 
 `audio_processing/stages/generate_summary.py` 只作为 `recording_summary` 的适配器：创建关联 run、向 `StreamEmitter` 报告阶段和最终文本；它不直接处理 SSE、数据库 sequence 或前端连接。未来的 `rag_answer` 执行器也只需要调用同一 `GenerationService`。

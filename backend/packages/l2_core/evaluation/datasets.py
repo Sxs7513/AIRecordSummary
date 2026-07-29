@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections import defaultdict
+from typing import Literal
 
 from l2_core.asr_lab.normalization import normalize_text
 from l2_core.evaluation.contracts import (
@@ -20,6 +21,7 @@ def build_dataset_preview(
     normalization_name: str,
     normalization_version: str,
     seed: str = "asr-lab-v1",
+    split_strategy_name: Literal["deterministic_group_hash_v1", "all_train_v1"] = "deterministic_group_hash_v1",
     excluded_count: int = 0,
 ) -> DatasetVersionPreview:
     if not annotations:
@@ -32,7 +34,7 @@ def build_dataset_preview(
     split_cases: list[FrozenCase] = []
     for group_key in sorted(grouped):
         group = sorted(grouped[group_key], key=lambda item: (str(item.source_asset_id), item.start_ms, str(item.id)))
-        preferred = _preferred_split(group_key, seed)
+        preferred = DatasetSplit.TRAIN if split_strategy_name == "all_train_v1" else _preferred_split(group_key, seed)
         split = _allowed_split(group, preferred)
         for annotation in group:
             normalized = normalize_text(annotation.reference_text, normalization_name, normalization_version)
@@ -56,13 +58,16 @@ def build_dataset_preview(
         }
         for item in split_cases
     ]
+    checksum_input: dict[str, object] = {
+        "normalization": [normalization_name, normalization_version],
+        "seed": seed,
+        "cases": checksum_payload,
+    }
+    if split_strategy_name != "deterministic_group_hash_v1":
+        checksum_input["split_strategy"] = split_strategy_name
     checksum = hashlib.sha256(
         json.dumps(
-            {
-                "normalization": [normalization_name, normalization_version],
-                "seed": seed,
-                "cases": checksum_payload,
-            },
+            checksum_input,
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),

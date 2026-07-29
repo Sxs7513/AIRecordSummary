@@ -3,8 +3,11 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
+from contextlib import suppress
 from pathlib import Path
-from typing import Any, cast
+from tempfile import TemporaryDirectory
+from typing import Any, Literal, cast
 from uuid import UUID, uuid4
 
 from fastapi import UploadFile
@@ -13,11 +16,14 @@ from sqlalchemy.exc import IntegrityError
 
 from l1_foundation.infrastructure.storage.local import LocalStorage
 from l2_core.access.recordings import RecordingAccessService
+from l2_core.asr_lab.encrypted_datasets import EncryptedDatasetStore, crop_audio_to_flac
 from l2_core.auth.contracts import CurrentUser
 from l2_core.evaluation.contracts import ApprovedAnnotation, DatasetVersionPreview
 from l2_core.evaluation.datasets import build_dataset_preview
 
 type DatabaseRow = dict[str, Any]
+train_logger = logging.getLogger("train")
+evaluation_logger = logging.getLogger("evaluation")
 
 
 class AsrLabNotFoundError(LookupError):
@@ -35,10 +41,19 @@ class AsrLabPermissionError(PermissionError):
 class AsrLabService:
     """Workspace-scoped use cases for annotation, datasets, runs, and models."""
 
-    def __init__(self, engine: Engine, storage: LocalStorage) -> None:
+    def __init__(
+        self,
+        engine: Engine,
+        storage: LocalStorage,
+        project_dataset_root: Path,
+        *,
+        evaluation_context: str = "",
+    ) -> None:
         self._engine = engine
         self._storage = storage
         self._recording_access = RecordingAccessService(engine)
+        self._encrypted_datasets = EncryptedDatasetStore(project_dataset_root)
+        self._evaluation_context = evaluation_context
 
     def list_datasets(self, user: CurrentUser) -> list[DatabaseRow]:
         with self._engine.connect() as connection:
@@ -52,8 +67,12 @@ class AsrLabService:
                            count(distinct assets.id) as asset_count,
                            max(versions.version_number) filter (where versions.status = 'frozen') as latest_version_number
                     from evaluation_datasets datasets
-                    left join evaluation_annotations annotations on annotations.dataset_id = datasets.id
-                    left join evaluation_source_assets assets on assets.id = annotations.source_asset_id
+                    left join evaluation_source_assets assets
+                      on assets.dataset_id = datasets.id
+                     and assets.archived_at is null
+                    left join evaluation_annotations annotations
+                      on annotations.dataset_id = datasets.id
+                     and annotations.source_asset_id = assets.id
                     left join evaluation_dataset_versions versions on versions.dataset_id = datasets.id
                     where datasets.workspace_id = :workspace_id
                       and datasets.status = 'active'
@@ -89,6 +108,73 @@ class AsrLabService:
             ).mappings().one()
         return dict(row)
 
+    def delete_dataset(self, user: CurrentUser, dataset_id: UUID) -> DatabaseRow:
+        self._require_manager(user)
+        artifact_uris: list[str] = []
+        with self._engine.begin() as connection:
+            self._dataset_row(connection, user, dataset_id)
+            connection.execute(
+                text("select id from evaluation_datasets where id = :dataset_id for update"),
+                {"dataset_id": dataset_id},
+            )
+            version_count = cast(
+                int,
+                connection.execute(
+                    text("select count(*) from evaluation_dataset_versions where dataset_id = :dataset_id"),
+                    {"dataset_id": dataset_id},
+                ).scalar_one(),
+            )
+            if version_count > 0:
+                connection.execute(
+                    text(
+                        """
+                        update evaluation_datasets
+                        set status = 'archived', archived_at = now(), updated_at = now()
+                        where id = :dataset_id
+                        """
+                    ),
+                    {"dataset_id": dataset_id},
+                )
+                return {
+                    "id": dataset_id,
+                    "mode": "archived",
+                    "retained_version_count": version_count,
+                }
+
+            artifact_uris = [
+                cast(str, value)
+                for value in connection.execute(
+                    text(
+                        """
+                        select artifact_uri
+                        from evaluation_source_assets
+                        where dataset_id = :dataset_id and artifact_uri is not null
+                        """
+                    ),
+                    {"dataset_id": dataset_id},
+                ).scalars()
+            ]
+            connection.execute(
+                text("delete from evaluation_annotations where dataset_id = :dataset_id"),
+                {"dataset_id": dataset_id},
+            )
+            connection.execute(
+                text("delete from evaluation_source_assets where dataset_id = :dataset_id"),
+                {"dataset_id": dataset_id},
+            )
+            connection.execute(
+                text("delete from evaluation_datasets where id = :dataset_id"),
+                {"dataset_id": dataset_id},
+            )
+
+        for artifact_uri in artifact_uris:
+            self._storage.remove_tree(str(Path(artifact_uri).parent))
+        return {
+            "id": dataset_id,
+            "mode": "deleted",
+            "retained_version_count": 0,
+        }
+
     def get_dataset(self, user: CurrentUser, dataset_id: UUID) -> DatabaseRow:
         with self._engine.connect() as connection:
             dataset = self._dataset_row(connection, user, dataset_id)
@@ -121,7 +207,9 @@ class AsrLabService:
                         """
                         select annotations.*
                         from evaluation_annotations annotations
+                        join evaluation_source_assets assets on assets.id = annotations.source_asset_id
                         where annotations.dataset_id = :dataset_id
+                          and assets.archived_at is null
                         order by annotations.source_asset_id, annotations.start_ms, annotations.created_at
                         """
                     ),
@@ -142,20 +230,59 @@ class AsrLabService:
                     {"dataset_id": dataset_id},
                 ).mappings()
             ]
-        return {"dataset": dataset, "assets": assets, "annotations": annotations, "versions": versions}
+        return {
+            "dataset": dataset,
+            "assets": assets,
+            "annotations": annotations,
+            "versions": versions,
+        }
 
-    async def upload_asset(self, user: CurrentUser, dataset_id: UUID, upload: UploadFile) -> DatabaseRow:
+    async def create_sample(
+        self,
+        user: CurrentUser,
+        dataset_id: UUID,
+        *,
+        audio_upload: UploadFile,
+        start_ms: int,
+        end_ms: int,
+        reference_text: str,
+        language: str | None,
+        train_allowed: bool,
+        evaluation_allowed: bool,
+        contains_sensitive_data: bool,
+        project_persistence_password: str | None = None,
+    ) -> DatabaseRow:
+        cleaned_text = reference_text.strip()
+        if not cleaned_text:
+            raise ValueError("Reference text is required")
         self._require_dataset(user, dataset_id)
-        file_name = self._safe_file_name(upload.filename)
+        if project_persistence_password is not None:
+            self._encrypted_datasets.verify_password(str(dataset_id), project_persistence_password)
+
+        source_file_name = self._safe_file_name(audio_upload.filename)
+        try:
+            with TemporaryDirectory(prefix="asr-lab-source-") as temporary_directory:
+                source = Path(temporary_directory) / source_file_name
+                await self._write_upload(audio_upload, source)
+                if start_ms < 0 or end_ms <= start_ms:
+                    raise ValueError("Audio interval must satisfy 0 <= start_ms < end_ms")
+                audio = await asyncio.to_thread(crop_audio_to_flac, source, start_ms, end_ms)
+        finally:
+            await audio_upload.close()
+
         asset_id = uuid4()
-        storage_key = f"asr-lab/assets/{asset_id}/{file_name}"
+        annotation_id = uuid4()
+        file_name = f"{asset_id}.flac"
+        storage_key = f"asr-lab/samples/{asset_id}/{file_name}"
         destination = self._storage.resolve(storage_key)
         destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(audio)
+        sample_duration_ms = self._probe_duration_ms_sync(destination)
+        checksum = hashlib.sha256(audio).hexdigest()
         try:
-            file_size_bytes, checksum = await self._write_upload(upload, destination)
-            duration_ms = await self._probe_duration_ms(destination)
             with self._engine.begin() as connection:
-                asset = connection.execute(
+                self._dataset_row(connection, user, dataset_id)
+                connection.execute(
                     text(
                         """
                         insert into evaluation_source_assets (
@@ -163,10 +290,9 @@ class AsrLabService:
                             file_size_bytes, duration_ms, created_by_user_id
                         )
                         values (
-                            :id, :workspace_id, :dataset_id, :artifact_uri, :checksum, :file_name, :mime_type,
-                            :file_size_bytes, :duration_ms, :user_id
+                            :id, :workspace_id, :dataset_id, :artifact_uri, :checksum, :file_name,
+                            'audio/flac', :file_size_bytes, :duration_ms, :user_id
                         )
-                        returning *
                         """
                     ),
                     {
@@ -176,18 +302,55 @@ class AsrLabService:
                         "artifact_uri": storage_key,
                         "checksum": checksum,
                         "file_name": file_name,
-                        "mime_type": upload.content_type or "application/octet-stream",
-                        "file_size_bytes": file_size_bytes,
-                        "duration_ms": duration_ms,
+                        "file_size_bytes": len(audio),
+                        "duration_ms": sample_duration_ms,
+                        "user_id": user.id,
+                    },
+                )
+                row = connection.execute(
+                    text(
+                        """
+                        insert into evaluation_annotations (
+                            id, dataset_id, source_asset_id, start_ms, end_ms, reference_text,
+                            language, train_allowed, evaluation_allowed, contains_sensitive_data,
+                            group_key, created_by_user_id
+                        )
+                        values (
+                            :id, :dataset_id, :source_asset_id, 0, :end_ms, :reference_text,
+                            :language, :train_allowed, :evaluation_allowed, :contains_sensitive_data,
+                            :group_key, :user_id
+                        )
+                        returning *
+                        """
+                    ),
+                    {
+                        "id": annotation_id,
+                        "dataset_id": dataset_id,
+                        "source_asset_id": asset_id,
+                        "end_ms": sample_duration_ms,
+                        "reference_text": cleaned_text,
+                        "language": language.strip() if language and language.strip() else None,
+                        "train_allowed": train_allowed,
+                        "evaluation_allowed": evaluation_allowed,
+                        "contains_sensitive_data": contains_sensitive_data,
+                        "group_key": str(asset_id),
                         "user_id": user.id,
                     },
                 ).mappings().one()
-                result = dict(asset)
         except Exception:
-            destination.unlink(missing_ok=True)
+            self._storage.remove_tree(str(Path(storage_key).parent))
             raise
-        finally:
-            await upload.close()
+
+        result = dict(row)
+        if project_persistence_password is not None:
+            self._encrypted_datasets.persist_audio_sample(
+                package_id=str(dataset_id),
+                sample_id=str(annotation_id),
+                password=project_persistence_password,
+                audio=audio,
+                text=cleaned_text,
+            )
+            result["project_persisted"] = True
         return result
 
     def import_recording(self, user: CurrentUser, dataset_id: UUID, recording_id: UUID) -> DatabaseRow:
@@ -284,6 +447,71 @@ class AsrLabService:
         result["storage_path"] = result["artifact_uri"] or result["recording_storage_path"]
         return result
 
+    def delete_asset(self, user: CurrentUser, asset_id: UUID, *, delete_annotations: bool) -> DatabaseRow:
+        with self._engine.begin() as connection:
+            asset_row = connection.execute(
+                text(
+                    """
+                    select *
+                    from evaluation_source_assets
+                    where id = :asset_id
+                      and workspace_id = :workspace_id
+                      and archived_at is null
+                    for update
+                    """
+                ),
+                {"asset_id": asset_id, "workspace_id": user.current_workspace_id},
+            ).mappings().one_or_none()
+            if asset_row is None:
+                raise AsrLabNotFoundError(str(asset_id))
+            asset = dict(asset_row)
+            annotation_count = cast(
+                int,
+                connection.execute(
+                    text("select count(*) from evaluation_annotations where source_asset_id = :asset_id"),
+                    {"asset_id": asset_id},
+                ).scalar_one(),
+            )
+            if annotation_count and not delete_annotations:
+                raise AsrLabConflictError(f"录音包含 {annotation_count} 条标注，请确认同时删除这些标注")
+            snapshot_reference_count = cast(
+                int,
+                connection.execute(
+                    text("select count(*) from evaluation_cases where source_asset_id = :asset_id"),
+                    {"asset_id": asset_id},
+                ).scalar_one(),
+            )
+            if snapshot_reference_count:
+                connection.execute(
+                    text("update evaluation_source_assets set archived_at = now() where id = :asset_id"),
+                    {"asset_id": asset_id},
+                )
+                return {
+                    "id": asset_id,
+                    "mode": "archived",
+                    "deleted_annotation_count": 0,
+                    "retained_snapshot_reference_count": snapshot_reference_count,
+                }
+
+            deleted_annotation_count = connection.execute(
+                text("delete from evaluation_annotations where source_asset_id = :asset_id"),
+                {"asset_id": asset_id},
+            ).rowcount
+            connection.execute(
+                text("update evaluation_source_assets set archived_at = now() where id = :asset_id"),
+                {"asset_id": asset_id},
+            )
+
+        artifact_uri = asset.get("artifact_uri")
+        if isinstance(artifact_uri, str):
+            self._storage.remove_tree(str(Path(artifact_uri).parent))
+        return {
+            "id": asset_id,
+            "mode": "deleted",
+            "deleted_annotation_count": deleted_annotation_count,
+            "retained_snapshot_reference_count": 0,
+        }
+
     def create_annotation(
         self,
         user: CurrentUser,
@@ -297,10 +525,15 @@ class AsrLabService:
         train_allowed: bool,
         evaluation_allowed: bool,
         contains_sensitive_data: bool,
+        project_persistence_password: str | None = None,
     ) -> DatabaseRow:
         cleaned_text = reference_text.strip()
         if not cleaned_text:
             raise ValueError("Reference text is required")
+        if project_persistence_password is not None:
+            self._require_dataset(user, dataset_id)
+            self._encrypted_datasets.verify_password(str(dataset_id), project_persistence_password)
+        annotation_id = uuid4()
         with self._engine.begin() as connection:
             self._dataset_row(connection, user, dataset_id)
             duration_ms = self._asset_duration(connection, user, dataset_id, source_asset_id)
@@ -309,12 +542,12 @@ class AsrLabService:
                 text(
                     """
                     insert into evaluation_annotations (
-                        dataset_id, source_asset_id, start_ms, end_ms, reference_text,
+                        id, dataset_id, source_asset_id, start_ms, end_ms, reference_text,
                         language, train_allowed, evaluation_allowed, contains_sensitive_data,
                         group_key, created_by_user_id
                     )
                     values (
-                        :dataset_id, :source_asset_id, :start_ms, :end_ms, :reference_text,
+                        :id, :dataset_id, :source_asset_id, :start_ms, :end_ms, :reference_text,
                         :language, :train_allowed, :evaluation_allowed, :contains_sensitive_data,
                         :group_key, :user_id
                     )
@@ -322,6 +555,7 @@ class AsrLabService:
                     """
                 ),
                 {
+                    "id": annotation_id,
                     "dataset_id": dataset_id,
                     "source_asset_id": source_asset_id,
                     "start_ms": start_ms,
@@ -335,7 +569,11 @@ class AsrLabService:
                     "user_id": user.id,
                 },
             ).mappings().one()
-        return dict(row)
+        result = dict(row)
+        if project_persistence_password is not None:
+            self._persist_annotation_sample(user, result, project_persistence_password)
+            result["project_persisted"] = True
+        return result
 
     def update_annotation(
         self,
@@ -350,12 +588,15 @@ class AsrLabService:
         train_allowed: bool,
         evaluation_allowed: bool,
         contains_sensitive_data: bool,
+        project_persistence_password: str | None = None,
     ) -> DatabaseRow:
         cleaned_text = reference_text.strip()
         if not cleaned_text:
             raise ValueError("Reference text is required")
         with self._engine.begin() as connection:
             existing = self._annotation_row(connection, user, annotation_id)
+            if project_persistence_password is not None:
+                self._encrypted_datasets.verify_password(str(existing["dataset_id"]), project_persistence_password)
             duration_ms = self._asset_duration(
                 connection,
                 user,
@@ -400,7 +641,128 @@ class AsrLabService:
             ).mappings().one_or_none()
         if row is None:
             raise AsrLabConflictError("Annotation was changed by another user; reload and retry")
-        return dict(row)
+        result = dict(row)
+        if project_persistence_password is not None:
+            self._persist_annotation_sample(user, result, project_persistence_password)
+            result["project_persisted"] = True
+        return result
+
+    def list_encrypted_project_datasets(self) -> list[DatabaseRow]:
+        return self._encrypted_datasets.list_packages()
+
+    def import_encrypted_project_dataset(self, user: CurrentUser, package_id: str, password: str) -> DatabaseRow:
+        samples = self._encrypted_datasets.load(package_id, password)
+        if not samples:
+            raise ValueError("加密数据集没有可导入的样本")
+
+        dataset_id = uuid4()
+        prepared_assets: list[dict[str, Any]] = []
+        written_paths: list[Path] = []
+        try:
+            for sample in samples:
+                asset_id = uuid4()
+                file_name = f"{sample.sample_id}.flac"
+                storage_key = f"asr-lab/assets/{asset_id}/{file_name}"
+                destination = self._storage.resolve(storage_key)
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(sample.audio)
+                written_paths.append(destination)
+                prepared_assets.append(
+                    {
+                        "asset_id": asset_id,
+                        "storage_key": storage_key,
+                        "file_name": file_name,
+                        "file_size_bytes": len(sample.audio),
+                        "checksum": hashlib.sha256(sample.audio).hexdigest(),
+                        "duration_ms": self._probe_duration_ms_sync(destination),
+                        "reference_text": sample.text,
+                    }
+                )
+
+            with self._engine.begin() as connection:
+                dataset = connection.execute(
+                    text(
+                        """
+                        insert into evaluation_datasets (
+                            id, workspace_id, name, description, task_type, created_by_user_id
+                        )
+                        values (:id, :workspace_id, :name, null, 'asr', :user_id)
+                        returning *
+                        """
+                    ),
+                    {
+                        "id": dataset_id,
+                        "workspace_id": user.current_workspace_id,
+                        "name": f"项目加密数据集 {package_id[:8]}",
+                        "user_id": user.id,
+                    },
+                ).mappings().one()
+                for prepared in prepared_assets:
+                    connection.execute(
+                        text(
+                            """
+                            insert into evaluation_source_assets (
+                                id, workspace_id, dataset_id, artifact_uri, checksum, file_name, mime_type,
+                                file_size_bytes, duration_ms, created_by_user_id
+                            )
+                            values (
+                                :asset_id, :workspace_id, :dataset_id, :storage_key, :checksum, :file_name,
+                                'audio/flac', :file_size_bytes, :duration_ms, :user_id
+                            )
+                            """
+                        ),
+                        {
+                            **prepared,
+                            "workspace_id": user.current_workspace_id,
+                            "dataset_id": dataset_id,
+                            "user_id": user.id,
+                        },
+                    )
+                    connection.execute(
+                        text(
+                            """
+                            insert into evaluation_annotations (
+                                dataset_id, source_asset_id, start_ms, end_ms, reference_text,
+                                language, train_allowed, evaluation_allowed, contains_sensitive_data,
+                                group_key, created_by_user_id
+                            )
+                            values (
+                                :dataset_id, :asset_id, 0, :duration_ms, :reference_text,
+                                'zh', true, true, true, :group_key, :user_id
+                            )
+                            """
+                        ),
+                        {
+                            **prepared,
+                            "dataset_id": dataset_id,
+                            "group_key": str(prepared["asset_id"]),
+                            "user_id": user.id,
+                        },
+                    )
+            result = dict(dataset)
+            result["imported_sample_count"] = len(prepared_assets)
+            return result
+        except Exception:
+            for path in written_paths:
+                path.unlink(missing_ok=True)
+                with suppress(OSError):
+                    path.parent.rmdir()
+            raise
+
+    def _persist_annotation_sample(self, user: CurrentUser, annotation: DatabaseRow, password: str) -> None:
+        asset = self.get_asset_audio(user, UUID(str(annotation["source_asset_id"])))
+        source = self._storage.resolve(cast(str, asset["storage_path"]))
+        if not source.is_file():
+            raise AsrLabNotFoundError("Audio file not found")
+        self._encrypted_datasets.persist_sample(
+            package_id=str(annotation["dataset_id"]),
+            sample_id=str(annotation["id"]),
+            password=password,
+            source=source,
+            start_ms=cast(int, annotation["start_ms"]),
+            end_ms=cast(int, annotation["end_ms"]),
+            text=cast(str, annotation["reference_text"]),
+        )
 
     def review_annotation(self, user: CurrentUser, annotation_id: UUID, revision: int) -> DatabaseRow:
         self._require_manager(user)
@@ -438,6 +800,7 @@ class AsrLabService:
         normalization_name: str,
         normalization_version: str,
         seed: str,
+        split_strategy_name: Literal["deterministic_group_hash_v1", "all_train_v1"] = "deterministic_group_hash_v1",
     ) -> DatasetVersionPreview:
         with self._engine.connect() as connection:
             self._dataset_row(connection, user, dataset_id)
@@ -449,16 +812,34 @@ class AsrLabService:
                     join evaluation_source_assets assets on assets.id = annotations.source_asset_id
                     where annotations.dataset_id = :dataset_id
                       and annotations.status = 'approved'
-                      and (annotations.train_allowed or annotations.evaluation_allowed)
+                      and assets.archived_at is null
+                      and (
+                          (:training_only and annotations.train_allowed)
+                          or (
+                              not :training_only
+                              and (annotations.train_allowed or annotations.evaluation_allowed)
+                          )
+                      )
                     order by annotations.group_key, annotations.start_ms, annotations.id
                     """
                 ),
-                {"dataset_id": dataset_id},
+                {
+                    "dataset_id": dataset_id,
+                    "training_only": split_strategy_name == "all_train_v1",
+                },
             ).mappings().all()
             total_count = cast(
                 int,
                 connection.execute(
-                    text("select count(*) from evaluation_annotations where dataset_id = :dataset_id"),
+                    text(
+                        """
+                        select count(*)
+                        from evaluation_annotations annotations
+                        join evaluation_source_assets assets on assets.id = annotations.source_asset_id
+                        where annotations.dataset_id = :dataset_id
+                          and assets.archived_at is null
+                        """
+                    ),
                     {"dataset_id": dataset_id},
                 ).scalar_one(),
             )
@@ -477,13 +858,25 @@ class AsrLabService:
             )
             for row in rows
         ]
-        return build_dataset_preview(
+        preview = build_dataset_preview(
             annotations,
             normalization_name=normalization_name,
             normalization_version=normalization_version,
             seed=seed,
+            split_strategy_name=split_strategy_name,
             excluded_count=total_count - len(annotations),
         )
+        evaluation_logger.info(
+            "ASR 评测：数据版本预览 dataset_id=%s strategy=%s train=%d validation=%d test=%d excluded=%d checksum=%s",
+            dataset_id,
+            split_strategy_name,
+            preview.train.case_count,
+            preview.validation.case_count,
+            preview.test.case_count,
+            preview.excluded_count,
+            preview.checksum,
+        )
+        return preview
 
     def freeze_dataset_version(
         self,
@@ -493,6 +886,8 @@ class AsrLabService:
         normalization_name: str,
         normalization_version: str,
         seed: str,
+        split_strategy_name: Literal["deterministic_group_hash_v1", "all_train_v1"] = "deterministic_group_hash_v1",
+        expected_checksum: str | None = None,
     ) -> DatabaseRow:
         self._require_manager(user)
         preview = self.preview_dataset_version(
@@ -501,9 +896,17 @@ class AsrLabService:
             normalization_name=normalization_name,
             normalization_version=normalization_version,
             seed=seed,
+            split_strategy_name=split_strategy_name,
+        )
+        if expected_checksum is not None and preview.checksum != expected_checksum:
+            raise AsrLabConflictError("数据集切片已发生变化，请重新预览并确认后再冻结")
+        ratios = (
+            {"train": 100, "validation": 0, "test": 0}
+            if split_strategy_name == "all_train_v1"
+            else {"train": 80, "validation": 10, "test": 10}
         )
         strategy = json.dumps(
-            {"name": "deterministic_group_hash_v1", "seed": seed, "ratios": {"train": 80, "validation": 10, "test": 10}},
+            {"name": split_strategy_name, "seed": seed, "ratios": ratios},
             separators=(",", ":"),
         )
         with self._engine.begin() as connection:
@@ -587,6 +990,17 @@ class AsrLabService:
                 ),
                 {"version_id": version_id, "checksum": preview.checksum},
             ).mappings().one()
+        evaluation_logger.info(
+            "ASR 评测：数据版本冻结完成 dataset_id=%s version_id=%s version_number=%d strategy=%s train=%d validation=%d test=%d checksum=%s",
+            dataset_id,
+            version_id,
+            version_number,
+            split_strategy_name,
+            preview.train.case_count,
+            preview.validation.case_count,
+            preview.test.case_count,
+            preview.checksum,
+        )
         return dict(row)
 
     def list_models(self, user: CurrentUser) -> list[DatabaseRow]:
@@ -631,20 +1045,29 @@ class AsrLabService:
         self,
         user: CurrentUser,
         *,
-        dataset_version_id: UUID,
+        dataset_id: UUID | None,
+        dataset_version_id: UUID | None,
         base_model_version_id: UUID,
         preset_name: str,
         candidate_model_name: str,
+        run_validation: bool,
         idempotency_key: str,
     ) -> DatabaseRow:
         self._require_manager(user)
+        if (dataset_id is None) == (dataset_version_id is None):
+            raise ValueError("Provide exactly one of dataset_id or dataset_version_id")
+        resolved_version_id = (
+            self._get_or_create_training_dataset_version(user, dataset_id, run_validation=run_validation)
+            if dataset_id is not None
+            else cast(UUID, dataset_version_id)
+        )
         with self._engine.begin() as connection:
-            self._require_frozen_version(connection, user, dataset_version_id)
+            self._require_frozen_version(connection, user, resolved_version_id)
             train_count = cast(
                 int,
                 connection.execute(
                     text("select count(*) from evaluation_cases where dataset_version_id = :version_id and split = 'train'"),
-                    {"version_id": dataset_version_id},
+                    {"version_id": resolved_version_id},
                 ).scalar_one(),
             )
             if train_count == 0:
@@ -676,16 +1099,95 @@ class AsrLabService:
                 ),
                 {
                     "workspace_id": user.current_workspace_id,
-                    "dataset_version_id": dataset_version_id,
+                    "dataset_version_id": resolved_version_id,
                     "base_model_version_id": base_model_version_id,
                     "preset_name": preset_name.strip(),
                     "candidate_model_name": candidate_model_name.strip(),
                     "idempotency_key": idempotency_key.strip(),
-                    "config_snapshot": json.dumps({"preset_name": preset_name.strip(), "training_method": "lora"}),
+                    "config_snapshot": json.dumps(
+                        {
+                            "preset_name": preset_name.strip(),
+                            "training_method": "lora",
+                            "run_validation": run_validation,
+                        }
+                    ),
                     "user_id": user.id,
                 },
             ).mappings().one()
         return dict(row)
+
+    def _get_or_create_training_dataset_version(
+        self,
+        user: CurrentUser,
+        dataset_id: UUID,
+        *,
+        run_validation: bool,
+    ) -> UUID:
+        normalization_name = "zh_asr"
+        normalization_version = "v1"
+        seed = "asr-lab-v1"
+        split_strategy_name: Literal["deterministic_group_hash_v1", "all_train_v1"] = (
+            "deterministic_group_hash_v1" if run_validation else "all_train_v1"
+        )
+        preview = self.preview_dataset_version(
+            user,
+            dataset_id,
+            normalization_name=normalization_name,
+            normalization_version=normalization_version,
+            seed=seed,
+            split_strategy_name=split_strategy_name,
+        )
+        if preview.train.case_count == 0:
+            raise AsrLabConflictError("数据集中没有可用于训练的已确认样本")
+        with self._engine.connect() as connection:
+            existing = connection.execute(
+                text(
+                    """
+                    select versions.id
+                    from evaluation_dataset_versions versions
+                    join evaluation_datasets datasets on datasets.id = versions.dataset_id
+                    where versions.dataset_id = :dataset_id
+                      and versions.status = 'frozen'
+                      and versions.checksum = :checksum
+                      and datasets.workspace_id = :workspace_id
+                      and datasets.status = 'active'
+                    """
+                ),
+                {
+                    "dataset_id": dataset_id,
+                    "checksum": preview.checksum,
+                    "workspace_id": user.current_workspace_id,
+                },
+            ).scalar_one_or_none()
+        if existing is not None:
+            return UUID(str(existing))
+        try:
+            version = self.freeze_dataset_version(
+                user,
+                dataset_id,
+                normalization_name=normalization_name,
+                normalization_version=normalization_version,
+                seed=seed,
+                split_strategy_name=split_strategy_name,
+            )
+            return UUID(str(version["id"]))
+        except IntegrityError:
+            with self._engine.connect() as connection:
+                raced = connection.execute(
+                    text(
+                        """
+                        select id
+                        from evaluation_dataset_versions
+                        where dataset_id = :dataset_id
+                          and status = 'frozen'
+                          and checksum = :checksum
+                        """
+                    ),
+                    {"dataset_id": dataset_id, "checksum": preview.checksum},
+                ).scalar_one_or_none()
+            if raced is None:
+                raise
+            return UUID(str(raced))
 
     def list_training_runs(self, user: CurrentUser) -> list[DatabaseRow]:
         with self._engine.connect() as connection:
@@ -711,6 +1213,48 @@ class AsrLabService:
     def cancel_training_run(self, user: CurrentUser, run_id: UUID) -> DatabaseRow:
         self._require_manager(user)
         return self._cancel_run(user, "training_runs", run_id)
+
+    def delete_training_run(self, user: CurrentUser, run_id: UUID) -> DatabaseRow:
+        self._require_manager(user)
+        with self._engine.begin() as connection:
+            row = connection.execute(
+                text(
+                    """
+                    select *
+                    from training_runs
+                    where id = :run_id and workspace_id = :workspace_id
+                    for update
+                    """
+                ),
+                {"run_id": run_id, "workspace_id": user.current_workspace_id},
+            ).mappings().one_or_none()
+            if row is None:
+                raise AsrLabNotFoundError(str(run_id))
+            run = dict(row)
+            run_status = cast(str, run["status"])
+            if run_status in {"preparing", "training", "validating"}:
+                raise AsrLabConflictError("训练任务正在运行，请先取消并等待任务进入 cancelled 状态")
+            produced_model_count = cast(
+                int,
+                connection.execute(
+                    text("select count(*) from model_versions where training_run_id = :run_id"),
+                    {"run_id": run_id},
+                ).scalar_one(),
+            )
+            if run_status == "succeeded" or produced_model_count > 0:
+                raise AsrLabConflictError("成功的训练任务已关联候选模型，不能直接删除")
+            connection.execute(
+                text("delete from training_runs where id = :run_id"),
+                {"run_id": run_id},
+            )
+
+        self._storage.remove_tree(f"asr-lab/training/{run_id}")
+        train_logger.info("ASR LoRA：训练任务已删除 run_id=%s previous_status=%s", run_id, run_status)
+        return {
+            "id": run_id,
+            "status": run_status,
+            "deleted": True,
+        }
 
     def create_evaluation_run(
         self,
@@ -762,7 +1306,11 @@ class AsrLabService:
                     "split": split,
                     "idempotency_key": idempotency_key.strip(),
                     "config_snapshot": json.dumps(
-                        {"normalization_name": normalization_name, "normalization_version": normalization_version},
+                        {
+                            "normalization_name": normalization_name,
+                            "normalization_version": normalization_version,
+                            "asr_context": self._evaluation_context,
+                        },
                         separators=(",", ":"),
                     ),
                     "total_case_count": case_count * len(model_version_ids),
@@ -790,6 +1338,15 @@ class AsrLabService:
                         ),
                         {"run_id": run_id, "model_id": model_id, "role": "baseline" if position == 0 else "candidate", "position": position},
                     )
+        evaluation_logger.info(
+            "ASR 评测：任务已创建 run_id=%s dataset_version_id=%s split=%s models=%s case_count=%d total_model_cases=%d",
+            run_id,
+            dataset_version_id,
+            split,
+            ",".join(str(model_id) for model_id in model_version_ids),
+            case_count,
+            case_count * len(model_version_ids),
+        )
         return dict(run)
 
     def list_evaluation_runs(self, user: CurrentUser) -> list[DatabaseRow]:
@@ -887,6 +1444,36 @@ class AsrLabService:
 
     def cancel_evaluation_run(self, user: CurrentUser, run_id: UUID) -> DatabaseRow:
         return self._cancel_run(user, "evaluation_runs", run_id)
+
+    def delete_evaluation_run(self, user: CurrentUser, run_id: UUID) -> DatabaseRow:
+        self._require_manager(user)
+        with self._engine.begin() as connection:
+            row = connection.execute(
+                text(
+                    """
+                    select status
+                    from evaluation_runs
+                    where id = :run_id and workspace_id = :workspace_id
+                    for update
+                    """
+                ),
+                {"run_id": run_id, "workspace_id": user.current_workspace_id},
+            ).mappings().one_or_none()
+            if row is None:
+                raise AsrLabNotFoundError(str(run_id))
+            run_status = cast(str, row["status"])
+            if run_status == "running":
+                raise AsrLabConflictError("评测任务正在运行，请先取消并等待任务进入 cancelled 状态")
+            connection.execute(
+                text("delete from evaluation_runs where id = :run_id"),
+                {"run_id": run_id},
+            )
+        evaluation_logger.info("ASR 评测：任务已删除 run_id=%s previous_status=%s", run_id, run_status)
+        return {
+            "id": run_id,
+            "status": run_status,
+            "deleted": True,
+        }
 
     def _transition_annotation(
         self,

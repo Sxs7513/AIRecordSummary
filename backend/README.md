@@ -25,7 +25,7 @@ The audio installer installs the aggregate backend project and creates the
 isolated Qwen HF Trainer environment under:
 
 ```text
-backend/L2-Core/trainers/qwen-asr-lora/.venv
+backend/packages/l2_core/trainers/qwen-asr-lora/.venv
 ```
 
 ## Run
@@ -36,7 +36,6 @@ From the repository root:
 npm run dev:production-api
 npm run dev:evaluation-api
 npm run dev:training-api
-npm run worker:asr-lab
 ```
 
 The APIs listen on ports 8000, 8001, and 8002. `npm run dev:python-web` is a
@@ -45,26 +44,14 @@ backward-compatible alias for `npm run dev:production-api`.
 The Uvicorn access logs are disabled so terminal output stays focused on
 pipeline stages and model progress.
 
-The Web application starts a long-lived CPU worker and a single GPU scheduler
-as part of its lifespan. The GPU scheduler always checks `gpu_high` before
-`gpu_normal`, and rechecks it after every normal-priority stage. The API
-process therefore creates runs and consumes them automatically; model work is
-performed on background worker threads, never on a request-handling thread.
+`production-api` starts the recording pipeline coordinator and GPU scheduler
+as part of its lifespan. `training-api` starts the single-GPU ASR evaluation
+and LoRA training worker in a background thread. Both stop before their API
+releases database resources; interrupted ASR Lab runs are returned to the
+queue and can be resumed by the next process.
 
-Set `PIPELINE_EMBEDDED_WORKERS_ENABLED=false` only when workers are deployed
-as independent processes. In that case, start one process per queue:
-
-```bash
-cd backend
-PYTHONPATH=packages .venv/bin/python L3-App/production-worker/src/main.py
-PIPELINE_WORKER_QUEUE=gpu_high PYTHONPATH=packages .venv/bin/python L3-App/production-worker/src/main.py
-PIPELINE_WORKER_QUEUE=gpu_normal PYTHONPATH=packages .venv/bin/python L3-App/production-worker/src/main.py
-```
-
-GPU workers do not launch model-specific runner subprocesses. Both embedded
-and independent workers use `backend/.venv`, which contains the backend and
-audio-model dependencies. The root `.env` retains `*_PYTHON_BIN` entries for
-the legacy service, but the Python backend no longer reads them.
+Run each API as a single Uvicorn process. Starting multiple `training-api`
+workers would create multiple ASR Lab consumers competing for the same GPU.
 
 Run `scripts/install_audio_dependencies.sh` to install production audio-model
 dependencies into `backend/.venv` and HF training dependencies into the
@@ -128,7 +115,7 @@ pipeline run and keeps the failed run intact for diagnosis.
 ## Checks
 
 ```bash
-.venv/bin/ruff check packages L2-Core/trainers L3-App tests scripts
+.venv/bin/ruff check packages packages/l2_core/trainers packages/l3_app tests scripts
 .venv/bin/pyright
 .venv/bin/pytest
 ```

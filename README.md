@@ -15,7 +15,11 @@ Install Node dependencies:
 npm install
 ```
 
-Configure PostgreSQL in `.env`:
+Project-wide development configuration is versioned in `.env`. Put
+machine-local credentials and tokens in the ignored `.env.local`; its values
+override `.env`.
+
+Configure PostgreSQL in `.env` or `.env.local`:
 
 ```bash
 DB_HOST=localhost
@@ -26,7 +30,8 @@ DB_NAME=ai_record_summary
 DB_ADMIN_DATABASE=postgres
 ```
 
-Speaker diarization uses the gated pyannote model. Set this in `.env` before retrying diarization jobs:
+Speaker diarization uses the gated pyannote model. Set this in `.env.local`
+before retrying diarization jobs:
 
 ```bash
 PYANNOTE_AUTH_TOKEN=your_huggingface_token
@@ -58,7 +63,7 @@ The installer creates two isolated Python environments:
 backend/.venv
   Production APIs, pipeline workers, qwen-asr inference and shared packages
 
-backend/L2-Core/trainers/qwen-asr-lora/.venv
+backend/packages/l2_core/trainers/qwen-asr-lora/.venv
   Qwen3-ASR-1.7B-hf, Transformers 5.13+ and PEFT LoRA training/evaluation
 ```
 
@@ -84,18 +89,9 @@ npm run dev:training-api
 The APIs listen on ports 8000, 8001, and 8002 respectively.
 `npm run dev:python-web` remains as an alias for the production API.
 
-Run the isolated ASR evaluation and LoRA training worker in another terminal:
-
-```bash
-npm run worker:asr-lab
-```
-
-When `PIPELINE_EMBEDDED_WORKERS_ENABLED=false`, also start the standalone
-production pipeline worker:
-
-```bash
-npm run worker:production
-```
+`production-api` starts the recording pipeline coordinator in its lifespan.
+`training-api` likewise starts the single-GPU ASR evaluation/training worker,
+so no separate worker process is required.
 
 Useful pages:
 

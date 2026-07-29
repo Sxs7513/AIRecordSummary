@@ -25,7 +25,6 @@ def _settings() -> Settings:
             "DB_ADMIN_DATABASE": "postgres",
             "DB_SSL": False,
             "LOCAL_STORAGE_ROOT": "uploads-test",
-            "PIPELINE_EMBEDDED_WORKERS_ENABLED": False,
         }
     )
 
@@ -144,7 +143,7 @@ class FakeSummaryRegenerationService:
 
 
 def _client(service: FakeRecordingService) -> TestClient:
-    app = create_app(_settings())
+    app = create_app(_settings(), start_pipeline_worker=False)
     app.dependency_overrides[get_recording_service] = lambda: service
     app.dependency_overrides[get_recording_summary_regeneration_service] = lambda: FakeSummaryRegenerationService(service.recording_id, service.run_id)
     app.dependency_overrides[require_current_user] = lambda: CurrentUser(uuid4(), "test@example.com", "Test", uuid4(), ())

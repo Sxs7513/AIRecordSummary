@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
+import { Trash2 } from "lucide-react";
 
 import { asrLabRequest } from "@/app/sdk/asr-lab/client";
 import type { TrainingRun } from "@/app/sdk/asr-lab/types";
@@ -17,8 +18,20 @@ export function AsrTrainingRuns() {
   }, [load]);
 
   async function cancel(runId: string) {
+    setError(null);
     try {
       await asrLabRequest(`/api/training-runs/${runId}:cancel`, { method: "POST" });
+      await load();
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+    }
+  }
+
+  async function deleteRun(run: TrainingRun) {
+    if (!window.confirm(`确定删除训练任务“${run.candidate_model_name}”吗？对应的失败日志和临时训练文件也会删除。`)) return;
+    setError(null);
+    try {
+      await asrLabRequest(`/api/training-runs/${run.id}`, { method: "DELETE" });
       await load();
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
@@ -38,11 +51,18 @@ export function AsrTrainingRuns() {
             <td><span className={`badge ${run.status}`}>{run.status}</span>{run.error_message ? <p className="subtle">{run.error_message}</p> : null}</td>
             <td><div className="job-progress"><span>{run.progress_percent ?? 0}%</span><div className="job-progress-track"><div className="progress-bar" style={{ width: `${run.progress_percent ?? 0}%` }} /></div><span className="subtle">{run.progress_message}</span></div></td>
             <td>{new Date(run.created_at).toLocaleString()}</td>
-            <td>{["queued", "preparing", "training", "validating"].includes(run.status) ? <button className="secondary" onClick={() => void cancel(run.id)}>取消</button> : run.status === "succeeded" ? <Link className="button secondary" href="/asr-lab/evaluations">去评测</Link> : "—"}</td>
+            <td>
+              {["preparing", "training", "validating"].includes(run.status) ? (
+                <button className="secondary" onClick={() => void cancel(run.id)}>取消</button>
+              ) : ["queued", "failed", "cancelled"].includes(run.status) ? (
+                <button className="secondary" onClick={() => void deleteRun(run)}><Trash2 size={15} />删除</button>
+              ) : run.status === "succeeded" ? (
+                <Link className="button secondary" href="/asr-lab/evaluations">去评测</Link>
+              ) : "—"}
+            </td>
           </tr>)}</tbody>
         </table> : <div className="empty">还没有训练任务</div>}
       </section>
     </>
   );
 }
-

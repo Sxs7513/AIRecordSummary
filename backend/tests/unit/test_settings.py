@@ -27,10 +27,11 @@ def test_default_asr_provider_is_qwen() -> None:
     assert settings.asr_provider == "qwen_asr"
     assert settings.qwen_asr_model == "Qwen/Qwen3-ASR-1.7B"
     assert settings.asr_lab_training_model == "Qwen/Qwen3-ASR-1.7B-hf"
-    assert settings.asr_lab_training_module == "airecord_qwen_asr_trainer"
+    assert settings.asr_lab_training_module == "qwen_asr_lora"
     assert settings.resolved_asr_lab_training_python_bin == (
-        REPOSITORY_ROOT / "backend/L2-Core/trainers/qwen-asr-lora/.venv/bin/python"
-    ).resolve()
+        REPOSITORY_ROOT / "backend/packages/l2_core/trainers/qwen-asr-lora/.venv/bin/python"
+    ).absolute()
+    assert ".venv" in settings.resolved_asr_lab_training_python_bin.parts
 
 
 def test_funasr_nano_can_be_selected_as_the_recording_asr_provider() -> None:
@@ -52,12 +53,6 @@ def test_relative_storage_root_is_resolved_from_repository_root() -> None:
     settings = Settings(_env_file=None, **settings_payload(LOCAL_STORAGE_ROOT="uploads"))
 
     assert settings.resolved_local_storage_root == REPOSITORY_ROOT / Path("uploads")
-
-
-def test_embedded_workers_are_enabled_by_default() -> None:
-    settings = Settings(_env_file=None, **settings_payload())
-
-    assert settings.pipeline_embedded_workers_enabled is True
 
 
 def test_summary_defaults_to_large_context_without_rolling() -> None:

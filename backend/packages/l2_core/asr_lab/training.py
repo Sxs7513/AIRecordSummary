@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import logging
 import subprocess
 import time
 from pathlib import Path
+from threading import Event, Thread
 from typing import Any, TextIO, cast
 from uuid import UUID
 
@@ -11,6 +13,8 @@ from sqlalchemy import Engine, text
 
 from l1_foundation.infrastructure.huggingface import resolve_local_snapshot
 from l2_core.asr_lab.evaluators import AsrEvaluationWorker
+
+logger = logging.getLogger("train")
 
 
 class AsrTrainingWorker:
@@ -24,20 +28,26 @@ class AsrTrainingWorker:
         model_cache_root: Path,
         training_python: Path,
         training_module: str,
+        evaluation_context: str = "",
     ) -> None:
         self._engine = engine
         self._storage_root = storage_root.resolve()
         self._model_cache_root = model_cache_root.resolve()
-        self._training_python = training_python.resolve()
+        self._training_python = training_python.absolute()
         self._training_module = training_module
+        self._evaluation_context = evaluation_context
 
-    def run_once(self) -> bool:
+    def run_once(self, stop_event: Event | None = None) -> bool:
+        if stop_event is not None and stop_event.is_set():
+            return False
         run_id = self._claim()
         if run_id is None:
             return False
+        logger.info("ASR LoRA：领取训练任务 run_id=%s", run_id)
         try:
-            self._execute(run_id)
+            self._execute(run_id, stop_event)
         except Exception as error:
+            logger.exception("ASR LoRA：训练任务失败 run_id=%s error=%s", run_id, error)
             self._fail(run_id, str(error))
         return True
 
@@ -65,7 +75,16 @@ class AsrTrainingWorker:
             ).scalar_one_or_none()
         return None if value is None else UUID(str(value))
 
-    def _execute(self, run_id: UUID) -> None:
+    def _execute(self, run_id: UUID, stop_event: Event | None) -> None:
+        logger.info(
+            "ASR LoRA：开始准备训练 run_id=%s python=%s module=%s",
+            run_id,
+            self._training_python,
+            self._training_module,
+        )
+        if stop_event is not None and stop_event.is_set():
+            self._requeue(run_id)
+            return
         if not self._training_python.is_file():
             raise FileNotFoundError(f"ASR Lab training Python does not exist: {self._training_python}")
         with self._engine.connect() as connection:
@@ -82,6 +101,10 @@ class AsrTrainingWorker:
                     {"run_id": run_id},
                 ).mappings().one()
             )
+            config_snapshot = run.get("config_snapshot")
+            config = cast(dict[str, object], config_snapshot) if isinstance(config_snapshot, dict) else {}
+            run_validation_value = config.get("run_validation", False)
+            run_validation = run_validation_value if isinstance(run_validation_value, bool) else False
             cases = [
                 dict(row)
                 for row in connection.execute(
@@ -93,13 +116,28 @@ class AsrTrainingWorker:
                         join evaluation_source_assets assets on assets.id = cases.source_asset_id
                         left join recordings on recordings.id = assets.recording_id
                         where cases.dataset_version_id = :version_id
-                          and cases.split in ('train', 'validation')
+                          and (
+                              cases.split = 'train'
+                              or (:run_validation and cases.split = 'validation')
+                          )
                         order by cases.split, cases.id
                         """
                     ),
-                    {"version_id": run["dataset_version_id"]},
+                    {
+                        "version_id": run["dataset_version_id"],
+                        "run_validation": run_validation,
+                    },
                 ).mappings()
             ]
+        train_case_count = sum(case["split"] == "train" for case in cases)
+        validation_case_count = len(cases) - train_case_count
+        logger.info(
+            "ASR LoRA：加载训练数据 run_id=%s train_cases=%d validation_cases=%d run_validation=%s",
+            run_id,
+            train_case_count,
+            validation_case_count,
+            run_validation,
+        )
         run_root = self._storage_root / "asr-lab" / "training" / str(run_id)
         audio_root = run_root / "dataset" / "audio"
         output_root = run_root / "output"
@@ -112,10 +150,23 @@ class AsrTrainingWorker:
                 if self._cancel_requested(run_id):
                     self._cancel(run_id)
                     return
+                if stop_event is not None and stop_event.is_set():
+                    self._requeue(run_id)
+                    return
                 self._materialize_case(case, audio_root, train_output if case["split"] == "train" else validation_output)
                 self._progress(run_id, min(20, 2 + round(index / max(1, len(cases)) * 18)), f"准备训练样本 {index}/{len(cases)}")
+        logger.info(
+            "ASR LoRA：训练数据物化完成 run_id=%s train_file=%s validation_enabled=%s",
+            run_id,
+            train_file,
+            validation_file.stat().st_size > 0,
+        )
 
+        if stop_event is not None and stop_event.is_set():
+            self._requeue(run_id)
+            return
         base_path = resolve_local_snapshot(cast(str, run["base_model_name"]), self._model_cache_root)
+        logger.info("ASR LoRA：基础模型已解析 run_id=%s base_model=%s", run_id, base_path)
         manifest: dict[str, object] = {
             "run_id": str(run_id),
             "dataset_version_id": str(run["dataset_version_id"]),
@@ -133,10 +184,12 @@ class AsrTrainingWorker:
                 "gradient_accumulation_steps": 16,
                 "learning_rate": 2e-4,
                 "epochs": 3,
+                "num_workers": 0,
             },
         }
         manifest_path = run_root / "manifest.json"
         manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+        logger.info("ASR LoRA：训练 manifest 已生成 run_id=%s manifest=%s", run_id, manifest_path)
         command = [
             str(self._training_python),
             "-m",
@@ -147,25 +200,58 @@ class AsrTrainingWorker:
         ]
         log_path = run_root / "training.log"
         self._progress(run_id, 25, "启动独立 LoRA 训练进程", status="training")
+        logger.info(
+            "ASR LoRA：启动训练子进程 run_id=%s command=%s log=%s",
+            run_id,
+            " ".join(command),
+            log_path,
+        )
         with log_path.open("w", encoding="utf-8") as log:
-            process = subprocess.Popen(command, cwd=run_root, stdout=log, stderr=subprocess.STDOUT, text=True)
+            process = subprocess.Popen(
+                command,
+                cwd=run_root,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+            if process.stdout is None:
+                raise RuntimeError("LoRA training subprocess stdout is unavailable")
+            output_thread = Thread(
+                target=self._relay_training_output,
+                args=(run_id, process.stdout, log),
+                name=f"asr-training-log-{run_id}",
+                daemon=True,
+            )
+            output_thread.start()
             while process.poll() is None:
                 if self._cancel_requested(run_id):
-                    process.terminate()
-                    try:
-                        process.wait(timeout=30)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
+                    self._terminate_process(process)
+                    output_thread.join(timeout=5)
                     self._cancel(run_id)
                     return
-                time.sleep(2)
+                if stop_event is not None and stop_event.is_set():
+                    self._terminate_process(process)
+                    output_thread.join(timeout=5)
+                    self._requeue(run_id)
+                    return
+                if stop_event is None:
+                    time.sleep(2)
+                else:
+                    stop_event.wait(2)
+            output_thread.join(timeout=5)
+        logger.info("ASR LoRA：训练子进程结束 run_id=%s return_code=%s", run_id, process.returncode)
         if process.returncode != 0:
             tail = self._log_tail(log_path)
             raise RuntimeError(f"LoRA training exited with code {process.returncode}: {tail}")
+        if stop_event is not None and stop_event.is_set():
+            self._requeue(run_id)
+            return
         adapter_config = output_root / "adapter_config.json"
         if not adapter_config.is_file():
             raise RuntimeError("LoRA training completed without adapter_config.json")
         adapter_uri = output_root.relative_to(self._storage_root).as_posix()
+        logger.info("ASR LoRA：LoRA adapter 已生成 run_id=%s adapter_uri=%s", run_id, adapter_uri)
         self._progress(run_id, 95, "注册候选模型", status="validating")
         with self._engine.begin() as connection:
             model_id = UUID(str(connection.execute(
@@ -196,18 +282,22 @@ class AsrTrainingWorker:
                     "user_id": run["created_by_user_id"],
                 },
             ).scalar_one()))
-            validation_case_count = cast(
-                int,
-                connection.execute(
-                    text(
-                        """
-                        select count(*)
-                        from evaluation_cases
-                        where dataset_version_id = :version_id and split = 'validation'
-                        """
-                    ),
-                    {"version_id": run["dataset_version_id"]},
-                ).scalar_one(),
+            validation_case_count = (
+                cast(
+                    int,
+                    connection.execute(
+                        text(
+                            """
+                            select count(*)
+                            from evaluation_cases
+                            where dataset_version_id = :version_id and split = 'validation'
+                            """
+                        ),
+                        {"version_id": run["dataset_version_id"]},
+                    ).scalar_one(),
+                )
+                if run_validation
+                else 0
             )
             validation_run_id: UUID | None = None
             if validation_case_count > 0:
@@ -238,6 +328,7 @@ class AsrTrainingWorker:
                                         "normalization_name": "zh_asr",
                                         "normalization_version": "v1",
                                         "source_training_run_id": str(run_id),
+                                        "asr_context": self._evaluation_context,
                                     },
                                     separators=(",", ":"),
                                 ),
@@ -280,10 +371,20 @@ class AsrTrainingWorker:
                     "progress_message": (
                         "LoRA 训练完成，候选模型已注册并进入验证评测"
                         if validation_run_id is not None
-                        else "LoRA 训练完成，候选模型已注册；数据集没有 validation case"
+                        else (
+                            "LoRA 训练完成，候选模型已注册；数据集没有 validation case"
+                            if run_validation
+                            else "LoRA 训练完成，候选模型已注册；已按任务配置跳过验证"
+                        )
                     ),
                 },
             )
+        logger.info(
+            "ASR LoRA：训练任务完成 run_id=%s model_id=%s validation_run_id=%s",
+            run_id,
+            model_id,
+            validation_run_id,
+        )
 
     def _materialize_case(self, case: dict[str, Any], audio_root: Path, output: TextIO) -> None:
         source_uri = case["artifact_uri"] or case["recording_storage_path"]
@@ -313,6 +414,13 @@ class AsrTrainingWorker:
             return bool(connection.execute(text("select cancel_requested from training_runs where id = :run_id"), {"run_id": run_id}).scalar_one())
 
     def _progress(self, run_id: UUID, percent: int, message: str, *, status: str | None = None) -> None:
+        logger.info(
+            "ASR LoRA：训练进度 run_id=%s percent=%d status=%s message=%s",
+            run_id,
+            percent,
+            status or "unchanged",
+            message,
+        )
         status_sql = "status = :status," if status is not None else ""
         with self._engine.begin() as connection:
             connection.execute(
@@ -328,6 +436,7 @@ class AsrTrainingWorker:
             )
 
     def _cancel(self, run_id: UUID) -> None:
+        logger.info("ASR LoRA：取消训练任务 run_id=%s", run_id)
         with self._engine.begin() as connection:
             connection.execute(
                 text(
@@ -335,6 +444,21 @@ class AsrTrainingWorker:
                     update training_runs
                     set status = 'cancelled', progress_message = '训练已取消',
                         finished_at = now(), updated_at = now()
+                    where id = :run_id
+                    """
+                ),
+                {"run_id": run_id},
+            )
+
+    def _requeue(self, run_id: UUID) -> None:
+        logger.info("ASR LoRA：停止信号触发，重新排队训练任务 run_id=%s", run_id)
+        with self._engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    update training_runs
+                    set status = 'queued', progress_message = '服务停止，等待重新调度',
+                        finished_at = null, updated_at = now()
                     where id = :run_id
                     """
                 ),
@@ -360,3 +484,55 @@ class AsrTrainingWorker:
         if not path.is_file():
             return "training log is missing"
         return path.read_text(encoding="utf-8", errors="replace")[-2000:]
+
+    def _relay_training_output(self, run_id: UUID, output: TextIO, log: TextIO) -> None:
+        for raw_line in output:
+            log.write(raw_line)
+            log.flush()
+            line = raw_line.strip()
+            if line and "\r" not in raw_line:
+                logger.info("ASR LoRA 子进程：run_id=%s %s", run_id, line)
+            progress = self._parse_training_progress(line)
+            if progress is None:
+                continue
+            step, max_steps, train_percent, loss, learning_rate = progress
+            overall_percent = min(90, 25 + round(train_percent * 0.65))
+            details = [f"训练 step {step}/{max_steps}（{train_percent:.1f}%）"]
+            if loss is not None:
+                details.append(f"loss={loss:g}")
+            if learning_rate is not None:
+                details.append(f"lr={learning_rate:g}")
+            try:
+                self._progress(run_id, overall_percent, " · ".join(details))
+            except Exception:
+                logger.exception("ASR LoRA：同步实时训练进度失败 run_id=%s", run_id)
+
+    @staticmethod
+    def _parse_training_progress(line: str) -> tuple[int, int, float, float | None, float | None] | None:
+        marker = "TRAIN_PROGRESS "
+        if marker not in line:
+            return None
+        try:
+            payload_value: object = json.loads(line.split(marker, maxsplit=1)[1])
+            if not isinstance(payload_value, dict):
+                return None
+            payload = cast(dict[str, object], payload_value)
+            step = int(cast(int | float | str, payload["step"]))
+            max_steps = int(cast(int | float | str, payload["max_steps"]))
+            percent = float(cast(int | float | str, payload["percent"]))
+            loss_value = payload.get("loss")
+            learning_rate_value = payload.get("learning_rate")
+            loss = float(loss_value) if isinstance(loss_value, int | float) else None
+            learning_rate = float(learning_rate_value) if isinstance(learning_rate_value, int | float) else None
+            return step, max_steps, percent, loss, learning_rate
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            return None
+
+    @staticmethod
+    def _terminate_process(process: subprocess.Popen[str]) -> None:
+        process.terminate()
+        try:
+            process.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()

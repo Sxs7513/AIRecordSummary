@@ -122,6 +122,7 @@ class QwenHfSubprocessRuntime:
         base_model_name: str,
         model_cache_root: Path,
         adapter_path: Path | None,
+        context: str = "",
         max_new_tokens: int = 4096,
     ) -> None:
         if not python_bin.is_file():
@@ -139,6 +140,7 @@ class QwenHfSubprocessRuntime:
         ]
         if adapter_path is not None:
             command.extend(("--adapter-path", str(adapter_path)))
+        self._context = context
         # The handle intentionally remains open for the lifetime of the child process.
         self._stderr_file = cast(
             TextIO,
@@ -173,6 +175,7 @@ class QwenHfSubprocessRuntime:
             "id": self._request_id,
             "audio": str(audio_path),
             "language": language,
+            "prompt": self._context,
         }
         self._process.stdin.write(json.dumps(request, ensure_ascii=False, separators=(",", ":")) + "\n")
         self._process.stdin.flush()
@@ -225,7 +228,8 @@ def build_asr_runtime(
     storage_root: Path,
     model_cache_root: Path,
     hf_runtime_python: Path | None = None,
-    hf_runtime_module: str = "airecord_qwen_asr_trainer",
+    hf_runtime_module: str = "qwen_asr_lora",
+    context: str = "",
 ) -> AsrRuntime:
     runtime_config = model.get("runtime_config")
     provider = cast(Mapping[str, object], runtime_config).get("provider") if isinstance(runtime_config, Mapping) else None
@@ -247,9 +251,11 @@ def build_asr_runtime(
             base_model_name=str(model["base_model_name"]),
             model_cache_root=model_cache_root,
             adapter_path=adapter_path,
+            context=context,
         )
     return QwenAsrRuntime(
         base_model_name=str(model["base_model_name"]),
         model_cache_root=model_cache_root,
         adapter_path=adapter_path,
+        context=context,
     )

@@ -25,9 +25,9 @@
 - `sql/evaluation.sql`：评测、训练和模型版本独立 schema；
 - `backend/packages/l2_core/evaluation`：通用评测与数据版本边界；
 - `backend/packages/l2_core/asr_lab`：标注、冻结和训练任务编排边界；
-- `backend/L2-Core/trainers/qwen-asr-lora`：独立 HF Trainer，使用 `Qwen/Qwen3-ASR-1.7B-hf`；
-- `backend/L3-App/evaluation-api`、`training-api`：拆分后的控制面 API；
-- `backend/L3-App/asr-compute-worker`：统一单 GPU 评测与训练调度入口；
+- `backend/packages/l2_core/trainers/qwen-asr-lora`：独立 HF Trainer，使用 `Qwen/Qwen3-ASR-1.7B-hf`；
+- `backend/packages/l3_app/evaluation-api`、`training-api`：拆分后的控制面 API；
+- `backend/packages/l3_app/training-api`：训练控制面，并在 lifespan 内运行统一单 GPU 评测与训练 worker；
 - `app/asr-lab` 和 `components/asr-lab`：数据标注、模型评测和训练记录页面。
 
 启动顺序：
@@ -36,9 +36,7 @@
 npm run db:init
 npm run db:init:evaluation
 npm run dev
-
-# 独立终端
-npm run worker:asr-lab
+npm run dev:training-api
 ```
 
 真实 LoRA 训练依赖由 Trainer 自己的 `pyproject.toml` 和 `.venv` 管理，包括
@@ -101,7 +99,7 @@ backend/packages/l2_core/asr_lab/
 ├── training.py
 └── model_registry.py
 
-backend/L3-App/shared-api/src/routes/
+backend/packages/l3_app/shared-api/routes/
 ├── evaluation_datasets.py
 ├── evaluation_runs.py
 ├── training_runs.py

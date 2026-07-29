@@ -18,12 +18,17 @@ def _find_repository_root() -> Path:
 
 REPOSITORY_ROOT = _find_repository_root()
 ROOT_ENV_FILE = REPOSITORY_ROOT / ".env"
+ROOT_ENV_LOCAL_FILE = REPOSITORY_ROOT / ".env.local"
 
 
 class Settings(BaseSettings):
     """Typed adapter for the repository-root .env configuration."""
 
-    model_config = SettingsConfigDict(env_file=ROOT_ENV_FILE, env_file_encoding="utf-8", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_file=(ROOT_ENV_FILE, ROOT_ENV_LOCAL_FILE),
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
 
     app_name: str = "AI Record Summary API"
     app_env: str = "development"
@@ -37,6 +42,10 @@ class Settings(BaseSettings):
     db_ssl: bool = Field(validation_alias="DB_SSL")
     database_url: str | None = Field(default=None, validation_alias="DATABASE_URL")
     local_storage_root: Path = Field(validation_alias="LOCAL_STORAGE_ROOT")
+    asr_lab_project_dataset_root: Path = Field(
+        default=Path("datasets/asr-encrypted"),
+        validation_alias="ASR_LAB_PROJECT_DATASET_ROOT",
+    )
     audio_model_cache_root: Path = Field(default=Path("model-cache"), validation_alias="AUDIO_MODEL_CACHE_ROOT")
     asr_provider: Literal["qwen_asr", "funasr_nano"] = Field(default="qwen_asr", validation_alias="ASR_PROVIDER")
     qwen_asr_model: str = Field(default="Qwen/Qwen3-ASR-1.7B", validation_alias="QWEN_ASR_MODEL")
@@ -47,10 +56,10 @@ class Settings(BaseSettings):
     qwen_asr_max_context_items: int = Field(default=200, ge=0, validation_alias="QWEN_ASR_MAX_CONTEXT_ITEMS")
     qwen_asr_max_inference_batch_size: int = Field(default=4, ge=1, validation_alias="QWEN_ASR_MAX_INFERENCE_BATCH_SIZE")
     asr_lab_training_python_bin: Path = Field(
-        default=Path("backend/L2-Core/trainers/qwen-asr-lora/.venv/bin/python"),
+        default=Path("backend/packages/l2_core/trainers/qwen-asr-lora/.venv/bin/python"),
         validation_alias="ASR_LAB_TRAINING_PYTHON_BIN",
     )
-    asr_lab_training_module: str = Field(default="airecord_qwen_asr_trainer", validation_alias="ASR_LAB_TRAINING_MODULE")
+    asr_lab_training_module: str = Field(default="qwen_asr_lora", validation_alias="ASR_LAB_TRAINING_MODULE")
     asr_lab_training_model: str = Field(default="Qwen/Qwen3-ASR-1.7B-hf", validation_alias="ASR_LAB_TRAINING_MODEL")
     asr_lab_worker_poll_seconds: float = Field(default=2.0, ge=0.2, le=60, validation_alias="ASR_LAB_WORKER_POLL_SECONDS")
     qwen_asr_enhance_low_volume_segments: bool = Field(default=True, validation_alias="QWEN_ASR_ENHANCE_LOW_VOLUME_SEGMENTS")
@@ -117,7 +126,6 @@ class Settings(BaseSettings):
     pyannote_model: str = Field(default="pyannote/speaker-diarization-3.1", validation_alias="PYANNOTE_MODEL")
     pyannote_use_local_config: bool = Field(default=True, validation_alias="PYANNOTE_USE_LOCAL_CONFIG")
     pipeline_worker_queue: str = Field(default="cpu", validation_alias="PIPELINE_WORKER_QUEUE")
-    pipeline_embedded_workers_enabled: bool = Field(default=True, validation_alias="PIPELINE_EMBEDDED_WORKERS_ENABLED")
     session_cookie_name: str = Field(default="ai_record_summary_session", validation_alias="SESSION_COOKIE_NAME")
     session_ttl_days: int = Field(default=14, ge=1, le=90, validation_alias="SESSION_TTL_DAYS")
     session_cookie_secure: bool = Field(default=False, validation_alias="SESSION_COOKIE_SECURE")
@@ -157,6 +165,12 @@ class Settings(BaseSettings):
         return (REPOSITORY_ROOT / self.local_storage_root).resolve()
 
     @property
+    def resolved_asr_lab_project_dataset_root(self) -> Path:
+        if self.asr_lab_project_dataset_root.is_absolute():
+            return self.asr_lab_project_dataset_root
+        return (REPOSITORY_ROOT / self.asr_lab_project_dataset_root).resolve()
+
+    @property
     def resolved_whisper_initial_prompt_config(self) -> Path:
         if self.whisper_initial_prompt_config.is_absolute():
             return self.whisper_initial_prompt_config
@@ -176,7 +190,12 @@ class Settings(BaseSettings):
 
     @property
     def resolved_asr_lab_training_python_bin(self) -> Path:
-        return self._resolve_repository_path(self.asr_lab_training_python_bin)
+        value = self.asr_lab_training_python_bin
+        candidate = value if value.is_absolute() else REPOSITORY_ROOT / value
+        # A venv's Python executable is normally a symlink to the base
+        # interpreter. Resolving that symlink would bypass the venv's
+        # site-packages when the executable is passed to subprocess.
+        return candidate.absolute()
 
     @property
     def resolved_funasr_nano_cache_dir(self) -> Path:

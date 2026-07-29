@@ -6,7 +6,10 @@ const evaluationApiOrigin = process.env.NEXT_PUBLIC_EVALUATION_API_ORIGIN ?? "ht
 const trainingApiOrigin = process.env.NEXT_PUBLIC_TRAINING_API_ORIGIN ?? "http://localhost:8002";
 
 function asrLabApiUrl(path: string): string {
-  const origin = path.startsWith("/api/training-runs") ? trainingApiOrigin : evaluationApiOrigin;
+  const usesTrainingApi =
+    path.startsWith("/api/training-runs") ||
+    path.startsWith("/api/model-versions");
+  const origin = usesTrainingApi ? trainingApiOrigin : evaluationApiOrigin;
   return `${origin}${path}`;
 }
 

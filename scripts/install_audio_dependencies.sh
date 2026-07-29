@@ -4,7 +4,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VENV_DIR="${ROOT_DIR}/backend/.venv"
-QWEN_ASR_TRAINER_DIR="${ROOT_DIR}/backend/L2-Core/trainers/qwen-asr-lora"
+QWEN_ASR_TRAINER_DIR="${ROOT_DIR}/backend/packages/l2_core/trainers/qwen-asr-lora"
 QWEN_ASR_TRAINER_VENV="${QWEN_ASR_TRAINER_DIR}/.venv"
 PIP_CONSTRAINTS_FILE="${ROOT_DIR}/scripts/audio-python-constraints.txt"
 PYTHON_BIN_DEFAULT="python3.14"
@@ -116,27 +116,31 @@ start_postgresql_with_pg_ctl() {
 }
 
 load_env_file() {
-  local env_file="${ROOT_DIR}/.env"
-  if [[ ! -f "${env_file}" ]]; then
-    return
-  fi
-
-  while IFS= read -r line || [[ -n "${line}" ]]; do
-    line="${line#"${line%%[![:space:]]*}"}"
-    line="${line%"${line##*[![:space:]]}"}"
-    if [[ -z "${line}" || "${line}" == \#* || "${line}" != *=* ]]; then
+  local env_file
+  # Read the local override first so the existing "only when unset" behavior
+  # preserves both shell-environment precedence and .env.local precedence.
+  for env_file in "${ROOT_DIR}/.env.local" "${ROOT_DIR}/.env"; do
+    if [[ ! -f "${env_file}" ]]; then
       continue
     fi
-    local key="${line%%=*}"
-    local value="${line#*=}"
-    value="${value%\"}"
-    value="${value#\"}"
-    value="${value%\'}"
-    value="${value#\'}"
-    if [[ -z "${!key+x}" ]]; then
-      export "${key}=${value}"
-    fi
-  done <"${env_file}"
+
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+      line="${line#"${line%%[![:space:]]*}"}"
+      line="${line%"${line##*[![:space:]]}"}"
+      if [[ -z "${line}" || "${line}" == \#* || "${line}" != *=* ]]; then
+        continue
+      fi
+      local key="${line%%=*}"
+      local value="${line#*=}"
+      value="${value%\"}"
+      value="${value#\"}"
+      value="${value%\'}"
+      value="${value#\'}"
+      if [[ -z "${!key+x}" ]]; then
+        export "${key}=${value}"
+      fi
+    done <"${env_file}"
+  done
 
   LLM_CORRECTION_ENABLED="${LLM_CORRECTION_ENABLED:-false}"
   LLM_CORRECTION_MODEL_REPO="${LLM_CORRECTION_MODEL_REPO:-Qwen/Qwen2.5-7B-Instruct-GGUF}"
