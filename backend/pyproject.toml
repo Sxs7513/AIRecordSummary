@@ -8,20 +8,22 @@ version = "0.1.0"
 description = "Python backend for AI Record Summary"
 requires-python = ">=3.14.4,<3.15"
 dependencies = [
+  "aiokafka>=0.12,<1",
   "cryptography>=45,<50",
   "fastapi>=0.120,<1",
+  "httpx>=0.28,<1",
   "langchain>=1,<2",
   "langgraph>=1,<2",
   "python-multipart>=0.0.20,<1",
   "psycopg[binary]>=3.2,<4",
   "pydantic-settings>=2.10,<3",
+  "redis>=6,<8",
   "sqlalchemy>=2.0.40,<3",
   "uvicorn[standard]>=0.38,<1",
 ]
 
 [project.optional-dependencies]
 dev = [
-  "httpx>=0.28,<1",
   "pytest>=8.4,<9",
   "pytest-cov>=6.2,<7",
   "pyright>=1.1.400,<2",
@@ -52,10 +54,13 @@ exclude = [
 ]
 extraPaths = [
   "packages",
-  "packages/l3_app/shared-api",
   "packages/l3_app/production-api",
   "packages/l3_app/evaluation-api",
   "packages/l3_app/training-api",
+  "packages/l3_app/observability-api",
+  "packages/l3_app/observability_worker",
+  "packages/l3_app/generation_worker",
+  "packages/l3_app/processing_worker",
 ]
 venvPath = "."
 venv = ".venv"
@@ -73,11 +78,12 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 known-first-party = [
   "access",
   "app_factory",
-  "dependencies",
+  "evaluation_dependencies",
   "l1_foundation",
   "l2_core",
-  "router",
-  "routes",
+  "l3_app",
+  "production_dependencies",
+  "training_dependencies",
   "scripts",
 ]
 
@@ -86,10 +92,10 @@ testpaths = ["tests"]
 pythonpath = [
   ".",
   "packages",
-  "packages/l3_app/shared-api",
   "packages/l3_app/production-api",
   "packages/l3_app/evaluation-api",
   "packages/l3_app/training-api",
+  "packages/l3_app/observability-api",
 ]
 addopts = "-q"
 markers = ["integration: opt-in tests that require local audio models"]

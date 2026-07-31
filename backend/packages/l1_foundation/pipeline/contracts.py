@@ -7,7 +7,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, Field
 
-from l1_foundation.task_runtime.resources import ResourceQueue, RetryPolicy
+from l1_foundation.task_runtime.resources import RetryPolicy
 
 PipelineSubjectId = NewType("PipelineSubjectId", UUID)
 PipelineRunId = NewType("PipelineRunId", UUID)
@@ -68,13 +68,12 @@ class StageContext:
 @dataclass(frozen=True, slots=True)
 class StageResult[OutputT]:
     output: OutputT
-    artifacts: tuple[ArtifactPayload, ...] = ()
+    artifacts: tuple[ArtifactPayload | ArtifactRef, ...] = ()
 
 
 class Stage[InputT, OutputT](Protocol):
     name: str
     version: str
-    resource_queue: ResourceQueue
     retry_policy: RetryPolicy
 
     async def run(self, context: StageContext, input_payload: InputT) -> StageResult[OutputT]: ...

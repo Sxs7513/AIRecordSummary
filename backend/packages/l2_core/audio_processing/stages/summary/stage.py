@@ -1,25 +1,32 @@
 from __future__ import annotations
 
-import gc
 import json
 import logging
 import re
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from asyncio import to_thread
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from importlib import import_module
 from pathlib import Path
-from typing import Any, Protocol, cast
+from typing import cast
 from uuid import UUID
 
-from l1_foundation.pipeline.contracts import ArtifactPayload, ResourceQueue, RetryPolicy, StageContext, StageResult
+from l1_foundation.llm import (
+    ChatMessage,
+    ChatRole,
+    CompletionOptions,
+    LlmGenerateResult,
+    LlmProvider,
+    build_llm_generate_command,
+)
+from l1_foundation.pipeline.contracts import ArtifactPayload, RetryPolicy, StageContext, StageResult
 from l1_foundation.pipeline.runtime.artifact_store import ArtifactStore
+from l1_foundation.worker import SyncWorkerClient
 from l2_core.audio_processing.stages.recording_models import GenerateSummaryInput, RecordingSummaryOutput, Utterance, UtterancesOutput
 from l2_core.audio_processing.stages.summary.generation import create_pipeline_summary_generation
-from l2_core.generation.emitter import StreamEmitter
-from l2_core.generation.local_llm_runtime import local_llm_inference_lock
+from l2_core.generation.event_sink import GenerationEventSink
 from l2_core.generation.service import GenerationService
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("audio_processing")
 
 DEFAULT_SYSTEM_PROMPT = """请总结这段录音，只能根据录音文本写，不要编造。
 开头先写一个全局总结，用 1-2 段话说明这段录音整体在讨论什么、最重要的结论或结果是什么。
@@ -30,21 +37,6 @@ DEFAULT_SYSTEM_PROMPT = """请总结这段录音，只能根据录音文本写�
 每段都要保留具体事情、数字、结论和待办，不要只写空泛概括。
 用自然的大白话写，不要写成报告腔，也不要只写空泛概括。
 用 Markdown 输出。不要使用代码块或缩进代码格式。不要输出思考过程，不要输出 JSON。"""
-STOP_TOKENS = ["</s>", "<|im_end|>"]
-
-
-class LlamaModel(Protocol):
-    def __call__(self, prompt: str, **kwargs: object) -> Mapping[str, object] | Iterable[Mapping[str, object]]: ...
-
-    def close(self) -> None: ...
-
-
-class LlamaFactory(Protocol):
-    def __call__(self, *, model_path: str, n_ctx: int, n_gpu_layers: int, verbose: bool) -> LlamaModel: ...
-
-
-class LlamaCppModule(Protocol):
-    Llama: LlamaFactory
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,14 +91,15 @@ class GenerateSummaryStage:
 
     name = "generate_summary"
     version = "2"
-    resource_queue = ResourceQueue.GPU_NORMAL
     retry_policy = RetryPolicy(initial_backoff_seconds=30)
     input_model = GenerateSummaryInput
 
     def __init__(
         self,
         artifact_store: ArtifactStore,
-        model_path: Path,
+        worker_client: SyncWorkerClient,
+        provider: LlmProvider,
+        model_name: str,
         context_size: int,
         prompt_config_path: Path,
         max_output_tokens: int = 4096,
@@ -117,12 +110,13 @@ class GenerateSummaryStage:
         rolling_chunk_max_tokens: int = 1800,
         rolling_memory_max_chars: int = 6000,
         generation_service: GenerationService | None = None,
-        verbose: bool = False,
     ) -> None:
         if context_size <= max_output_tokens:
             raise ValueError("Summary context_size must be greater than max_output_tokens")
         self._artifact_store = artifact_store
-        self._model_path = model_path
+        self._worker_client = worker_client
+        self._provider = provider
+        self._model_name = model_name
         self._context_size = context_size
         self._max_output_tokens = max_output_tokens
         self._rolling_enabled = rolling_enabled
@@ -133,57 +127,45 @@ class GenerateSummaryStage:
         self._rolling_memory_max_chars = rolling_memory_max_chars
         self._system_prompt = self._load_system_prompt(prompt_config_path)
         self._generation_service = generation_service
-        self._verbose = verbose
-        self._model: LlamaModel | None = None
-        self._force_cpu = False
+
+    async def try_restore(self, context: StageContext, _input_payload: GenerateSummaryInput) -> StageResult[RecordingSummaryOutput] | None:
+        return self._artifact_store.try_restore_json(
+            context.pipeline_run_id, context.stage_run_id, self.name, self.version, "summary.recording", RecordingSummaryOutput
+        )
 
     async def run(self, context: StageContext, input_payload: GenerateSummaryInput) -> StageResult[RecordingSummaryOutput]:
         utterances = UtterancesOutput.model_validate(self._artifact_store.read_json(input_payload.utterances)).segments
-        emitter = self._create_emitter(context, input_payload)
-        if emitter is not None:
-            emitter.start()
+        sink = self._create_event_sink(context, input_payload)
+        if sink is not None:
+            sink.start()
         try:
-            output = self.generate(utterances, context.report_progress, emitter)
-            if emitter is not None:
-                emitter.succeed(output.model_dump(mode="json"))
+            output = await to_thread(self.generate, utterances, context.report_progress, sink)
+            if sink is not None:
+                sink.succeed(output.model_dump(mode="json"))
         except Exception as error:
-            if emitter is not None:
-                emitter.fail("summary_generation_failed", str(error), retryable=True)
+            if sink is not None:
+                sink.fail("summary_generation_failed", str(error), retryable=True)
             raise
         return StageResult(output=output, artifacts=(ArtifactPayload(artifact_type="summary.recording", data=output.model_dump(mode="json")),))
 
     def generate(
-        self, utterances: Sequence[Utterance], report_progress: Callable[[int, str], None], emitter: StreamEmitter | None = None
+        self, utterances: Sequence[Utterance], report_progress: Callable[[int, str], None], sink: GenerationEventSink | None = None
     ) -> RecordingSummaryOutput:
         """Generate one summary from materialized utterances without pipeline artifact concerns."""
-        try:
-            if emitter is not None:
-                emitter.phase("preparing", "正在准备录音总结", 1)
-            summary = self._summarize(utterances, report_progress, emitter) if utterances else "暂无可总结的润色文本。"
-            if emitter is not None and not utterances:
-                emitter.text(summary)
-            return RecordingSummaryOutput(provider="local_llm", model_name=self._model_path.name, summary_text=summary)
-        finally:
-            self.release()
+        logger.info(
+            "summary：开始生成 provider=%s model=%s utterances=%d",
+            self._provider.value,
+            self._model_name,
+            len(utterances),
+        )
+        if sink is not None:
+            sink.phase("preparing", "正在准备录音总结", 1)
+        summary = self._summarize(utterances, report_progress, sink) if utterances else "暂无可总结的润色文本。"
+        if sink is not None and not utterances:
+            sink.text(summary)
+        return RecordingSummaryOutput(provider=self._provider.value, model_name=self._model_name, summary_text=summary)
 
-    def release(self) -> None:
-        with local_llm_inference_lock:
-            model = self._model
-            self._model = None
-            self._force_cpu = False
-            if model is None:
-                gc.collect()
-                return
-            try:
-                model.close()
-            except Exception as error:
-                logger.warning("summary：模型引用已释放，但 llama.cpp close 失败：%s", error)
-            finally:
-                del model
-                gc.collect()
-        logger.info("summary：模型已释放")
-
-    def _create_emitter(self, context: StageContext, input_payload: GenerateSummaryInput) -> StreamEmitter | None:
+    def _create_event_sink(self, context: StageContext, input_payload: GenerateSummaryInput) -> GenerationEventSink | None:
         if self._generation_service is None:
             return None
         run = create_pipeline_summary_generation(
@@ -193,26 +175,34 @@ class GenerateSummaryStage:
             context.attempt_count,
             {"utterances_artifact": input_payload.utterances.model_dump(mode="json"), "strategy": "rolling" if self._rolling_enabled else "large_context"},
         )
-        return self._generation_service.emitter(run.id)
+        return self._generation_service.event_sink(run.id)
 
-    def _summarize(self, utterances: Sequence[Utterance], report_progress: Callable[[int, str], None], emitter: StreamEmitter | None) -> str:
+    def _summarize(self, utterances: Sequence[Utterance], report_progress: Callable[[int, str], None], sink: GenerationEventSink | None) -> str:
         if self.should_use_rolling_summary(utterances):
             chunks = self.build_rolling_chunks(utterances)
             logger.info("summary：使用滚动总结，片段数=%d", len(chunks))
             report_progress(5, f"滚动总结：准备 {len(chunks)} 个片段")
-            if emitter is not None:
-                emitter.phase("summarizing", f"正在整理 {len(chunks)} 个录音片段", 5)
-            self._load_model()
-            return self._run_rolling_summary(chunks, report_progress, emitter)
+            if self._provider == LlmProvider.LOCAL:
+                report_progress(8, "加载总结模型")
+            if sink is not None:
+                sink.phase("summarizing", f"正在整理 {len(chunks)} 个录音片段", 5)
+            return self._run_rolling_summary(chunks, report_progress, sink)
         summarized_utterances = self._truncate_utterances(utterances, self._input_char_budget())
-        logger.info("summary：使用 %d token 大上下文单次总结，发言段数=%d", self._context_size, len(summarized_utterances))
-        report_progress(5, f"使用 {self._context_size} token 大上下文生成总结")
-        report_progress(25, "加载本地总结模型")
-        if emitter is not None:
-            emitter.phase("generating", "正在生成录音总结", 25)
-        self._load_model()
-        prompt = self._build_single_prompt(summarized_utterances)
-        summary = self._complete_with_fallback(prompt, self._max_output_tokens, emitter.text if emitter is not None else None)
+        if self._provider == LlmProvider.LOCAL:
+            logger.info("summary：使用 %d token 大上下文单次总结，发言段数=%d", self._context_size, len(summarized_utterances))
+            report_progress(5, f"使用 {self._context_size} token 大上下文生成总结")
+        else:
+            logger.info(
+                "summary：使用在线模型单次总结 provider=%s，发言段数=%d",
+                self._provider.value,
+                len(summarized_utterances),
+            )
+            report_progress(5, "准备生成录音总结")
+        report_progress(25, "加载总结模型" if self._provider == LlmProvider.LOCAL else "开始生成录音总结")
+        if sink is not None:
+            sink.phase("generating", "正在生成录音总结", 25)
+        messages = self._build_single_prompt(summarized_utterances)
+        summary = self._complete_text(messages, self._max_output_tokens, sink.text if sink is not None else None)
         report_progress(95, "整理总结结果")
         return summary
 
@@ -248,17 +238,19 @@ class GenerateSummaryStage:
             chunks.append(SummaryChunk(len(chunks) + 1, current_start_ms or current[0].start_ms, current[-1].end_ms, tuple(current)))
         return chunks
 
-    def _run_rolling_summary(self, chunks: Sequence[SummaryChunk], report_progress: Callable[[int, str], None], emitter: StreamEmitter | None) -> str:
+    def _run_rolling_summary(
+        self, chunks: Sequence[SummaryChunk], report_progress: Callable[[int, str], None], sink: GenerationEventSink | None
+    ) -> str:
         memory = ""
         chunk_summaries: list[dict[str, object]] = []
         total = len(chunks)
         for index, chunk in enumerate(chunks, start=1):
             progress = 10 + round(65 * (index - 1) / max(1, total))
             report_progress(progress, f"滚动总结片段 {index}/{total}")
-            if emitter is not None:
-                emitter.phase("summarizing", f"正在整理录音片段 {index}/{total}", progress)
+            if sink is not None:
+                sink.phase("summarizing", f"正在整理录音片段 {index}/{total}", progress)
             logger.info("summary：滚动总结片段 %d/%d", index, total)
-            raw = self._complete_with_fallback(self._build_refine_prompt(chunk, total, memory), self._rolling_chunk_max_tokens)
+            raw = self._complete_text(self._build_refine_prompt(chunk, total, memory), self._rolling_chunk_max_tokens)
             parsed = self._parse_json_object(raw)
             if parsed is None:
                 chunk_summary = raw
@@ -275,87 +267,59 @@ class GenerateSummaryStage:
                 }
             )
         report_progress(80, "汇总滚动总结")
-        if emitter is not None:
-            emitter.phase("generating", "正在生成最终录音总结", 80)
+        if sink is not None:
+            sink.phase("generating", "正在生成最终录音总结", 80)
         final_chunks, final_memory = self._fit_final_inputs(chunk_summaries, memory)
-        summary = self._complete_with_fallback(
-            self._build_final_prompt(final_chunks, final_memory), self._max_output_tokens, emitter.text if emitter is not None else None
+        summary = self._complete_text(
+            self._build_final_prompt(final_chunks, final_memory), self._max_output_tokens, sink.text if sink is not None else None
         )
         report_progress(95, "整理最终总结")
         return summary
 
-    def _complete_with_fallback(self, prompt: str, max_tokens: int, on_delta: Callable[[str], None] | None = None) -> str:
-        try:
-            return self._complete_text(prompt, max_tokens, on_delta)
-        except RuntimeError as error:
-            if self._force_cpu:
-                raise
-            logger.warning("summary：GPU 初始化或推理失败，回退到 CPU：%s", error)
-            self._model = None
-            self._force_cpu = True
-            return self._complete_text(prompt, max_tokens, on_delta)
-
-    def _complete_text(self, prompt: str, max_tokens: int, on_delta: Callable[[str], None] | None = None) -> str:
-        with local_llm_inference_lock:
-            response = self._load_model()(prompt, max_tokens=max_tokens, temperature=0.1, stop=STOP_TOKENS, echo=False, stream=on_delta is not None)
-            if isinstance(response, Mapping):
-                summary = self._completion_text(cast(Mapping[str, object], response))
-                if on_delta is not None:
-                    logger.warning("summary：llama-cpp 未返回迭代式 stream，最终文本只能一次性写入消息流")
-                    on_delta(summary)
-                return summary
-            safe_stream = SafeTextStream(on_delta) if on_delta is not None else None
-            chunks: list[str] = []
-            for chunk in response:
-                text = self._completion_text(chunk, allow_empty=True)
-                chunks.append(text)
-                if safe_stream is not None:
-                    safe_stream.feed(text)
-        if safe_stream is not None:
-            safe_stream.finish()
-        summary = self._strip_thinking("".join(chunks))
+    def _complete_text(
+        self,
+        messages: Sequence[ChatMessage],
+        max_tokens: int,
+        on_delta: Callable[[str], None] | None = None,
+    ) -> str:
+        options = CompletionOptions(max_tokens=max_tokens, temperature=0.1)
+        if on_delta is None:
+            result = self._worker_client.execute(
+                build_llm_generate_command(
+                    self._provider,
+                    messages,
+                    options,
+                    context_size=self._context_size,
+                    stream=False,
+                ),
+                result_type=LlmGenerateResult,
+            )
+            return self._strip_thinking(result.text)
+        safe_stream = SafeTextStream(on_delta)
+        result = self._worker_client.execute_streaming(
+            build_llm_generate_command(
+                self._provider,
+                messages,
+                options,
+                context_size=self._context_size,
+                stream=True,
+            ),
+            result_type=LlmGenerateResult,
+            on_delta=safe_stream.feed,
+        )
+        safe_stream.finish()
+        summary = self._strip_thinking(result.text)
         if not summary:
-            raise RuntimeError("Local summary model returned an empty completion")
+            raise RuntimeError("Summary model returned an empty completion")
         return summary
 
-    @staticmethod
-    def _completion_text(response: Mapping[str, object], allow_empty: bool = False) -> str:
-        choices = response.get("choices")
-        if not isinstance(choices, list) or not choices or not isinstance(choices[0], Mapping):
-            if allow_empty:
-                return ""
-            raise RuntimeError("Local summary model returned no completion")
-        choice = cast(Mapping[str, object], choices[0])
-        return str(choice.get("text") or "")
+    def _build_single_prompt(self, utterances: Sequence[Utterance]) -> list[ChatMessage]:
+        return [
+            ChatMessage(ChatRole.SYSTEM, self._system_prompt),
+            ChatMessage(ChatRole.USER, f"录音标题：未命名录音\n\n润色后的录音文本：\n{self._format_utterances(utterances)}"),
+        ]
 
-    def _load_model(self) -> LlamaModel:
-        if self._model is not None:
-            return self._model
-        if not self._model_path.is_file():
-            raise FileNotFoundError(f"Local summary model file not found: {self._model_path}")
-        try:
-            module = cast(LlamaCppModule, import_module("llama_cpp"))
-        except ImportError as error:
-            raise RuntimeError("llama-cpp-python is not installed; start the GPU worker with backend/.venv") from error
-        n_gpu_layers = 0 if self._force_cpu else -1
-        try:
-            self._model = module.Llama(model_path=str(self._model_path), n_ctx=self._context_size, n_gpu_layers=n_gpu_layers, verbose=self._verbose)
-        except Exception as error:
-            if self._force_cpu:
-                raise RuntimeError("Unable to initialize the local summary model on CPU") from error
-            self._force_cpu = True
-            return self._load_model()
-        return self._model
-
-    def _build_single_prompt(self, utterances: Sequence[Utterance]) -> str:
-        return self._chat_prompt(
-            [
-                {"role": "system", "content": self._system_prompt},
-                {"role": "user", "content": f"录音标题：未命名录音\n\n润色后的录音文本：\n{self._format_utterances(utterances)}"},
-            ]
-        )
-
-    def _build_refine_prompt(self, chunk: SummaryChunk, total_chunks: int, memory: str) -> str:
+    def _build_refine_prompt(self, chunk: SummaryChunk, total_chunks: int, memory: str) -> list[ChatMessage]:
         system = (
             f"{self._system_prompt}\n"
             "你正在做滚动记忆式长录音总结。必须基于当前片段和前文滚动记忆，不能编造。\n"
@@ -368,9 +332,9 @@ class GenerateSummaryStage:
             f"录音标题：未命名录音\n当前片段：{chunk.index}/{total_chunks}，时间范围：{self._format_ms(chunk.start_ms)}-{self._format_ms(chunk.end_ms)}\n\n"
             f"前文滚动记忆：\n{memory or '无'}\n\n当前片段文本：\n{self._format_utterances(chunk.utterances)}"
         )
-        return self._chat_prompt([{"role": "system", "content": system}, {"role": "user", "content": user}])
+        return [ChatMessage(ChatRole.SYSTEM, system), ChatMessage(ChatRole.USER, user)]
 
-    def _build_final_prompt(self, chunk_summaries: Sequence[Mapping[str, object]], memory: str) -> str:
+    def _build_final_prompt(self, chunk_summaries: Sequence[Mapping[str, object]], memory: str) -> list[ChatMessage]:
         summaries = "\n\n".join(f"片段 {item['index']} [{item['time_range']}]\n{item['summary']}" for item in chunk_summaries)
         system = (
             f"{self._system_prompt}\n"
@@ -384,31 +348,7 @@ class GenerateSummaryStage:
             "不要输出 <think>，不要输出 JSON，不要编造。"
         )
         user = f"录音标题：未命名录音\n\n最终滚动记忆：\n{memory or '无'}\n\n片段总结：\n{summaries}\n\n输出最终总结，不要把长录音压缩成很短一段。"
-        return self._chat_prompt([{"role": "system", "content": system}, {"role": "user", "content": user}])
-
-    def _chat_prompt(self, messages: Sequence[dict[str, str]]) -> str:
-        model = self._model
-        if model is not None:
-            template = getattr(model, "metadata", {}).get("tokenizer.chat_template")
-            if isinstance(template, str) and template:
-                try:
-                    formatter_module = import_module("llama_cpp.llama_chat_format")
-                    formatter_factory = formatter_module.Jinja2ChatFormatter
-                    concrete_model = cast(Any, model)
-                    eos_token_id = concrete_model.token_eos()
-                    bos_token_id = concrete_model.token_bos()
-                    eos_token = concrete_model._model.token_get_text(eos_token_id) if eos_token_id != -1 else "<|im_end|>"
-                    bos_token = concrete_model._model.token_get_text(bos_token_id) if bos_token_id != -1 else ""
-                    formatter = formatter_factory(
-                        template=template,
-                        eos_token=eos_token,
-                        bos_token=bos_token,
-                        stop_token_ids=[eos_token_id] if eos_token_id != -1 else None,
-                    )
-                    return str(formatter(messages=messages, enable_thinking=False).prompt)
-                except Exception:
-                    logger.debug("summary：模型 chat template 不可用，回退 ChatML", exc_info=True)
-        return "".join(f"<|im_start|>{message['role']}\n{message['content'].strip()}\n<|im_end|>\n" for message in messages) + "<|im_start|>assistant\n"
+        return [ChatMessage(ChatRole.SYSTEM, system), ChatMessage(ChatRole.USER, user)]
 
     def _fit_final_inputs(self, chunk_summaries: Sequence[dict[str, object]], memory: str) -> tuple[list[dict[str, object]], str]:
         budget = max(4000, self._context_size - self._max_output_tokens - 1600)

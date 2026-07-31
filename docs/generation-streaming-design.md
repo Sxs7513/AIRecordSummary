@@ -1,5 +1,7 @@
 # 通用生成任务与流式消息设计
 
+> 文档状态：历史实现设计。Redis + Kafka 目标架构已经替代本文中的 PostgreSQL `generation_events`、进程内 `GenerationStreamHub`、数据库 sequence 和“第一版不引入 Redis”等结论。新实现以 Redis Streams 承载 delta/SSE，以 Kafka 承载 Generation 命令和可靠终态，以 PostgreSQL 保存最终结果投影。参见 [`redis-kafka-architecture-refactor.md`](./redis-kafka-architecture-refactor.md)。本文仅保留用于理解现有代码和迁移来源。
+
 ## 1. 目标与范围
 
 系统中的本地 LLM 生成不能分别为录音总结、录音问答各自实现一套流式逻辑。它们都应使用统一的 **Generation** 基础设施：
@@ -24,7 +26,7 @@
       GenerationExecutor
              │ llama-cpp / 其他 provider 的 token stream
              ▼
-        StreamEmitter
+     GenerationEventSink
         ├── 进程内缓冲与实时发布
         └── 批量持久化快照与事件
              │
@@ -37,7 +39,7 @@
 
 - `GenerationService`：创建、查询、取消 Generation Run，负责幂等键和状态转换。
 - `GenerationExecutor`：按任务类型调用模型；不直接操作 HTTP/SSE。
-- `StreamEmitter`：将 provider 的 token、阶段变化和最终结果转换为统一事件，并批量持久化。
+- `GenerationEventSink`：将 provider 的 token、阶段变化和最终结果转换为统一 Generation 事件，并写入运行时流。
 - `GenerationEventStore`：保存可恢复快照和顺序事件。
 - `GenerationStreamHub`：同一进程内把新事件即时通知 SSE 订阅者。
 - 前端 SDK：恢复快照、按序消费增量、处理连接状态；不包含具体问答或总结页面 UI。
@@ -48,15 +50,15 @@
 backend/packages/l2_core/generation/
 ├── contracts.py  # run、事件 envelope、block 与状态的类型契约
 ├── store.py      # PostgreSQL 快照、事件与 sequence 的原子读写
-├── emitter.py    # 模型回调 -> 批量 content.delta / phase / 终态事件
+├── event_sink.py # 模型回调 -> 批量 content.delta / phase / 终态事件
 ├── hub.py        # 单进程实时订阅者广播；不保存业务状态
-├── service.py    # 调用方唯一入口：创建、查询、取消与 emitter 构造
+├── service.py    # 调用方唯一入口：创建、查询、取消与 event sink 构造
 └── __init__.py
 
-backend/packages/l3_app/shared-api/routes/generations.py  # GET run、HTTP SSE 续传和取消接口
+backend/packages/l3_app/production-api/generations_routes.py  # GET run、HTTP SSE 续传和取消接口
 ```
 
-`audio_processing/stages/generate_summary.py` 只作为 `recording_summary` 的适配器：创建关联 run、向 `StreamEmitter` 报告阶段和最终文本；它不直接处理 SSE、数据库 sequence 或前端连接。未来的 `rag_answer` 执行器也只需要调用同一 `GenerationService`。
+`audio_processing/stages/generate_summary.py` 只作为 `recording_summary` 的适配器：创建关联 run、向 `GenerationEventSink` 报告阶段和最终文本；它不直接处理 SSE、数据库 sequence 或前端连接。未来的 `rag_answer` 执行器也只需要调用同一 `GenerationService`。
 
 ## 3. Generation Run 数据模型
 
@@ -205,7 +207,7 @@ Markdown 的流式增量使用内容 block，而非顶层 text：
 }
 ```
 
-`StreamEmitter` 不按 token 逐条写数据库。它在内存中聚合 token，达到 **500ms** 或 **约 500 字符** 时，写一个 `content.delta`：将 blocks 追加到 `output_blocks`，递增 run 的 `last_sequence`，插入对应 event，并向实时订阅者发布。
+`GenerationEventSink` 不按 token 逐条写入 Redis。它在内存中聚合 token，达到 **500ms** 或 **约 500 字符** 时，写一个 `content.delta`，同时更新 Generation 运行时快照。
 
 ### 5.3 问答与总结的内容组合
 
@@ -344,7 +346,7 @@ gpu_interactive（问答）
 
 ## 11. 实施顺序
 
-1. 新增 Generation 数据表、类型模型、事件存储和 `StreamEmitter`，并为 sequence/快照原子性编写测试。
+1. 新增 Generation 类型模型、事件存储和 `GenerationEventSink`，并为 sequence/快照原子性编写测试。
 2. 实现 Python SSE API 和 `app/sdk/generation/`；覆盖网络续传、页面刷新快照恢复、重复 event 去重。
 3. 将 `generate_summary` 接入 GenerationService，先验证长任务、重试、取消和详情页展示。
 4. 迁移旧 Node RAG stream 到 Python `rag_answer`，保留证据、文本增量、最终引用校验。

@@ -16,7 +16,7 @@ export type GenerationEvent = {
   v: 1;
   run_id: string;
   seq: number;
-  type: "snapshot" | "run.status" | "phase" | "content.delta" | "output.final" | "run.error" | "run.cancelled";
+  type: "conversation.ready" | "snapshot" | "run.status" | "phase" | "content.delta" | "output.final" | "run.error" | "run.cancelled";
   at: string;
   data: Record<string, unknown>;
 };

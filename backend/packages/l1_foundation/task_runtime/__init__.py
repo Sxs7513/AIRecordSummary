@@ -1,1 +1,1 @@
-"""Business-agnostic resource task scheduling and execution runtime."""
+"""Business-agnostic resource labels and retry policies."""

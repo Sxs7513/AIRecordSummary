@@ -20,3 +20,15 @@ export const sendMessage = (conversationId: string, text: string, clientMessageI
   `/api/conversations/${encodeURIComponent(conversationId)}/messages`,
   { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ content_blocks: [{ type: "text", value: text }], client_message_id: clientMessageId }) }
 );
+export const restartGeneration = (
+  conversationId: string,
+  generationRunId: string,
+  mode: "resume" | "regenerate",
+) => request<ConversationTurn>(
+  `/api/conversations/${encodeURIComponent(conversationId)}/generations/${encodeURIComponent(generationRunId)}/resume`,
+  {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ client_request_id: crypto.randomUUID(), mode }),
+  },
+);

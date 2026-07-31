@@ -372,14 +372,14 @@ build_utterances_and_embedding
 
 ### 7.1 当前问题
 
-当前实现只按最大字符数和最大时间跨度顺序装箱：
+检索分块按 embedding 模型的 tokenizer、最大时间跨度和 utterance 数顺序装箱：
 
 ```text
-加入下一条 utterance
-  → 超过 1200 字或 180 秒时切块
+加入下一句
+  → 最终 retrieval_text 超过 800 token 或 180 秒时，在中英文句号边界切块
 ```
 
-它能保证 chunk 有界，但不能识别话题边界，可能出现：
+主题 detector 先识别连续话题边界，builder 再执行确定性限制，以避免：
 
 - 一个 chunk 同时包含前后两个话题；
 - 一个完整话题被固定长度从中间切断；
@@ -397,6 +397,7 @@ backend/packages/l2_core/audio_processing/stages/build_search_chunks/
 ├── contracts.py
 ├── prompt.py
 ├── detector.py
+├── token_counter.py
 └── builder.py
 ```
 
@@ -406,7 +407,8 @@ backend/packages/l2_core/audio_processing/stages/build_search_chunks/
 - `contracts.py`：主题区间和模型结构化输出。
 - `prompt.py`：主题边界识别 prompt。
 - `detector.py`：调用本地 LLM，校验连续区间。
-- `builder.py`：按主题区间、字符数和时长构建最终 chunk。
+- `token_counter.py`：使用 embedding 模型自带的 tokenizer 统计最终检索文本 token。
+- `builder.py`：按主题区间、token 数和时长构建最终 chunk，优先在 `。` 和 `.` 后切分。
 
 因为节点内部使用本地 LLM，资源队列应从 `CPU` 调整为 `GPU_NORMAL`。确定性 fallback 本身仍在同一个资源任务内执行。
 
@@ -453,16 +455,16 @@ LLM 的任务不是将整篇录音分类后把相同主题全局聚合，而是�
 - 不允许为了主题相似而合并时间不连续的发言；
 - 过大的主题区间仍需由 builder 按硬限制切分。
 
-LLM 输出无效、超时或模型不可用时，回退到现有的字符数 + 时间跨度算法。
+LLM 输出无效、超时或模型不可用时，回退到相同的 token 数 + 时间跨度算法，只是不附加主题信息。
 
 ### 7.4 硬边界
 
 主题区间不能替代确定性限制。最终 builder 始终执行：
 
-- 最大字符数；
+- 最终 `retrieval_text` 的最大 token 数；
 - 最大时间跨度；
 - 最大 utterance 数；
-- 单条超长 utterance 的安全处理；
+- 中英文句号边界优先切分；单个句子自身超长时暂时保持完整；
 - 空文本过滤；
 - 稳定、连续的 `chunk_index`。
 
@@ -538,7 +540,15 @@ summary 失败
 - embedding 重试读取 `build_search_chunks` 的 `search.chunks`。
 - summary 重试读取 `build_utterances` 的 `utterances.final`。
 
-启动时会清理临时 artifact，因此重试链路仍需保留当前的 artifact 恢复策略：当文件缺失时，从上游成功 stage 的持久化 `output_payload` 恢复对应 artifact。
+当前“重试生成向量索引”是一个面向调试的轻量特例，不扩展成通用的定向 DAG 重跑能力：
+
+- API 从 Redis 找到录音当前的 `processing_id`，并复用该运行中成功产出的 `search.chunks` `ArtifactRef`；
+- 命令仍写入现有 `processing.commands`，事件类型为 `processing.embedding-index.requested`，不新增 Topic；
+- `processing-worker` 收到后只调用现有 `embedding_indexing` 节点，保留同一运行中其他节点的状态，也不把整条录音重新标记为处理中；
+- 重复消费时，如果 `embedding_indexing` 已成功则直接跳过；
+- Redis 状态或 `search.chunks` 文件已经失效时，接口返回不可重试，不自动退化成整条音频流水线重跑。
+
+因此该调试入口只在当前 Redis 状态和 artifact 保留期内可用。若以后需要跨清理周期或长期保存的正式重建能力，再单独增加 artifact 持久化/恢复设计，不在当前接口中引入。
 
 ### 9.3 文本校正重跑
 
@@ -564,7 +574,9 @@ TEXT_CORRECTION_UNIT_MAX_GAP_MS=1200
 TEXT_CORRECTION_UNIT_MAX_DURATION_MS=30000
 TEXT_CORRECTION_UNIT_MAX_CHARS=300
 
-# LLM 校正批次
+# LLM 校正
+# 在线 provider 会忽略下面两个批次限制，将全部 ASR windows 放入单次请求；本地 provider 继续分批。
+LLM_CORRECTION_MAX_OUTPUT_TOKENS=65536
 TEXT_CORRECTION_BATCH_MAX_UNITS=16
 TEXT_CORRECTION_BATCH_MAX_CHARS=4000
 TEXT_CORRECTION_CONTEXT_UNITS=1
@@ -576,7 +588,7 @@ UTTERANCE_MAX_CHARS=500
 
 # 检索分块
 SEARCH_CHUNK_TOPIC_DETECTION_ENABLED=true
-SEARCH_CHUNK_MAX_CHARS=1200
+SEARCH_CHUNK_MAX_TOKEN=800
 SEARCH_CHUNK_MAX_DURATION_MS=180000
 SEARCH_CHUNK_MAX_UTTERANCES=30
 RAG_CHUNK_CONTEXT_WINDOW_UTTERANCES=1

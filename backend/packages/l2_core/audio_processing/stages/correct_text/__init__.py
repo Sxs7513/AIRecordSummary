@@ -8,9 +8,11 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Literal, cast
 
-from l1_foundation.pipeline.contracts import ArtifactPayload, ResourceQueue, RetryPolicy, StageContext, StageResult
+from l1_foundation.llm import LlmProvider
+from l1_foundation.pipeline.contracts import ArtifactPayload, RetryPolicy, StageContext, StageResult
 from l1_foundation.pipeline.runtime.artifact_store import ArtifactStore
-from l2_core.audio_processing.stages.correct_text.local_llm import LocalLlmCorrector
+from l1_foundation.worker import SyncWorkerClient
+from l2_core.audio_processing.stages.correct_text.llm import LlmCorrector
 from l2_core.audio_processing.stages.correct_text.pycorrector import correct_texts_with_pycorrector
 from l2_core.audio_processing.stages.recording_models import (
     AsrWindowTranscriptOutput,
@@ -23,32 +25,42 @@ logger = logging.getLogger("audio_processing")
 
 
 class LocalTextCorrector:
-    """Perform correction directly in the GPU worker: pycorrector → rules → local LLM → rules."""
+    """Apply pycorrector, deterministic rules, and the configured L1 LLM provider."""
 
     def __init__(
         self,
-        repository_root: Path,
         pycorrector_enabled: bool,
         llm_enabled: bool,
-        llm_model_repo: str,
-        llm_model_file: str,
+        worker_client: SyncWorkerClient | None,
+        llm_provider: LlmProvider | None,
         llm_context_size: int,
+        llm_model_name: str | None,
         prompt_config_path: Path,
         llm_batch_max_units: int = 16,
         llm_batch_max_chars: int = 4000,
         llm_context_units: int = 1,
+        llm_max_output_tokens: int = 65_536,
     ) -> None:
         self._pycorrector_enabled = pycorrector_enabled
         self._llm_enabled = llm_enabled
         self._prompt_config = self._load_prompt_config(prompt_config_path)
-        self._llm = LocalLlmCorrector(
-            model_path=self._model_path(repository_root, llm_model_repo, llm_model_file),
-            context_size=llm_context_size,
-            prompt_config=self._prompt_config,
-            batch_max_units=llm_batch_max_units,
-            batch_max_chars=llm_batch_max_chars,
-            context_units=llm_context_units,
+        self._llm = (
+            LlmCorrector(
+                worker_client=worker_client,
+                provider=llm_provider,
+                context_size=llm_context_size,
+                model_name=llm_model_name,
+                prompt_config=self._prompt_config,
+                batch_max_units=llm_batch_max_units,
+                batch_max_chars=llm_batch_max_chars,
+                context_units=llm_context_units,
+                max_output_tokens=llm_max_output_tokens,
+            )
+            if llm_enabled and worker_client is not None and llm_provider is not None and llm_model_name is not None
+            else None
         )
+        if llm_enabled and self._llm is None:
+            raise ValueError("worker_client and LLM task configuration are required when llm_enabled is true")
 
     async def correct(
         self,
@@ -56,7 +68,10 @@ class LocalTextCorrector:
         report_progress: Callable[[int, str], None] | None = None,
         speaker_labels: Sequence[str] | None = None,
     ) -> list[str]:
-        report = report_progress or (lambda _percent, _message: None)
+        def ignore_progress(_percent: int, _message: str) -> None:
+            return
+
+        report: Callable[[int, str], None] = report_progress or ignore_progress
         report(5, "清理待润色文本")
         current = [self._clean(text) for text in texts]
         if self._pycorrector_enabled:
@@ -74,29 +89,40 @@ class LocalTextCorrector:
         if not self._llm_enabled:
             report(95, "文本润色完成")
             return current
-        report(45, "加载本地润色模型")
+        llm = self._llm
+        if llm is None:
+            raise RuntimeError("LLM corrector is not configured")
+        is_local_model = llm.provider == LlmProvider.LOCAL
+        logger.info(
+            "文本润色：开始 provider=%s model=%s texts=%d",
+            llm.provider.value,
+            llm.model_name,
+            len(current),
+        )
+        report(45, "加载文本润色模型" if is_local_model else "开始文本润色")
         last_llm_percent = 45
 
         def report_llm_progress(completed: int, total: int) -> None:
             nonlocal last_llm_percent
+            if completed == 0:
+                return
             percent = 50 + round(42 * completed / max(1, total))
             if percent <= last_llm_percent:
                 return
             last_llm_percent = percent
-            message = "本地润色模型加载完成" if completed == 0 else f"LLM 润色文本 {completed}/{total}"
-            report(percent, message)
+            report(percent, f"文本润色 {completed}/{total}")
 
         polished = await self._with_fallback(
-            asyncio.to_thread(self._llm.correct, current, report_llm_progress, speaker_labels),
+            asyncio.to_thread(llm.correct, current, report_llm_progress, speaker_labels),
             current,
-            "local_llm",
+            "llm",
         )
         output = [self._apply_rules(text) for text in polished]
         report(95, "文本润色完成")
         return output
 
     def release(self) -> None:
-        self._llm.release()
+        return
 
     async def _with_fallback(self, operation: Awaitable[list[str]], fallback: list[str], provider: str) -> list[str]:
         try:
@@ -104,13 +130,6 @@ class LocalTextCorrector:
         except Exception:
             logger.exception("文本校正：%s 执行失败，保留上一阶段结果", provider)
             return fallback
-
-    @staticmethod
-    def _model_path(repository_root: Path, model_repo: str, model_file: str) -> Path:
-        first_file = model_file.split(",", maxsplit=1)[0].strip()
-        if not first_file:
-            raise ValueError("LLM_CORRECTION_MODEL_FILE must contain a model filename")
-        return repository_root.resolve() / "model-cache/llm-correction" / model_repo.replace("/", "__") / first_file
 
     def _protected_terms(self) -> list[str]:
         values = self._config_strings("hotwords") + self._config_strings("people")
@@ -159,11 +178,10 @@ class LocalTextCorrector:
 
 
 class CorrectAsrWindowsStage:
-    """Conservatively correct each ASR window before it is forced-aligned."""
+    """Moderately correct each ASR window before it is forced-aligned."""
 
     name = "correct_asr_windows"
-    version = "1"
-    resource_queue = ResourceQueue.GPU_NORMAL
+    version = "4"
     retry_policy = RetryPolicy(initial_backoff_seconds=30)
     input_model = CorrectAsrWindowsInput
 
@@ -171,15 +189,29 @@ class CorrectAsrWindowsStage:
         self,
         artifact_store: ArtifactStore,
         corrector: LocalTextCorrector,
-        provider: Literal["pycorrector_llm", "pycorrector", "rules"],
+        provider: Literal["pycorrector_llm", "pycorrector", "llm", "rules"],
         model_name: str | None,
-        max_edit_ratio: float = 0.25,
+        max_edit_ratio: float = 0.35,
     ) -> None:
         self._artifact_store = artifact_store
         self._corrector = corrector
-        self._provider = provider
+        self._provider: Literal["pycorrector_llm", "pycorrector", "llm", "rules"] = provider
         self._model_name = model_name
         self._max_edit_ratio = max_edit_ratio
+
+    async def try_restore(
+        self,
+        context: StageContext,
+        _input_payload: CorrectAsrWindowsInput,
+    ) -> StageResult[CorrectedAsrWindowTranscriptOutput] | None:
+        return self._artifact_store.try_restore_json(
+            context.pipeline_run_id,
+            context.stage_run_id,
+            self.name,
+            self.version,
+            "transcript.corrected_windows",
+            CorrectedAsrWindowTranscriptOutput,
+        )
 
     async def run(self, context: StageContext, input_payload: CorrectAsrWindowsInput) -> StageResult[CorrectedAsrWindowTranscriptOutput]:
         raw = AsrWindowTranscriptOutput.model_validate(self._artifact_store.read_json(input_payload.transcript))
@@ -189,9 +221,15 @@ class CorrectAsrWindowsStage:
                 raise ValueError("Window corrector did not preserve window count")
             windows: list[CorrectedAsrWindowTranscript] = []
             for item, corrected in zip(raw.windows, texts, strict=True):
-                final_text = corrected if self._edit_ratio(item.text, corrected) <= self._max_edit_ratio else item.text
+                edit_ratio = self._edit_ratio(item.text, corrected)
+                final_text = corrected if edit_ratio <= self._max_edit_ratio else item.text
                 if final_text == item.text and corrected != item.text:
-                    logger.warning("窗口文本校正变更过大，回退 ASR 原文：window=%d", item.window_index)
+                    logger.warning(
+                        "窗口文本校正变更过大，回退 ASR 原文：window=%d edit_ratio=%.3f max_edit_ratio=%.3f",
+                        item.window_index,
+                        edit_ratio,
+                        self._max_edit_ratio,
+                    )
                 windows.append(CorrectedAsrWindowTranscript(**item.model_dump(exclude={"text"}), original_text=item.text, text=final_text))
             output = CorrectedAsrWindowTranscriptOutput(
                 asr_provider=raw.provider,

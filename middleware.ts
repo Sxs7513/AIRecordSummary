@@ -1,6 +1,6 @@
 import { NextResponse, type NextRequest } from "next/server";
 
-const protectedPrefixes = ["/recordings", "/chat", "/speaker-profiles", "/account"];
+const protectedPrefixes = ["/recordings", "/chat", "/speaker-profiles", "/account", "/admin"];
 const sessionCookieName = "ai_record_summary_session";
 
 /**
@@ -15,4 +15,4 @@ export function middleware(request: NextRequest) {
   return NextResponse.redirect(loginUrl);
 }
 
-export const config = { matcher: ["/recordings/:path*", "/chat/:path*", "/speaker-profiles/:path*", "/account/:path*"] };
+export const config = { matcher: ["/recordings/:path*", "/chat/:path*", "/speaker-profiles/:path*", "/account/:path*", "/admin/:path*"] };

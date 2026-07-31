@@ -43,14 +43,15 @@
 
 `今天`、`上周`、`最近三天` 等表达由 Python 按 `Asia/Shanghai` 确定性归一化为时间范围。
 
-### 2.3 时间语义由模型识别，时间边界由后端计算
+### 2.3 时间范围由模型解析，后端负责边界校验
 
-route 模型负责理解用户表达的时间语义，但不负责计算最终用于数据库查询的时间边界。职责链路为：
+route prompt 向模型提供精确到秒的当前时间、`Asia/Shanghai` 时区和自然周规则。模型直接输出最终时间边界，后端只负责结构校验、时区归一化和 SQL 参数绑定：
 
 ```text
 用户自然语言时间
-  -> route 提取原文与结构化时间语义
-  -> resolve_scope 根据当前日期和 Asia/Shanghai 确定性计算
+  -> route 计算带时区的 start / end
+  -> Pydantic 校验时区和边界顺序
+  -> resolve_time_range 归一化到 Asia/Shanghai
   -> created_from / created_to
 ```
 
@@ -60,10 +61,8 @@ route 模型负责理解用户表达的时间语义，但不负责计算最终�
 {
   "time_range": {
     "text": "最近三个月",
-    "kind": "relative_duration",
-    "unit": "month",
-    "value": 3,
-    "offset": null
+    "start": "2026-05-04T00:00:00+08:00",
+    "end": "2026-08-04T00:00:00+08:00"
   }
 }
 ```
@@ -74,24 +73,20 @@ route 模型负责理解用户表达的时间语义，但不负责计算最终�
 {
   "time_range": {
     "text": "上周",
-    "kind": "calendar_period",
-    "unit": "week",
-    "value": null,
-    "offset": -1
+    "start": "2026-07-27T00:00:00+08:00",
+    "end": "2026-08-03T00:00:00+08:00"
   }
 }
 ```
 
-route 只判断“这是向过去回溯三个月”或“这是偏移量为 -1 的自然周”，不能自行生成最终 ISO 起止时间。`resolve_scope` 使用服务端可信的当前日期、时区和日历规则完成换算，因此跨月、跨年、夏令时和自然周边界都能被确定性测试。
-
-明确的绝对日期仍保留用户原始表达，并由后端解析和校验。数据库范围统一采用左闭右开区间 `[created_from, created_to)`。例如查询 2026 年 7 月 15 日，最终范围应为：
+数据库范围统一采用左闭右开区间 `[created_from, created_to)`。例如查询 2026 年 7 月 15 日，模型应输出：
 
 ```text
 created_from = 2026-07-15T00:00:00+08:00
 created_to   = 2026-07-16T00:00:00+08:00
 ```
 
-不允许 route 模型根据“今天”自行推算“上周”的日期，也不允许把模型生成的未经验证的 ISO 时间直接用于 SQL。无法识别或后端暂不支持的时间表达应进入澄清分支，不能悄悄忽略时间条件后扩大检索范围。
+`start` 或 `end` 可以单独为空，以表达“从……以来”或“截至……”。没有时间限制时整个 `time_range` 为 `null`。模型输出不会未经校验直接进入 SQL：边界必须带时区，且同时存在时必须满足 `start < end`。无法可靠计算的时间表达应进入澄清分支，不能悄悄忽略时间条件后扩大检索范围。
 
 ### 2.4 生成只基于证据
 
@@ -127,16 +122,13 @@ class InferredFilters(BaseModel):
 
 class TimeRange(BaseModel):
     text: str
-    kind: Literal["relative_duration", "calendar_period", "absolute_range"]
-    unit: Literal["day", "week", "month", "quarter", "year"] | None = None
-    value: int | None = Field(default=None, ge=1)
-    offset: int | None = None
+    start: datetime | None = None
+    end: datetime | None = None
 
 
 class RagRoute(BaseModel):
     status: Literal["resolved", "ambiguous", "unresolved"]
     strategy: Literal["chunk_search", "scope_summary"] | None = None
-    topic: str | None = None
     recording_limit: int | None = Field(default=None, ge=1, le=10)
     recording_rank: int | None = Field(default=None, ge=1, le=10)
     time_range: TimeRange | None = None
@@ -145,9 +137,9 @@ class RagRoute(BaseModel):
     reason: str = ""
 ```
 
-时间条件只接受 `time_range`，不再兼容旧 `time_expression` 或 `date_range`。`text` 保留用户原话，其他字段只表达时间语义，最终日期范围仍由 `resolve_scope` 计算。`relative_duration` 必须同时提供 `unit` 和 `value`；`calendar_period` 必须提供 `unit`，`offset` 缺省时表示当前周期；`absolute_range` 只接受原始 `text`。字段组合不合法时 route 校验失败并停止，不回退到字符串关键词匹配。
+时间条件只接受 `time_range`，不再兼容旧 `time_expression`、`date_range` 或 kind/unit/value/offset 语义结构。`text` 保留用户原话，`start/end` 是模型计算的 RFC 3339 边界。二者至少存在一个、必须携带时区，并在同时存在时满足 `start < end`。字段组合不合法时 route 校验失败并停止，不回退到字符串关键词匹配。
 
-由于本地 GGUF 模型不一定稳定支持原生 tool/function calling，路由使用 LangChain 的 `ChatPromptTemplate` 与 Pydantic JSON 输出解析器。`status` 是程序控制字段：只有 `resolved` 可以进入检索；`ambiguous` 和 `unresolved` 必须带机器可识别的 `error_code`，不能再借用自由文本 `reason` 控制流程。若模型没有返回可校验的 route（空输出、非法 JSON、缺失合法 strategy，或 `chunk_search` 缺少 topic），RAG 在 route 后立即结束：不检索、不调用回答模型，只返回“请换一种更明确的说法”的用户可见响应。绝不能把原问题静默降级为 `chunk_search(query)`，因为这会制造看似正常、实际不可解释的回答。
+由于本地 GGUF 模型不一定稳定支持原生 tool/function calling，路由使用 LangChain 的 `ChatPromptTemplate` 与 Pydantic JSON 输出解析器。`status` 是程序控制字段：只有 `resolved` 可以进入检索；`ambiguous` 和 `unresolved` 必须带机器可识别的 `error_code`，不能再借用自由文本 `reason` 控制流程。若模型没有返回可校验的 route（空输出、非法 JSON或缺失合法 strategy），RAG 在 route 后立即结束。Route 不再生成 `topic` 或改写查询文本。
 
 ## 5. LangGraph 工作流
 
@@ -162,7 +154,7 @@ flowchart LR
   E --> G["grade：证据充分性评估"]
   F --> G
   G -->|"不足且首次查询"| H["rewrite_query：改写检索问题"]
-  H --> B
+  H --> D
   G -->|"充分"| I["answer_plan：要点与证据映射"]
   I --> J["validate_plan：证据校验"]
   J -->|"不通过且可重试"| H
@@ -178,6 +170,7 @@ flowchart LR
 - 询问某批录音整体内容的问题走 `scope_summary`；
 - 既有限定范围又有具体话题时，仍优先走 `chunk_search`，范围仅作为检索约束；
 - 路由输出保留模型推断的人名、地点、时间和目标人物限制。
+- route 不提取 `topic`，也不生成 `standalone_query`；范围以外的节点初始统一消费用户原始问题，只有 `rewrite_query` 可以覆盖后续使用的 `retrieval_query`。
 - 对话历史中的 assistant 消息会按问答顺序附带其持久化的录音 source；route 上下文仅提取 `recording_id`、标题和时间范围，不使用 chunk 原文。模型自行判断用户的范围是延续历史 source，还是在问录音库按创建时间排序的记录；前者将 source 的既有 ID 写入 `inferred_filters.recording_ids`，后者使用 `recording_limit` / `recording_rank`。
 - history source 是此前回答实际引用过的可信录音事实，可用于判断当前问题延续的录音范围；但 route 不能仅凭 source 的 ID、标题或时间范围推断录音具体内容，最终回答仍须重新检索证据。
 - 用户表达的范围既可能来自对话上下文，也可能来自录音库排序、时间、人物、地点或其他条件。route 根据完整语义自行判断，不对“最近的录音”等固定短语编写特殊分支。
@@ -198,7 +191,7 @@ flowchart LR
 
 `scope_summary` 从命中录音读取其连续发言内容或已有总结，用于“上周会议都讲了什么”一类问题。
 
-`chunk_search` 使用 `route.topic` 生成 query embedding，从 `recording_search_chunks` 执行 pgvector 检索，并应用模型推断的人名、地点、时间、目标人物和录音范围约束。
+`chunk_search` 使用 Graph 中的 `retrieval_query` 生成 query embedding，从 `recording_search_chunks` 执行 pgvector 检索，并应用模型推断的人名、地点、时间、目标人物和录音范围约束。`retrieval_query` 初始为用户原始问题，仅在 rewrite 后被替换。
 
 检索结果统一为 `Evidence`，其内容包括录音信息、chunk 文本、起止时间、说话人标签、匹配类型、相关度和可定位 URL。
 
@@ -216,7 +209,7 @@ flowchart LR
 
 ### 5.6 `stream_answer`
 
-验证通过后，最终回答节点以已批准的计划和证据调用 LangChain ChatModel 的异步流式接口。每个文本增量通过既有 `StreamEmitter.text()` 写入标准 `content.delta` 事件。
+验证通过后，最终回答节点以已批准的计划和证据调用 LangChain ChatModel 的异步流式接口。每个文本增量通过既有 `GenerationEventSink.text()` 写入标准 `content.delta` 事件。
 
 前端只展示文本 block；模型 route、检索计划、grading 结果和思考过程不产生用户可见事件。
 
@@ -306,7 +299,7 @@ backend/src/
     retrieval.py       # scope 与 pgvector 检索
     validation.py      # 证据充分性、计划及 source 校验
     graph.py           # LangGraph StateGraph 和条件边
-    service.py         # 创建 generation、提交 RAG 工作流资源任务、写入 StreamEmitter
+    service.py         # 创建 generation、提交 RAG 工作流资源任务、写入 GenerationEventSink
     operations.py      # RAG 提供给通用资源运行时的执行能力
   task_runtime/
     scheduler.py       # 内存 CPU/GPU 队列、优先级、Future 与优雅关闭
@@ -325,3 +318,4 @@ backend/src/
 5. 接入现有 GenerationService，验证 delta、`output_payload.sources`、SSE 续传和页面刷新恢复。
 6. 将 RAG 执行从 `BackgroundTasks` 迁移到 generation worker，验证与录音总结并发时的 GPU 排队行为。
 7. 使用真实录音做端到端手工验证：范围总结、话题问答、人名/地点/时间约束、无证据回答、断线重连和取消。
+> 已被 [Redis + Kafka 架构改造](./redis-kafka-architecture-refactor.md) 取代。本文保留为历史背景；其中 `generation_events`、数据库 delta 和进程内 `RagWorkflowRunner` 不再是目标架构。

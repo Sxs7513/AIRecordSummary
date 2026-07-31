@@ -1,14 +1,12 @@
 from __future__ import annotations
 
 import logging
-from asyncio import Task, create_task, gather
+from asyncio import Task, create_task, gather, to_thread
 from collections.abc import Callable
 from uuid import UUID
 
 from sqlalchemy import Engine, text
 
-from l1_foundation.task_runtime.resources import ResourceQueue
-from l1_foundation.task_runtime.scheduler import ResourceScheduler
 from l2_core.access.recordings import RecordingAccessService
 from l2_core.audio_processing.contracts import RecordingId
 from l2_core.audio_processing.projections import RecordingProjectionService
@@ -16,26 +14,37 @@ from l2_core.audio_processing.stages.recording_models import Utterance
 from l2_core.audio_processing.stages.summary.generation import create_manual_summary_generation
 from l2_core.audio_processing.stages.summary.stage import GenerateSummaryStage
 from l2_core.auth.contracts import CurrentUser
-from l2_core.generation.emitter import StreamEmitter
+from l2_core.generation.event_sink import GenerationEventSink
 from l2_core.generation.service import GenerationService
+from l2_core.rag.queue import GenerationCommandPublisher, SummaryGenerationWorkItem
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("audio_processing")
 
 
 class RecordingSummaryNotReadyError(ValueError):
     """Raised when a recording has no corrected utterances to summarize yet."""
 
 
+class RecordingSummaryQueueUnavailableError(RuntimeError):
+    """Raised after compensating a summary generation that Kafka did not accept."""
+
+
 class RecordingSummaryRegenerationService:
     """Regenerate one recording summary without creating a new recording pipeline run."""
 
-    def __init__(self, engine: Engine, scheduler: ResourceScheduler, generation_service: GenerationService, summary_stage: GenerateSummaryStage) -> None:
+    def __init__(
+        self,
+        engine: Engine,
+        generation_service: GenerationService,
+        summary_stage: GenerateSummaryStage,
+        publisher: GenerationCommandPublisher | None = None,
+    ) -> None:
         self._engine = engine
-        self._scheduler = scheduler
         self._generation_service = generation_service
         self._access = RecordingAccessService(engine)
         self._projections = RecordingProjectionService(engine)
         self._stage = summary_stage
+        self._publisher = publisher
         self._tasks: set[Task[None]] = set()
 
     async def regenerate(self, user: CurrentUser, recording_id: UUID) -> UUID:
@@ -46,8 +55,25 @@ class RecordingSummaryRegenerationService:
             raise RecordingSummaryNotReadyError("录音尚未生成可用于总结的润色文本")
         generation = create_manual_summary_generation(self._generation_service, recording_id)
         logger.info("summary：收到手动重新生成请求，recording_id=%s utterances=%d generation_id=%s", recording_id, len(utterances), generation.id)
+        if self._publisher is not None:
+            try:
+                await self._publisher.submit_summary(
+                    SummaryGenerationWorkItem(
+                        run_id=generation.id,
+                        recording_id=recording_id,
+                        generation=self._generation_service.command(generation.id),
+                    )
+                )
+            except Exception as error:
+                self._generation_service.event_sink(generation.id).fail(
+                    "kafka_unavailable",
+                    str(error) or type(error).__name__,
+                    retryable=True,
+                )
+                raise RecordingSummaryQueueUnavailableError("Generation queue unavailable") from error
+            return generation.id
         task = create_task(
-            self._execute(generation.id, RecordingId(recording_id), utterances),
+            self.execute(generation.id, RecordingId(recording_id), utterances),
             name=f"recording-summary-regeneration-{generation.id}",
         )
         self._tasks.add(task)
@@ -60,24 +86,34 @@ class RecordingSummaryRegenerationService:
         if self._tasks:
             await gather(*self._tasks, return_exceptions=True)
 
-    async def _execute(self, generation_id: UUID, recording_id: RecordingId, utterances: list[Utterance]) -> None:
-        emitter = self._generation_service.emitter(generation_id)
+    async def execute(self, generation_id: UUID, recording_id: RecordingId, utterances: list[Utterance] | None = None) -> None:
+        resolved_utterances = utterances if utterances is not None else self.load_utterances(recording_id)
+        sink = self._generation_service.event_sink(generation_id)
         try:
-            emitter.start()
-            if emitter.cancel_if_requested():
+            sink.start()
+            if sink.cancel_if_requested():
                 return
-            output = await self._scheduler.submit(
-                ResourceQueue.GPU_NORMAL,
-                lambda: self._stage.generate(utterances, self._generation_progress(emitter), emitter),
+            output = await to_thread(
+                self._stage.generate,
+                resolved_utterances,
+                self._generation_progress(sink),
+                sink,
             )
-            if emitter.cancel_if_requested():
+            if sink.cancel_if_requested():
                 return
             self._projections.project(recording_id, "generate_summary", output)
-            emitter.succeed(output.model_dump(mode="json"))
+            sink.succeed(output.model_dump(mode="json"))
             logger.info("summary：手动重新生成完成，recording_id=%s generation_id=%s", recording_id, generation_id)
         except Exception as error:
+            if sink.cancel_if_requested():
+                logger.info(
+                    "summary：手动重新生成已取消，recording_id=%s generation_id=%s",
+                    recording_id,
+                    generation_id,
+                )
+                return
             logger.exception("summary：手动重新生成失败，recording_id=%s generation_id=%s", recording_id, generation_id)
-            emitter.fail("summary_regeneration_failed", str(error) or "录音总结重新生成失败", retryable=True)
+            sink.fail("summary_regeneration_failed", str(error) or "录音总结重新生成失败", retryable=True)
 
     def load_utterances(self, recording_id: UUID) -> list[Utterance]:
         with self._engine.connect() as connection:
@@ -105,5 +141,5 @@ class RecordingSummaryRegenerationService:
             ]
 
     @staticmethod
-    def _generation_progress(emitter: StreamEmitter) -> Callable[[int, str], None]:
-        return lambda percent, message: emitter.phase("generating", message, percent)
+    def _generation_progress(sink: GenerationEventSink) -> Callable[[int, str], None]:
+        return lambda percent, message: sink.phase("generating", message, percent)

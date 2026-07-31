@@ -164,10 +164,7 @@ backend/
 │       │   └── main.py
 │       ├── training-api/
 │       │   └── main.py
-│       └── shared-api/
-│           ├── router.py
-│           ├── dependencies.py
-│           └── routes/
+│       └── 每个 API 内部拥有自己的 router、dependencies 和 routes
 │
 ├── migrations/
 │   ├── application.sql

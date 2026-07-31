@@ -19,6 +19,7 @@ def _find_repository_root() -> Path:
 REPOSITORY_ROOT = _find_repository_root()
 ROOT_ENV_FILE = REPOSITORY_ROOT / ".env"
 ROOT_ENV_LOCAL_FILE = REPOSITORY_ROOT / ".env.local"
+LlmProviderName = Literal["local", "zhipu", "gemini"]
 
 
 class Settings(BaseSettings):
@@ -41,6 +42,19 @@ class Settings(BaseSettings):
     db_admin_database: str = Field(validation_alias="DB_ADMIN_DATABASE")
     db_ssl: bool = Field(validation_alias="DB_SSL")
     database_url: str | None = Field(default=None, validation_alias="DATABASE_URL")
+    kafka_bootstrap_servers: str = Field(default="127.0.0.1:9092", validation_alias="KAFKA_BOOTSTRAP_SERVERS")
+    kafka_client_id: str = Field(default="ai-record-summary", validation_alias="KAFKA_CLIENT_ID")
+    kafka_request_timeout_ms: int = Field(default=30_000, gt=0, validation_alias="KAFKA_REQUEST_TIMEOUT_MS")
+    kafka_consumer_max_poll_interval_ms: int = Field(default=900_000, gt=0, validation_alias="KAFKA_CONSUMER_MAX_POLL_INTERVAL_MS")
+    processing_consumer_max_poll_interval_ms: int = Field(
+        default=7_200_000,
+        gt=0,
+        validation_alias="PROCESSING_CONSUMER_MAX_POLL_INTERVAL_MS",
+    )
+    redis_url: str = Field(default="redis://127.0.0.1:6379/0", validation_alias="REDIS_URL")
+    redis_stream_maxlen: int = Field(default=10_000, gt=0, validation_alias="REDIS_STREAM_MAXLEN")
+    redis_terminal_ttl_seconds: int = Field(default=86_400, gt=0, validation_alias="REDIS_TERMINAL_TTL_SECONDS")
+    redis_stream_block_ms: int = Field(default=15_000, gt=0, validation_alias="REDIS_STREAM_BLOCK_MS")
     local_storage_root: Path = Field(validation_alias="LOCAL_STORAGE_ROOT")
     asr_lab_project_dataset_root: Path = Field(
         default=Path("datasets/asr-encrypted"),
@@ -54,7 +68,9 @@ class Settings(BaseSettings):
     qwen_asr_context_config: Path = Field(default=Path("config/initial-prompt.json"), validation_alias="QWEN_ASR_CONTEXT_CONFIG")
     qwen_asr_context: str = Field(default="", validation_alias="QWEN_ASR_CONTEXT")
     qwen_asr_max_context_items: int = Field(default=200, ge=0, validation_alias="QWEN_ASR_MAX_CONTEXT_ITEMS")
-    qwen_asr_max_inference_batch_size: int = Field(default=4, ge=1, validation_alias="QWEN_ASR_MAX_INFERENCE_BATCH_SIZE")
+    qwen_asr_max_inference_batch_size: int = Field(default=1, ge=1, validation_alias="QWEN_ASR_MAX_INFERENCE_BATCH_SIZE")
+    qwen_asr_num_beams: int = Field(default=2, ge=1, le=8, validation_alias="QWEN_ASR_NUM_BEAMS")
+    qwen_asr_tempo: float = Field(default=1.0, ge=0.5, le=2.0, validation_alias="QWEN_ASR_TEMPO")
     asr_lab_training_python_bin: Path = Field(
         default=Path("backend/packages/l2_core/trainers/qwen-asr-lora/.venv/bin/python"),
         validation_alias="ASR_LAB_TRAINING_PYTHON_BIN",
@@ -72,7 +88,7 @@ class Settings(BaseSettings):
     asr_speech_window_target_duration_ms: int = Field(default=30_000, gt=0, validation_alias="ASR_SPEECH_WINDOW_TARGET_DURATION_MS")
     asr_speech_window_max_duration_ms: int = Field(default=80_000, gt=0, validation_alias="ASR_SPEECH_WINDOW_MAX_DURATION_MS")
     asr_speech_window_overlap_ms: int = Field(default=500, ge=0, validation_alias="ASR_SPEECH_WINDOW_OVERLAP_MS")
-    asr_window_correction_max_edit_ratio: float = Field(default=0.25, ge=0, le=1, validation_alias="ASR_WINDOW_CORRECTION_MAX_EDIT_RATIO")
+    asr_window_correction_max_edit_ratio: float = Field(default=0.35, ge=0, le=1, validation_alias="ASR_WINDOW_CORRECTION_MAX_EDIT_RATIO")
     pyannote_segment_merge_max_gap_ms: int = Field(default=3_000, ge=0, validation_alias="PYANNOTE_SEGMENT_MERGE_MAX_GAP_MS")
     pyannote_segment_merge_max_duration_ms: int = Field(default=80_000, gt=0, validation_alias="PYANNOTE_SEGMENT_MERGE_MAX_DURATION_MS")
     pyannote_short_segment_absorb_max_duration_ms: int = Field(
@@ -80,25 +96,41 @@ class Settings(BaseSettings):
         ge=0,
         validation_alias="PYANNOTE_SHORT_SEGMENT_ABSORB_MAX_DURATION_MS",
     )
-    qwen_asr_low_volume_rms_threshold: float = Field(default=0.004, ge=0, le=1, validation_alias="QWEN_ASR_LOW_VOLUME_RMS_THRESHOLD")
-    qwen_asr_low_volume_peak_threshold: float = Field(default=0.025, ge=0, le=1, validation_alias="QWEN_ASR_LOW_VOLUME_PEAK_THRESHOLD")
+    pyannote_short_segment_absorb_max_gap_ms: int = Field(
+        default=2_000,
+        ge=0,
+        validation_alias="PYANNOTE_SHORT_SEGMENT_ABSORB_MAX_GAP_MS",
+    )
+    qwen_asr_low_volume_rms_threshold: float = Field(default=0.01, ge=0, le=1, validation_alias="QWEN_ASR_LOW_VOLUME_RMS_THRESHOLD")
+    qwen_asr_low_volume_peak_threshold: float = Field(default=0.08, ge=0, le=1, validation_alias="QWEN_ASR_LOW_VOLUME_PEAK_THRESHOLD")
+    qwen_asr_low_volume_max_gain_db: float = Field(default=9.0, ge=0, le=24, validation_alias="QWEN_ASR_LOW_VOLUME_MAX_GAIN_DB")
     qwen_asr_speaker_segment_min_duration_ms: int = Field(default=1200, ge=0, validation_alias="QWEN_ASR_SPEAKER_SEGMENT_MIN_DURATION_MS")
     qwen_asr_speaker_segment_merge_max_gap_ms: int = Field(default=2000, ge=-1, validation_alias="QWEN_ASR_SPEAKER_SEGMENT_MERGE_MAX_GAP_MS")
     qwen_asr_speaker_segment_merge_max_duration_ms: int = Field(default=60_000, ge=0, validation_alias="QWEN_ASR_SPEAKER_SEGMENT_MERGE_MAX_DURATION_MS")
-    transcription_correction_enabled: bool = Field(default=True, validation_alias="TRANSCRIPTION_CORRECTION_ENABLED")
+    transcription_correction_enabled: bool = Field(default=False, validation_alias="TRANSCRIPTION_CORRECTION_ENABLED")
     whisper_initial_prompt_config: Path = Field(default=Path("config/initial-prompt.json"), validation_alias="WHISPER_INITIAL_PROMPT_CONFIG")
+    llm_default_provider: LlmProviderName = Field(default="gemini", validation_alias="LLM_DEFAULT_PROVIDER")
     llm_correction_enabled: bool = Field(default=True, validation_alias="LLM_CORRECTION_ENABLED")
-    llm_correction_model_repo: str = Field(default="Qwen/Qwen2.5-7B-Instruct-GGUF", validation_alias="LLM_CORRECTION_MODEL_REPO")
-    llm_correction_model_file: str = Field(default="qwen2.5-7b-instruct-q4_k_m-00001-of-00002.gguf", validation_alias="LLM_CORRECTION_MODEL_FILE")
+    llm_correction_provider: LlmProviderName = Field(
+        default="gemini",
+        validation_alias=AliasChoices("LLM_CORRECTION_PROVIDER", "LLM_DEFAULT_PROVIDER"),
+    )
     llm_correction_context_size: int = Field(default=8192, gt=0, validation_alias="LLM_CORRECTION_CONTEXT_SIZE")
+    llm_correction_max_output_tokens: int = Field(default=65_536, gt=0, validation_alias="LLM_CORRECTION_MAX_OUTPUT_TOKENS")
     text_correction_batch_max_units: int = Field(default=16, gt=0, validation_alias="TEXT_CORRECTION_BATCH_MAX_UNITS")
     text_correction_batch_max_chars: int = Field(default=4000, gt=0, validation_alias="TEXT_CORRECTION_BATCH_MAX_CHARS")
+    text_correction_context_units: int = Field(default=1, ge=0, validation_alias="TEXT_CORRECTION_CONTEXT_UNITS")
     search_chunk_topic_detection_enabled: bool = Field(default=True, validation_alias="SEARCH_CHUNK_TOPIC_DETECTION_ENABLED")
-    search_chunk_max_chars: int = Field(default=1200, gt=0, validation_alias="SEARCH_CHUNK_MAX_CHARS")
+    topic_detection_provider: LlmProviderName = Field(
+        default="gemini",
+        validation_alias=AliasChoices("TOPIC_DETECTION_PROVIDER", "LLM_DEFAULT_PROVIDER"),
+    )
+    search_chunk_max_token: int = Field(default=800, gt=0, validation_alias="SEARCH_CHUNK_MAX_TOKEN")
     search_chunk_max_duration_ms: int = Field(default=180_000, gt=0, validation_alias="SEARCH_CHUNK_MAX_DURATION_MS")
     search_chunk_max_utterances: int = Field(default=30, gt=0, validation_alias="SEARCH_CHUNK_MAX_UTTERANCES")
     rag_chunk_context_window_utterances: int = Field(default=1, ge=0, le=10, validation_alias="RAG_CHUNK_CONTEXT_WINDOW_UTTERANCES")
     rag_hybrid_search_enabled: bool = Field(default=True, validation_alias="RAG_HYBRID_SEARCH_ENABLED")
+    rag_query_term_expansion_enabled: bool = Field(default=True, validation_alias="RAG_QUERY_TERM_EXPANSION_ENABLED")
     rag_vector_candidate_limit: int = Field(default=30, gt=0, le=200, validation_alias="RAG_VECTOR_CANDIDATE_LIMIT")
     rag_lexical_candidate_limit: int = Field(default=30, gt=0, le=200, validation_alias="RAG_LEXICAL_CANDIDATE_LIMIT")
     rag_fused_candidate_limit: int = Field(default=20, gt=0, le=200, validation_alias="RAG_FUSED_CANDIDATE_LIMIT")
@@ -107,8 +139,12 @@ class Settings(BaseSettings):
     rag_lexical_weight: float = Field(default=1.0, ge=0, validation_alias="RAG_LEXICAL_WEIGHT")
     embedding_model: str = Field(default="Qwen/Qwen3-Embedding-4B", validation_alias="EMBEDDING_MODEL")
     embedding_dimensions: int = Field(default=2560, gt=0, validation_alias="EMBEDDING_DIMENSIONS")
+    embedding_inference_batch_size: int = Field(default=8, gt=0, le=64, validation_alias="EMBEDDING_INFERENCE_BATCH_SIZE")
     embedding_model_cache_dir: Path = Field(default=Path("model-cache/embedding"), validation_alias="EMBEDDING_MODEL_CACHE_DIR")
-    recording_summary_provider: str = Field(default="local_llm", validation_alias="RECORDING_SUMMARY_PROVIDER")
+    recording_summary_provider: LlmProviderName = Field(
+        default="gemini",
+        validation_alias=AliasChoices("RECORDING_SUMMARY_PROVIDER", "LLM_DEFAULT_PROVIDER"),
+    )
     recording_summary_prompt_config: Path = Field(default=Path("config/initial-prompt.json"), validation_alias="RECORDING_SUMMARY_PROMPT_CONFIG")
     recording_summary_context_size: int = Field(default=262_144, gt=0, validation_alias="RECORDING_SUMMARY_CONTEXT_SIZE")
     recording_summary_max_tokens: int = Field(default=4_096, gt=0, validation_alias="RECORDING_SUMMARY_MAX_TOKENS")
@@ -118,14 +154,69 @@ class Settings(BaseSettings):
     recording_summary_rolling_chunk_max_chars: int = Field(default=8000, gt=0, validation_alias="RECORDING_SUMMARY_ROLLING_CHUNK_MAX_CHARS")
     recording_summary_rolling_chunk_max_tokens: int = Field(default=1800, gt=0, validation_alias="RECORDING_SUMMARY_ROLLING_CHUNK_MAX_TOKENS")
     recording_summary_rolling_memory_max_chars: int = Field(default=6000, gt=0, validation_alias="RECORDING_SUMMARY_ROLLING_MEMORY_MAX_CHARS")
-    local_llm_model_repo: str = Field(default="DevQuasar/Qwen.Qwen3.5-9B-GGUF", validation_alias="LOCAL_LLM_MODEL_REPO")
-    local_llm_model_file: str = Field(default="Qwen.Qwen3.5-9B.Q8_0.gguf", validation_alias="LOCAL_LLM_MODEL_FILE")
+    local_llm_model_repo: str = Field(
+        default="Qwen/Qwen2.5-7B-Instruct-GGUF",
+        validation_alias=AliasChoices("LOCAL_LLM_MODEL_REPO", "LLM_CORRECTION_MODEL_REPO"),
+    )
+    local_llm_model_file: str = Field(
+        default="qwen2.5-7b-instruct-q4_k_m-00001-of-00002.gguf",
+        validation_alias=AliasChoices("LOCAL_LLM_MODEL_FILE", "LLM_CORRECTION_MODEL_FILE"),
+    )
     local_llm_verbose: bool = Field(default=False, validation_alias="LOCAL_LLM_VERBOSE")
     rag_context_size: int = Field(default=16_384, gt=0, validation_alias="RAG_CONTEXT_SIZE")
+    rag_local_model_repo: str = Field(default="Qwen/Qwen3-4B-GGUF", validation_alias="RAG_LOCAL_MODEL_REPO")
+    rag_local_model_file: str = Field(default="Qwen3-4B-Q4_K_M.gguf", validation_alias="RAG_LOCAL_MODEL_FILE")
+    rag_route_model_profile: Literal["default", "rag"] = Field(
+        default="default",
+        validation_alias="RAG_ROUTE_MODEL_PROFILE",
+    )
+    rag_node_model_profile: Literal["default", "rag"] = Field(
+        default="default",
+        validation_alias="RAG_NODE_MODEL_PROFILE",
+    )
+    rag_plan_local_input_tokens: int = Field(default=4_000, gt=0, validation_alias="RAG_PLAN_LOCAL_INPUT_TOKENS")
+    rag_run_max_total_tokens: int = Field(default=50_000, gt=0, validation_alias="RAG_RUN_MAX_TOTAL_TOKENS")
+    rag_evaluation_stale_run_seconds: float = Field(
+        default=120.0, ge=30, validation_alias="RAG_EVALUATION_STALE_RUN_SECONDS"
+    )
+    rag_rerank_enabled: bool = Field(default=True, validation_alias="RAG_RERANK_ENABLED")
+    rag_rerank_model: str = Field(default="Qwen/Qwen3-Reranker-0.6B", validation_alias="RAG_RERANK_MODEL")
+    rag_rerank_model_cache_dir: Path = Field(default=Path("model-cache/rerank"), validation_alias="RAG_RERANK_MODEL_CACHE_DIR")
+    rag_rerank_candidate_limit: int = Field(default=20, gt=0, le=200, validation_alias="RAG_RERANK_CANDIDATE_LIMIT")
+    rag_rerank_max_total_tokens: int = Field(default=16_000, gt=0, validation_alias="RAG_RERANK_MAX_TOTAL_TOKENS")
+    rag_rerank_inference_batch_size: int = Field(default=1, gt=0, le=32, validation_alias="RAG_RERANK_INFERENCE_BATCH_SIZE")
+    rag_rerank_output_limit: int = Field(default=8, gt=0, le=100, validation_alias="RAG_RERANK_OUTPUT_LIMIT")
+    rag_sql_statement_timeout_ms: int = Field(default=15_000, gt=0, validation_alias="RAG_SQL_STATEMENT_TIMEOUT_MS")
+    rag_checkpoint_ttl_seconds: int = Field(default=604_800, gt=0, validation_alias="RAG_CHECKPOINT_TTL_SECONDS")
+    rag_answer_provider: LlmProviderName = Field(
+        default="gemini",
+        validation_alias=AliasChoices("RAG_ANSWER_PROVIDER", "LLM_DEFAULT_PROVIDER"),
+    )
+    zhipu_api_key: str | None = Field(default=None, validation_alias="ZHIPU_API_KEY")
+    zhipu_model: str = Field(default="glm-4.5-flash", validation_alias="ZHIPU_MODEL")
+    zhipu_base_url: str = Field(default="https://open.bigmodel.cn/api/paas/v4", validation_alias="ZHIPU_BASE_URL")
+    zhipu_timeout_seconds: float = Field(default=120.0, gt=0, validation_alias="ZHIPU_TIMEOUT_SECONDS")
+    gemini_api_key: str | None = Field(default=None, validation_alias="GEMINI_API_KEY")
+    gemini_model: str = Field(default="gemini-3.5-flash-lite", validation_alias="GEMINI_MODEL")
+    gemini_base_url: str = Field(
+        default="https://generativelanguage.googleapis.com/v1beta/openai",
+        validation_alias="GEMINI_BASE_URL",
+    )
+    gemini_timeout_seconds: float = Field(default=300.0, gt=0, validation_alias="GEMINI_TIMEOUT_SECONDS")
     pyannote_auth_token: str | None = Field(default=None, validation_alias="PYANNOTE_AUTH_TOKEN")
     pyannote_model: str = Field(default="pyannote/speaker-diarization-3.1", validation_alias="PYANNOTE_MODEL")
     pyannote_use_local_config: bool = Field(default=True, validation_alias="PYANNOTE_USE_LOCAL_CONFIG")
-    pipeline_worker_queue: str = Field(default="cpu", validation_alias="PIPELINE_WORKER_QUEUE")
+    compute_worker_host: str = Field(default="127.0.0.1", validation_alias="COMPUTE_WORKER_HOST")
+    compute_worker_port: int = Field(default=8010, gt=0, le=65535, validation_alias="COMPUTE_WORKER_PORT")
+    compute_worker_internal_token: str | None = Field(default=None, validation_alias="COMPUTE_WORKER_INTERNAL_TOKEN")
+    compute_worker_completed_ttl_seconds: float = Field(default=1800, gt=0, validation_alias="COMPUTE_WORKER_COMPLETED_TTL_SECONDS")
+    compute_worker_max_tasks: int = Field(default=100, gt=0, validation_alias="COMPUTE_WORKER_MAX_TASKS")
+    compute_worker_heartbeat_seconds: float = Field(default=15, gt=0, validation_alias="COMPUTE_WORKER_HEARTBEAT_SECONDS")
+    compute_worker_poll_interval_seconds: float = Field(default=0.2, gt=0, validation_alias="COMPUTE_WORKER_POLL_INTERVAL_SECONDS")
+    compute_worker_cancel_grace_seconds: float = Field(default=10.0, gt=0, validation_alias="COMPUTE_WORKER_CANCEL_GRACE_SECONDS")
+    observability_enabled: bool = Field(default=True, validation_alias="OBSERVABILITY_ENABLED")
+    observability_api_host: str = Field(default="127.0.0.1", validation_alias="OBSERVABILITY_API_HOST")
+    observability_api_port: int = Field(default=8003, gt=0, le=65535, validation_alias="OBSERVABILITY_API_PORT")
     session_cookie_name: str = Field(default="ai_record_summary_session", validation_alias="SESSION_COOKIE_NAME")
     session_ttl_days: int = Field(default=14, ge=1, le=90, validation_alias="SESSION_TTL_DAYS")
     session_cookie_secure: bool = Field(default=False, validation_alias="SESSION_COOKIE_SECURE")
@@ -135,10 +226,14 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_hybrid_retrieval_settings(self) -> Self:
+        if self.rag_answer_provider == "local":
+            raise ValueError("RAG_ANSWER_PROVIDER must be an online provider because answer generation is always remote")
         if self.rag_vector_weight == 0 and self.rag_lexical_weight == 0:
             raise ValueError("RAG vector and lexical weights cannot both be zero")
         if self.rag_fused_candidate_limit > self.rag_vector_candidate_limit + self.rag_lexical_candidate_limit:
             raise ValueError("RAG fused candidate limit cannot exceed the sum of branch candidate limits")
+        if self.rag_rerank_output_limit > self.rag_rerank_candidate_limit:
+            raise ValueError("RAG rerank output limit cannot exceed its candidate limit")
         return self
 
     def _database_url_for(self, database: str) -> str:
@@ -218,14 +313,23 @@ class Settings(BaseSettings):
         model_file = self.local_llm_model_file.split(",", maxsplit=1)[0].strip()
         if not model_file:
             raise ValueError("LOCAL_LLM_MODEL_FILE must contain a model filename")
-        return REPOSITORY_ROOT / "model-cache/local-llm" / self.local_llm_model_repo.replace("/", "__") / model_file
+        return self.resolved_audio_model_cache_root / "llm-correction" / self.local_llm_model_repo.replace("/", "__") / model_file
 
     @property
     def resolved_llm_correction_model_path(self) -> Path:
-        model_file = self.llm_correction_model_file.split(",", maxsplit=1)[0].strip()
+        """Compatibility alias for the single local Qwen model path."""
+        return self.resolved_local_llm_model_path
+
+    @property
+    def resolved_rag_local_model_path(self) -> Path:
+        model_file = self.rag_local_model_file.split(",", maxsplit=1)[0].strip()
         if not model_file:
-            raise ValueError("LLM_CORRECTION_MODEL_FILE must contain a model filename")
-        return REPOSITORY_ROOT / "model-cache/llm-correction" / self.llm_correction_model_repo.replace("/", "__") / model_file
+            raise ValueError("RAG_LOCAL_MODEL_FILE must contain a model filename")
+        return self.resolved_audio_model_cache_root / "rag-llm" / self.rag_local_model_repo.replace("/", "__") / model_file
+
+    @property
+    def resolved_rag_rerank_model_cache_dir(self) -> Path:
+        return self._resolve_repository_path(self.rag_rerank_model_cache_dir)
 
     @staticmethod
     def _resolve_repository_path(value: Path) -> Path:

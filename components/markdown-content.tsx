@@ -4,6 +4,12 @@ import { useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 
+export type CitationTarget = {
+  index: number;
+  href: string;
+  title: string;
+};
+
 function normalizeMarkdown(markdown: string) {
   return markdown
     .replace(/\r\n?/g, "\n")
@@ -18,7 +24,12 @@ function normalizeMarkdown(markdown: string) {
     .join("\n");
 }
 
-export function MarkdownContent({ markdown, className, streaming = false }: { markdown: string; className?: string; streaming?: boolean }) {
+export function MarkdownContent({ markdown, className, streaming = false, citations = [] }: {
+  markdown: string;
+  className?: string;
+  streaming?: boolean;
+  citations?: CitationTarget[];
+}) {
   const [visibleLength, setVisibleLength] = useState(() => splitGraphemes(markdown).length);
   const targetRef = useRef(splitGraphemes(markdown));
   const visibleLengthRef = useRef(visibleLength);
@@ -66,6 +77,11 @@ export function MarkdownContent({ markdown, className, streaming = false }: { ma
     <div className={className}>
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
+        components={{
+          a: ({ href, ...props }) => (
+            <a {...props} className="citation-link" href={href} rel="noreferrer" target="_blank" />
+          )
+        }}
         allowedElements={[
           "a",
           "p",
@@ -91,10 +107,20 @@ export function MarkdownContent({ markdown, className, streaming = false }: { ma
           "hr"
         ]}
       >
-        {normalizeMarkdown(visibleMarkdown)}
+        {linkifyCitations(normalizeMarkdown(visibleMarkdown), citations)}
       </ReactMarkdown>
     </div>
   );
+}
+
+function linkifyCitations(markdown: string, citations: CitationTarget[]): string {
+  if (citations.length === 0) return markdown;
+  const citationsByIndex = new Map(citations.map((citation) => [citation.index, citation]));
+  return markdown.replace(/\[(\d+)\]/g, (reference, rawIndex: string) => {
+    const citation = citationsByIndex.get(Number(rawIndex));
+    if (!citation) return reference;
+    return `[\\[${citation.index}\\]](${citation.href} \"${citation.title.replaceAll('"', "'")}\")`;
+  });
 }
 
 function splitGraphemes(value: string): string[] {

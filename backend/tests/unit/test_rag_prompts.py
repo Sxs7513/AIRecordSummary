@@ -1,61 +1,164 @@
-from l2_core.rag.prompts import answer_plan_prompt, answer_prompt, grade_prompt, route_prompt
+from l2_core.rag.prompts import answer_plan_prompt, answer_prompt, grade_prompt, retrieval_terms_prompt, route_prompt
 
 
-def test_route_prompt_includes_json_schema_and_exclusive_json_instruction() -> None:
-    prompt, values, _parser = route_prompt("最近的录音讲了什么", "[]", "[]")
+def test_route_prompt_relies_on_response_schema_without_embedding_format_instructions() -> None:
+    prompt, values, _parser = route_prompt("最近的录音讲了什么", "[]")
 
     rendered = "\n".join(str(message.content) for message in prompt.invoke(values).to_messages())
 
     assert "只输出唯一一个符合 schema 的 JSON 对象" in rendered
-    assert '"status"' in rendered
-    assert '"strategy"' in rendered
+    assert "确定录音范围、选择检索策略，并为正文检索提取 content_query" in rendered
+    assert "不提取 topic" in rendered
+    assert "不判断现实实体、证据充分性或答案是否存在" in rendered
+    assert "scope_summary" in rendered
+    assert "累计发言时长" in rendered
+    assert "file_names" in rendered
+    assert "必须先完成录音范围解析，再选择问答策略" in rendered
+    assert "范围条件不能作为选择 strategy 的依据" in rendered
+    assert "只移除已经由本次 route 结果表达的录音集合范围条件" in rendered
+    assert "不得机械删除所有时间、人名或地点" in rendered
+    assert "每个完整文件名都必须逐字出现在 inferred_filters.file_names" in rendered
+    assert "metadata_lookup 可访问每条录音的可信元数据" in rendered
+    assert "可对它们计数、筛选、分组、排序、比较和聚合" in rendered
+    assert '"speaking_duration_seconds": "number"' in rendered
+    assert "fact_lookup" in rendered
+    assert "时间长度中的数字不得写入 recording_limit" in rendered
+    assert "录音范围可以缺省" in rendered
+    assert "当前用户全部可访问的已完成录音" in rendered
+    assert "time_range 只表示对录音集合本身的创建或上传时间约束" in rendered
+    assert "根据语法关系和查询意图判断时间表达" in rendered
+    assert "用户没有明确提供修饰录音集合的时间约束时，time_range 必须为 null" in rendered
+    assert "只有已经确认存在这种明确约束、但仍无法可靠计算边界时" in rendered
+    assert "未使用的可选字段必须为 null，不得用 0、空字符串或空对象代替" in rendered
+    assert "不得根据 sources 或历史文本推断人物、话题、录音内容" in rendered
+    assert "conversation_history 是按时间升序排列的历史对话数组" in rendered
+    assert "sources 只绑定到所在 assistant 消息" in rendered
+    assert "current_query 可可靠关联到一条或多条 assistant 历史消息" in rendered
+    assert "time_range.start 和 time_range.end" in rendered
+    assert "左闭右开区间 [start,end)" in rendered
+    assert "一周从星期一开始" in rendered
+    assert '"properties"' not in rendered
+    assert "history_messages" not in rendered
 
 
-def test_grade_prompt_treats_scope_and_speaker_facts_as_trusted_metadata() -> None:
+def test_grade_prompt_only_evaluates_the_evidence_it_receives() -> None:
     prompt, values, _parser = grade_prompt("最近一条录音有几个说话人", "结构化说话人标签数量：9")
 
     rendered = "\n".join(str(message.content) for message in prompt.invoke(values).to_messages())
 
-    assert "查询范围已经由上游路由和筛选流程确定" in rendered
+    assert "结构化字段已经由上游可信流程确定" not in rendered
     assert "最近”或“第 N 条" not in rendered
-    assert "每个不同标签代表一个说话人聚类" in rendered
 
 
-def test_grade_prompt_checks_answerability_without_demanding_topic_completeness() -> None:
+def test_retrieval_terms_prompt_prepares_a_scope_free_content_query() -> None:
+    prompt, values, _parser = retrieval_terms_prompt(
+        "最近的录音里，王总说 API v2 的上线时间最后定了吗？"
+    )
+
+    rendered = "\n".join(str(message.content) for message in prompt.invoke(values).to_messages())
+
+    assert "不生成录音范围过滤条件" in rendered
+    assert "用于录音正文检索和证据判断的 content_query" in rendered
+    assert "判断依据是成分在当前问题中的语义作用" in rendered
+    assert "不得按词语表机械删除" in rendered
+    assert "改写可能改变问题含义时，必须保留" in rendered
+    assert "不得补充同义词" in rendered
+    assert "最近的录音里，王总说 API v2 的上线时间最后定了吗？" in rendered
+
+
+def test_grade_prompt_uses_a_conservative_answerability_process() -> None:
     prompt, values, _parser = grade_prompt("硅光的方案", "录音讨论了硅光集成路径和生产成本。")
 
     rendered = "\n".join(str(message.content) for message in prompt.invoke(values).to_messages())
 
-    assert "不负责评价用户的问题" in rendered
-    assert "不要求 evidence 全面、系统" in rendered
-    assert "不得擅自增加用户未提出的关注维度" in rendered
-    assert "只要 evidence 包含与 topic 直接相关的实质信息" in rendered
+    assert "不直接回答用户" in rendered
+    assert "决定性约束" in rendered
+    assert "最强证据子集" in rendered
+    assert "具体、保守且不误导的候选回答" in rendered
+    assert "实际行为、活动目的和上下文" in rendered
+    assert "名称未逐字出现不足以 abstain" in rendered
+    assert "不要做字面匹配或按证据数量投票" in rendered
 
 
-def test_grade_prompt_only_requires_plan_for_structurally_complex_answers() -> None:
+def test_grade_prompt_uses_a_general_qualified_answer_rule() -> None:
+    prompt, values, _parser = grade_prompt(
+        "对方是否真的想收购",
+        "A 对 B 说：之前经常被你们‘采风’，聊完也没有下文。",
+    )
+
+    messages = prompt.invoke(values).to_messages()
+    rendered = "\n".join(str(message.content) for message in messages)
+    system = str(messages[0].content)
+
+    assert "qualified_answer" in rendered
+    assert "只支持部分内容" in rendered
+    assert "名称、性质、阶段、范围等仍需限定" in rendered
+    assert "无需猜测或保守限定" in rendered
+    assert "反讽" not in system
+    assert "收购" not in system
+
+
+def test_grade_prompt_does_not_decide_answer_planning() -> None:
     prompt, values, _parser = grade_prompt("发布日期是什么", "发布日期是 8 月 1 日。")
 
     rendered = "\n".join(str(message.content) for message in prompt.invoke(values).to_messages())
 
-    assert "简单事实、单一结论、单一观点和简单局部总结令 planning_required=false" in rendered
-    assert "多子问题、对象比较、时间线、按人物或主题分组、跨录音综合" in rendered
-    assert "不要仅因为 evidence 数量大于一就要求 plan" in rendered
+    assert "planning_required" not in rendered
+    assert "retrieve_more" not in rendered
 
 
 def test_answer_plan_prompt_only_organizes_grade_approved_evidence() -> None:
-    prompt, values, _parser = answer_plan_prompt("硅光现状讲了什么", "[1] 硅光正在进入规模应用")
+    prompt, values, _parser = answer_plan_prompt(
+        "硅光现状讲了什么",
+        "[1] 硅光正在进入规模应用",
+        "direct_answer",
+    )
 
     rendered = "\n".join(str(message.content) for message in prompt.invoke(values).to_messages())
 
-    assert "Grade 已确认现有证据足以回答问题" in rendered
+    assert "证据评估已确认现有证据可以回答问题" in rendered
     assert "不要再次判断证据是否充分" in rendered
     assert "not_enough_evidence" not in rendered
+    assert "supported_claims" not in rendered
 
 
 def test_direct_answer_prompt_does_not_require_or_expose_an_answer_plan() -> None:
-    prompt, values = answer_prompt("发布日期是什么", None, "[1] 发布日期是 8 月 1 日。", "")
+    prompt, values = answer_prompt(
+        "发布日期是什么",
+        None,
+        "[1] 发布日期是 8 月 1 日。",
+        "",
+        "direct_answer",
+    )
 
     rendered = "\n".join(str(message.content) for message in prompt.invoke(values).to_messages())
 
     assert "回答计划" not in rendered
     assert "仅依据给出的证据" in rendered
+    assert "证据评估" not in rendered
+    assert "每个可核实的事实性陈述后必须紧跟一个或多个引用标记" in rendered
+    assert "不得创造编号" in rendered
+
+
+def test_answer_prompt_requires_inferences_to_remain_qualified() -> None:
+    prompt, values = answer_prompt(
+        "对方是否真的想收购",
+        None,
+        "A：之前经常被你们采风，聊完也没有下文。",
+        "",
+        "qualified_answer",
+    )
+
+    rendered = "\n".join(str(message.content) for message in prompt.invoke(values).to_messages())
+
+    assert "区分证据内容和基于证据的解释" in rendered
+    assert "不得把解释写成确定事实" in rendered
+
+
+def test_answer_prompt_without_assessment_does_not_invent_assessment_constraints() -> None:
+    prompt, values = answer_prompt("录音有多长", None, "时长：120 秒", "")
+
+    rendered = "\n".join(str(message.content) for message in prompt.invoke(values).to_messages())
+
+    assert "证据评估" not in rendered
+    assert "supported_claims" not in rendered

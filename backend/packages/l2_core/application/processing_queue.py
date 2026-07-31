@@ -1,0 +1,125 @@
+from __future__ import annotations
+
+from datetime import UTC, datetime
+from typing import Any
+from uuid import UUID, uuid4
+
+from pydantic import BaseModel, ConfigDict
+
+from l1_foundation.messaging import KafkaEventProducer, Topics, new_event
+from l1_foundation.pipeline.contracts import ArtifactRef
+
+
+class ProcessingQueueUnavailableError(RuntimeError):
+    """Raised when Kafka does not acknowledge a Processing command."""
+
+
+class ProcessingWorkItem(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    processing_id: UUID
+    subject_type: str
+    subject_id: UUID
+    pipeline_name: str
+    pipeline_version: str
+    initial_artifacts: list[ArtifactRef]
+
+
+class ProcessingCancelWorkItem(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    subject_type: str
+    subject_id: UUID
+
+
+class EmbeddingReindexWorkItem(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    processing_id: UUID
+    subject_id: UUID
+    chunks: ArtifactRef
+
+
+def queued_processing_state(
+    processing_id: UUID,
+    subject_id: UUID,
+    pipeline_name: str,
+    pipeline_version: str,
+) -> dict[str, Any]:
+    """Build the API-side live projection visible before a worker starts the DAG."""
+    now = datetime.now(UTC).isoformat()
+    return {
+        "processing_id": str(processing_id),
+        "subject_type": "recording",
+        "subject_id": str(subject_id),
+        "pipeline_name": pipeline_name,
+        "pipeline_version": pipeline_version,
+        "status": "queued",
+        "stages": {},
+        "created_at": now,
+        "updated_at": now,
+    }
+
+
+class ProcessingCommandPublisher:
+    def __init__(self, producer: KafkaEventProducer) -> None:
+        self._kafka_producer = producer
+
+    async def submit_recording(self, subject_id: UUID, pipeline_name: str, pipeline_version: str, source: ArtifactRef) -> UUID:
+        processing_id = uuid4()
+        item = ProcessingWorkItem(
+            processing_id=processing_id,
+            subject_type="recording",
+            subject_id=subject_id,
+            pipeline_name=pipeline_name,
+            pipeline_version=pipeline_version,
+            initial_artifacts=[source],
+        )
+        try:
+            await self._kafka_producer.publish(
+                Topics.PROCESSING_COMMANDS,
+                str(processing_id),
+                new_event(
+                    "processing.requested",
+                    "production-api",
+                    correlation_id=processing_id,
+                    processing_id=processing_id,
+                    payload=item.model_dump(mode="json"),
+                ),
+            )
+        except Exception as error:
+            raise ProcessingQueueUnavailableError("Processing queue unavailable") from error
+        return processing_id
+
+    async def cancel_recording(self, subject_id: UUID) -> None:
+        item = ProcessingCancelWorkItem(subject_type="recording", subject_id=subject_id)
+        try:
+            await self._kafka_producer.publish(
+                Topics.PROCESSING_CANCEL,
+                str(subject_id),
+                new_event(
+                    "processing.cancel.requested",
+                    "production-api",
+                    correlation_id=subject_id,
+                    payload=item.model_dump(mode="json"),
+                ),
+            )
+        except Exception as error:
+            raise ProcessingQueueUnavailableError("Processing cancellation queue unavailable") from error
+
+    async def retry_embedding_index(self, processing_id: UUID, subject_id: UUID, chunks: ArtifactRef) -> None:
+        item = EmbeddingReindexWorkItem(processing_id=processing_id, subject_id=subject_id, chunks=chunks)
+        try:
+            await self._kafka_producer.publish(
+                Topics.PROCESSING_COMMANDS,
+                str(processing_id),
+                new_event(
+                    "processing.embedding-index.requested",
+                    "production-api",
+                    correlation_id=processing_id,
+                    processing_id=processing_id,
+                    payload=item.model_dump(mode="json"),
+                ),
+            )
+        except Exception as error:
+            raise ProcessingQueueUnavailableError("Embedding reindex queue unavailable") from error

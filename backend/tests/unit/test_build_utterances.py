@@ -50,3 +50,43 @@ def test_build_utterances_projects_upstream_segments_without_merging_or_reorderi
         ["A:0:1000"],
         ["B:2100:3000"],
     ]
+
+
+def test_build_utterances_restores_its_deterministic_artifact(tmp_path: Path) -> None:
+    storage = ArtifactStore(tmp_path)
+    stage = BuildUtterancesStage(storage)
+    context = StageContext(PipelineSubjectId(uuid4()), PipelineRunId(uuid4()), StageRunId(uuid4()), 1)
+    output = {
+        "segments": [
+            {
+                "utterance_index": 0,
+                "start_ms": 0,
+                "end_ms": 1000,
+                "text": "hello",
+                "speaker_label": "Speaker A",
+                "speaker_cluster_id": "A",
+                "source_segment_indexes": [0],
+                "source_diarization_segment_ids": ["A:0:1000"],
+            }
+        ]
+    }
+    storage.write_json(
+        context.subject_id,
+        context.pipeline_run_id,
+        context.stage_run_id,
+        stage.name,
+        ArtifactPayload(artifact_type="utterances.final", data=output),
+        stage_version=stage.version,
+    )
+
+    unused_input = storage.write_json(
+        context.subject_id,
+        context.pipeline_run_id,
+        StageRunId(uuid4()),
+        "unused",
+        ArtifactPayload(artifact_type="transcript.aligned", data={}),
+    )
+    restored = asyncio.run(stage.try_restore(context, BuildUtterancesInput(transcript=unused_input)))
+
+    assert restored is not None
+    assert restored.output.segments[0].text == "hello"

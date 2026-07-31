@@ -8,11 +8,11 @@ from l2_core.auth.contracts import CurrentUser
 
 
 class ConversationAccessDeniedError(PermissionError):
-    """Raised when a user is not a member of the conversation workspace."""
+    """Raised when a user no longer owns an active conversation."""
 
 
 class ConversationAccessService:
-    """Workspace-based access checks for long-lived chat conversations."""
+    """Owner-based access checks for long-lived chat conversations."""
 
     def __init__(self, engine: Engine) -> None:
         self._engine = engine
@@ -23,12 +23,17 @@ class ConversationAccessService:
                 text(
                     """
                     select 1 from conversations
-                    join workspace_memberships on workspace_memberships.workspace_id = conversations.workspace_id
-                    where conversations.id = :conversation_id and conversations.archived_at is null
-                        and workspace_memberships.user_id = :user_id
+                    where id = :conversation_id
+                        and workspace_id = :workspace_id
+                        and owner_user_id = :user_id
+                        and archived_at is null
                     """
                 ),
-                {"conversation_id": conversation_id, "user_id": user.id},
+                {
+                    "conversation_id": conversation_id,
+                    "workspace_id": user.current_workspace_id,
+                    "user_id": user.id,
+                },
             ).scalar_one_or_none()
         if allowed is None:
             raise ConversationAccessDeniedError(str(conversation_id))

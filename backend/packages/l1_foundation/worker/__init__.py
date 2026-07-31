@@ -1,0 +1,53 @@
+"""Typed task contracts and Kafka/Redis clients for compute workers."""
+
+from l1_foundation.worker.client import SyncWorkerClient, WorkerClient
+from l1_foundation.worker.contracts import (
+    ComputeCancelledEvent,
+    ComputeCancelRequest,
+    ComputeCommand,
+    ComputeCompletedEvent,
+    ComputeDeltaEvent,
+    ComputeEvent,
+    ComputeFailedEvent,
+    ComputeHeartbeatEvent,
+    ComputeProgressEvent,
+    ComputeQueuedEvent,
+    ComputeRetryingEvent,
+    ComputeStartedEvent,
+    ComputeTaskError,
+    ComputeTaskRequest,
+    ComputeTaskSnapshot,
+    ComputeTaskStatus,
+    ExecutionScope,
+    WorkerExecutionContext,
+    WorkerHandler,
+    execution_scope,
+)
+from l1_foundation.worker.kafka_client import KafkaWorkerClient, SyncKafkaWorkerClient
+
+__all__ = [
+    "ComputeCancelledEvent",
+    "ComputeCancelRequest",
+    "WorkerClient",
+    "KafkaWorkerClient",
+    "ComputeCommand",
+    "ComputeCompletedEvent",
+    "ComputeDeltaEvent",
+    "ComputeEvent",
+    "ComputeFailedEvent",
+    "ComputeHeartbeatEvent",
+    "ComputeProgressEvent",
+    "ComputeQueuedEvent",
+    "ComputeRetryingEvent",
+    "ComputeStartedEvent",
+    "SyncWorkerClient",
+    "SyncKafkaWorkerClient",
+    "ComputeTaskError",
+    "ComputeTaskRequest",
+    "ComputeTaskSnapshot",
+    "ComputeTaskStatus",
+    "ExecutionScope",
+    "WorkerExecutionContext",
+    "WorkerHandler",
+    "execution_scope",
+]

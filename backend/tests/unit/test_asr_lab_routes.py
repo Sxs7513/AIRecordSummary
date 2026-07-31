@@ -1,10 +1,10 @@
 from uuid import UUID
 
 import pytest
+from asr_lab_routes import FreezeDatasetVersionRequest, evaluation_router
 from fastapi.routing import APIRoute
 from pydantic import ValidationError
-
-from routes.asr_lab import CreateTrainingRunRequest, FreezeDatasetVersionRequest, evaluation_router, training_router
+from training_routes import CreateTrainingRunRequest, training_router
 
 _DATASET_ID = UUID("00000000-0000-0000-0000-000000000001")
 _VERSION_ID = UUID("00000000-0000-0000-0000-000000000002")

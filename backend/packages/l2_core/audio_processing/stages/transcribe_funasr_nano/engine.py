@@ -20,7 +20,7 @@ class FunAsrNanoConfig:
     language: str
     model_cache_root: Path
     hotwords: list[str]
-    max_inference_batch_size: int = 4
+    max_inference_batch_size: int = 1
     speech_window_target_duration_ms: int = 30_000
     speech_window_max_duration_ms: int = 80_000
     speech_window_overlap_ms: int = 500
@@ -40,6 +40,12 @@ class SpeechWindow:
 class FunAsrNanoResult:
     language: str | None
     windows: list[tuple[SpeechWindow, str]]
+
+
+@dataclass(frozen=True, slots=True)
+class FunAsrNanoInferenceResult:
+    language: str | None
+    texts: list[str]
 
 
 def build_continuous_speech_windows(
@@ -103,39 +109,66 @@ class FunAsrNanoEngine:
         segments: Sequence[DiarizationSegment],
         progress: Callable[[int, str], None],
     ) -> FunAsrNanoResult:
+        with tempfile.TemporaryDirectory() as directory, self.prepare_inference_batch(audio_path, segments, Path(directory)) as (windows, paths):
+            result = self.infer_batch(paths, progress)
+        return FunAsrNanoResult(result.language, list(zip(windows, result.texts, strict=True)))
+
+    @contextlib.contextmanager
+    def prepare_inference_batch(
+        self,
+        audio_path: Path,
+        segments: Sequence[DiarizationSegment],
+        work_dir: Path,
+    ) -> Generator[tuple[list[SpeechWindow], list[Path]]]:
         windows = build_continuous_speech_windows(
             segments,
             self._config.speech_window_target_duration_ms,
             self._config.speech_window_max_duration_ms,
             self._config.speech_window_overlap_ms,
         )
+        work_dir.mkdir(parents=True, exist_ok=True)
+        with contextlib.ExitStack() as stack:
+            paths = [stack.enter_context(self._cropped_wav(audio_path, item.input_start_ms, item.input_end_ms, work_dir)) for item in windows]
+            yield windows, paths
+
+    def infer_batch(
+        self,
+        audio_paths: Sequence[Path],
+        progress: Callable[[int, str], None],
+        check_cancelled: Callable[[], None] | None = None,
+        on_item_completed: Callable[[int, str], None] | None = None,
+    ) -> FunAsrNanoInferenceResult:
         language = self._language_argument()
-        if not windows:
-            return FunAsrNanoResult(language, [])
+        if not audio_paths:
+            return FunAsrNanoInferenceResult(language, [])
         runtime = self._load_model(progress)
-        output: list[tuple[SpeechWindow, str]] = []
-        batch_size = max(1, self._config.max_inference_batch_size)
-        progress(20, f"开始转写 {len(windows)} 个连续语音窗口")
-        for offset in range(0, len(windows), batch_size):
-            batch = windows[offset : offset + batch_size]
-            progress(20 + round(70 * offset / len(windows)), f"FunASR 转写连续语音窗口 {offset + 1}-{offset + len(batch)}/{len(windows)}")
-            with contextlib.ExitStack() as stack:
-                paths = [stack.enter_context(self._cropped_wav(audio_path, item.input_start_ms, item.input_end_ms)) for item in batch]
-                results = runtime.generate(
-                    input=[str(path) for path in paths],
+        texts: list[str] = []
+        total = len(audio_paths)
+        for index, path in enumerate(audio_paths):
+            if check_cancelled is not None:
+                check_cancelled()
+            progress(15 + round(80 * index / total), f"FunASR 推理 {index + 1}/{total}")
+            result = cast(
+                object,
+                runtime.generate(
+                    input=str(path),
                     cache={},
-                    batch_size=len(paths),
+                    batch_size=1,
                     language=language,
                     hotwords=self._config.hotwords,
                     sentence_timestamp=False,
                     disable_pbar=True,
-                )
-            items = results if isinstance(results, list | tuple) else [results]
-            if len(items) != len(batch):
-                raise RuntimeError(f"FunASR result count mismatch: expected {len(batch)}, got {len(items)}")
-            output.extend((window, self._text(item)) for window, item in zip(batch, items, strict=True))
-        progress(95, "整理连续语音窗口转写结果")
-        return FunAsrNanoResult(language, output)
+                ),
+            )
+            items = list(cast(Sequence[object], result)) if isinstance(result, list | tuple) else [result]
+            if len(items) != 1:
+                raise RuntimeError(f"FunASR item result count mismatch: expected 1, got {len(items)}")
+            text = self._text(items[0])
+            texts.append(text)
+            if on_item_completed is not None:
+                on_item_completed(index, text)
+        progress(100, f"FunASR 推理 {total}/{total}")
+        return FunAsrNanoInferenceResult(language, texts)
 
     def release(self) -> None:
         self._runtime = None
@@ -167,14 +200,14 @@ class FunAsrNanoEngine:
     @staticmethod
     def _text(item: object) -> str:
         if isinstance(item, Mapping):
-            value = item.get("text")
+            value = cast(Mapping[str, object], item).get("text")
             return value.strip() if isinstance(value, str) else ""
         value = getattr(item, "text", "")
         return value.strip() if isinstance(value, str) else ""
 
     @contextlib.contextmanager
-    def _cropped_wav(self, source: Path, start_ms: int, end_ms: int) -> Generator[Path]:
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temporary:
+    def _cropped_wav(self, source: Path, start_ms: int, end_ms: int, output_dir: Path | None = None) -> Generator[Path]:
+        with tempfile.NamedTemporaryFile(suffix=".wav", dir=output_dir, delete=False) as temporary:
             output = Path(temporary.name)
         try:
             subprocess.run(

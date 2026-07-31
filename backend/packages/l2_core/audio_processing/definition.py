@@ -2,7 +2,7 @@
 
 from typing import Literal
 
-from l1_foundation.pipeline.contracts import ResourceQueue, RetryPolicy
+from l1_foundation.pipeline.contracts import RetryPolicy
 from l1_foundation.pipeline.definitions.graph import ArtifactBinding, PipelineDefinition, PipelineNode
 
 CPU_RETRY = RetryPolicy(initial_backoff_seconds=10)
@@ -14,18 +14,17 @@ type AsrProvider = Literal["qwen_asr", "funasr_nano"]
 def build_recording_processing(asr_provider: AsrProvider = "qwen_asr") -> PipelineDefinition:
     """Assemble the business pipeline with the configured ASR stage plugin."""
     asr_stage_name, asr_stage_version = {
-        "qwen_asr": ("transcribe_qwen_asr", "5"),
+        "qwen_asr": ("transcribe_qwen_asr", "11"),
         "funasr_nano": ("transcribe_funasr_nano", "3"),
     }[asr_provider]
     return PipelineDefinition(
         name="recording_processing",
-        version="10",
+        version="25",
         nodes=(
             PipelineNode(
                 "normalize_audio",
                 "normalize_audio",
                 "1",
-                ResourceQueue.CPU,
                 CPU_RETRY,
                 input_artifacts=(ArtifactBinding("source_audio", "audio.source"),),
                 output_artifacts=("audio.normalized",),
@@ -33,8 +32,7 @@ def build_recording_processing(asr_provider: AsrProvider = "qwen_asr") -> Pipeli
             PipelineNode(
                 "diarize_pyannote",
                 "diarize_pyannote",
-                "1",
-                ResourceQueue.GPU_HIGH,
+                "2",
                 GPU_RETRY,
                 depends_on=("normalize_audio",),
                 input_artifacts=(ArtifactBinding("audio", "audio.normalized", "normalize_audio"),),
@@ -43,8 +41,7 @@ def build_recording_processing(asr_provider: AsrProvider = "qwen_asr") -> Pipeli
             PipelineNode(
                 "preprocess_asr_audio",
                 "preprocess_asr_audio",
-                "1",
-                ResourceQueue.CPU,
+                "5",
                 CPU_RETRY,
                 depends_on=("normalize_audio",),
                 input_artifacts=(ArtifactBinding("audio", "audio.normalized", "normalize_audio"),),
@@ -54,7 +51,6 @@ def build_recording_processing(asr_provider: AsrProvider = "qwen_asr") -> Pipeli
                 asr_stage_name,
                 asr_stage_name,
                 asr_stage_version,
-                ResourceQueue.GPU_HIGH,
                 GPU_RETRY,
                 depends_on=("preprocess_asr_audio", "diarize_pyannote"),
                 input_artifacts=(
@@ -66,8 +62,7 @@ def build_recording_processing(asr_provider: AsrProvider = "qwen_asr") -> Pipeli
             PipelineNode(
                 "correct_asr_windows",
                 "correct_asr_windows",
-                "1",
-                ResourceQueue.GPU_NORMAL,
+                "4",
                 GPU_RETRY,
                 depends_on=(asr_stage_name,),
                 input_artifacts=(ArtifactBinding("transcript", "transcript.asr_windows", asr_stage_name),),
@@ -76,8 +71,7 @@ def build_recording_processing(asr_provider: AsrProvider = "qwen_asr") -> Pipeli
             PipelineNode(
                 "align_transcript",
                 "align_transcript",
-                "1",
-                ResourceQueue.GPU_HIGH,
+                "2",
                 GPU_RETRY,
                 depends_on=("correct_asr_windows", "preprocess_asr_audio", "diarize_pyannote"),
                 input_artifacts=(
@@ -91,7 +85,6 @@ def build_recording_processing(asr_provider: AsrProvider = "qwen_asr") -> Pipeli
                 "build_utterances",
                 "build_utterances",
                 "4",
-                ResourceQueue.CPU,
                 CPU_RETRY,
                 depends_on=("align_transcript",),
                 input_artifacts=(ArtifactBinding("transcript", "transcript.aligned", "align_transcript"),),
@@ -100,8 +93,7 @@ def build_recording_processing(asr_provider: AsrProvider = "qwen_asr") -> Pipeli
             PipelineNode(
                 "build_search_chunks",
                 "build_search_chunks",
-                "2",
-                ResourceQueue.GPU_NORMAL,
+                "4",
                 GPU_RETRY,
                 depends_on=("build_utterances",),
                 input_artifacts=(ArtifactBinding("utterances", "utterances.final", "build_utterances"),),
@@ -110,8 +102,7 @@ def build_recording_processing(asr_provider: AsrProvider = "qwen_asr") -> Pipeli
             PipelineNode(
                 "embedding_indexing",
                 "embedding_indexing",
-                "1",
-                ResourceQueue.GPU_NORMAL,
+                "3",
                 GPU_RETRY,
                 depends_on=("build_search_chunks",),
                 required=False,
@@ -122,7 +113,6 @@ def build_recording_processing(asr_provider: AsrProvider = "qwen_asr") -> Pipeli
                 "generate_summary",
                 "generate_summary",
                 "2",
-                ResourceQueue.GPU_NORMAL,
                 GPU_RETRY,
                 depends_on=("build_utterances",),
                 required=False,

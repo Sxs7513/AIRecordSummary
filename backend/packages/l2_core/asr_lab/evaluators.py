@@ -76,7 +76,7 @@ class AsrEvaluationWorker:
                     with candidate as (
                         select id
                         from evaluation_runs
-                        where status = 'queued'
+                        where status = 'queued' and evaluator_type = 'asr'
                         order by created_at
                         for update skip locked
                         limit 1

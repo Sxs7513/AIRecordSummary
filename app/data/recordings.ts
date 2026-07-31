@@ -1,17 +1,20 @@
 import { cookies } from "next/headers";
 import type { Recording, RecordingSummary, SpeakerDiarizationSegment, Transcription, TranscriptionSegment, TranscriptionToken, UtteranceSegment } from "@/app/shared/models";
 
-export type PipelineStage = { id: string; nodeName: string; stageName: string; stageVersion: string; required: boolean; resourceQueue: "cpu" | "gpu_normal" | "gpu_high"; status: string; attemptCount: number; maxAttempts: number | null; progressPercent: number | null; progressMessage: string | null; progressUpdatedAt: string | null; generationRunId: string | null; errorMessage: string | null; startedAt: string | null; finishedAt: string | null };
+export type PipelineStage = { id: string; nodeName: string; stageName: string; stageVersion: string; required: boolean; status: string; attemptCount: number; maxAttempts: number | null; progressPercent: number | null; progressMessage: string | null; progressUpdatedAt: string | null; generationRunId: string | null; errorMessage: string | null; startedAt: string | null; finishedAt: string | null };
 export type PipelineRun = { id: string; status: string; errorMessage: string | null; startedAt: string | null; finishedAt: string | null; stages: PipelineStage[] };
 export type PipelineRecordingDetail = { recording: Recording; summary: RecordingSummary | null; transcription: Transcription | null; transcriptionSegments: TranscriptionSegment[]; transcriptionTokens: TranscriptionToken[]; speakerDiarizationSegments: SpeakerDiarizationSegment[]; utteranceSegments: UtteranceSegment[]; speakerProfiles: []; pipelineRun: PipelineRun | null };
 
 const pythonApiOrigin = process.env.PYTHON_API_ORIGIN ?? "http://localhost:8000";
 async function get<T>(path: string): Promise<T | null> {
-  const cookie = (await cookies()).toString();
-  const response = await fetch(`${pythonApiOrigin}${path}`, { cache: "no-store", headers: cookie ? { cookie } : undefined });
-  if (response.status === 404) return null;
-  if (!response.ok) throw new Error(`Python API request failed: ${response.status}`);
-  return response.json() as Promise<T>;
+  try {
+    const cookie = (await cookies()).toString();
+    const response = await fetch(`${pythonApiOrigin}${path}`, { cache: "no-store", headers: cookie ? { cookie } : undefined });
+    if (!response.ok) return null;
+    return await response.json() as T;
+  } catch {
+    return null;
+  }
 }
 
 type ApiRecording = Record<string, unknown>;
@@ -24,7 +27,7 @@ function transcriptionSegment(value: ApiRecording): TranscriptionSegment { retur
 function transcriptionToken(value: ApiRecording): TranscriptionToken { return { id: String(value.id), recordingId: String(value.recording_id), transcriptionId: String(value.transcription_id), tokenIndex: Number(value.token_index), sourceWindowIndex: Number(value.source_window_index), text: String(value.text), startMs: Number(value.start_ms), endMs: Number(value.end_ms), speakerClusterId: stringOrNull(value.speaker_cluster_id), speakerLabel: stringOrNull(value.speaker_label), attributionStatus: String(value.attribution_status) }; }
 function diarizationSegment(value: ApiRecording): SpeakerDiarizationSegment { return { id: String(value.id), recordingId: String(value.recording_id), speakerClusterId: String(value.speaker_cluster_id), speakerLabel: String(value.speaker_label), startMs: Number(value.start_ms), endMs: Number(value.end_ms), confidence: numberOrNull(value.confidence), isTargetPerson: Boolean(value.is_target_person), targetPersonConfidence: numberOrNull(value.target_person_confidence), matchedSpeakerProfileId: stringOrNull(value.matched_speaker_profile_id), createdAt: String(value.created_at) }; }
 function utteranceSegment(value: ApiRecording): UtteranceSegment { return { id: String(value.id), recordingId: String(value.recording_id), utteranceIndex: Number(value.utterance_index), startMs: Number(value.start_ms), endMs: Number(value.end_ms), text: String(value.text), speakerLabel: stringOrNull(value.speaker_label), speakerClusterId: stringOrNull(value.speaker_cluster_id), sourceTranscriptionSegmentIds: Array.isArray(value.source_transcription_segment_ids) ? value.source_transcription_segment_ids.map(String) : [], isTargetPerson: Boolean(value.is_target_person), targetPersonConfidence: numberOrNull(value.target_person_confidence), matchedSpeakerProfileId: stringOrNull(value.matched_speaker_profile_id), mergeReason: String(value.merge_reason), createdAt: String(value.created_at) }; }
-function stage(value: ApiRecording): PipelineStage { return { id: String(value.id), nodeName: String(value.node_name), stageName: String(value.stage_name), stageVersion: String(value.stage_version), required: Boolean(value.required), resourceQueue: value.resource_queue as PipelineStage["resourceQueue"], status: String(value.status), attemptCount: Number(value.attempt_count), maxAttempts: numberOrNull(value.max_attempts), progressPercent: numberOrNull(value.progress_percent), progressMessage: stringOrNull(value.progress_message), progressUpdatedAt: stringOrNull(value.progress_updated_at), generationRunId: stringOrNull(value.generation_run_id), errorMessage: stringOrNull(value.error_message), startedAt: stringOrNull(value.started_at), finishedAt: stringOrNull(value.finished_at) }; }
+function stage(value: ApiRecording): PipelineStage { return { id: String(value.id), nodeName: String(value.node_name), stageName: String(value.stage_name), stageVersion: String(value.stage_version), required: Boolean(value.required), status: String(value.status), attemptCount: Number(value.attempt_count), maxAttempts: numberOrNull(value.max_attempts), progressPercent: numberOrNull(value.progress_percent), progressMessage: stringOrNull(value.progress_message), progressUpdatedAt: stringOrNull(value.progress_updated_at), generationRunId: stringOrNull(value.generation_run_id), errorMessage: stringOrNull(value.error_message), startedAt: stringOrNull(value.started_at), finishedAt: stringOrNull(value.finished_at) }; }
 function stringOrNull(value: unknown): string | null { return typeof value === "string" ? value : null; }
 function numberOrNull(value: unknown): number | null { return typeof value === "number" ? value : null; }
 
@@ -32,7 +35,7 @@ export async function listPythonRecordings(params: { status?: string; page?: num
   const query = new URLSearchParams({ page: String(params.page ?? 1), page_size: String(params.pageSize ?? 20) });
   if (params.status && params.status !== "all") query.set("status", params.status);
   const response = await get<{ items: ApiRecording[]; total: number; stats: Record<string, number>; page: number; page_size: number }>(`/api/recordings?${query}`);
-  if (!response) throw new Error("Python recordings API is unavailable");
+  if (!response) return { items: [], total: 0, stats: {}, page: params.page ?? 1, pageSize: params.pageSize ?? 20 };
   return { items: response.items.map(recording), total: response.total, stats: response.stats, page: response.page, pageSize: response.page_size };
 }
 

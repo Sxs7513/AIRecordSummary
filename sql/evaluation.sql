@@ -12,7 +12,7 @@ create table if not exists evaluation_datasets (
     workspace_id uuid not null references workspaces(id) on delete restrict,
     name text not null,
     description text,
-    task_type text not null check (task_type in ('asr')),
+    task_type text not null check (task_type in ('asr', 'rag_retrieval', 'rag_answer')),
     status text not null default 'active' check (status in ('active', 'archived')),
     created_by_user_id uuid not null references users(id) on delete restrict,
     archived_at timestamptz,
@@ -37,6 +37,14 @@ create index if not exists evaluation_datasets_workspace_updated_idx
 create unique index if not exists evaluation_datasets_workspace_active_name_uidx
     on evaluation_datasets (workspace_id, lower(name))
     where status = 'active';
+
+-- Existing installations created the task-type check when ASR was the only
+-- evaluator. Keep the table shared while allowing task-specific detail tables.
+alter table evaluation_datasets
+    drop constraint if exists evaluation_datasets_task_type_check;
+alter table evaluation_datasets
+    add constraint evaluation_datasets_task_type_check
+    check (task_type in ('asr', 'rag_retrieval', 'rag_answer'));
 
 -- Exactly one source is present:
 -- - recording_id imports an existing production recording;
@@ -103,6 +111,8 @@ create table if not exists evaluation_annotations (
     reviewed_at timestamptz,
     approved_by_user_id uuid references users(id) on delete restrict,
     approved_at timestamptz,
+    archived_by_user_id uuid references users(id) on delete restrict,
+    archived_at timestamptz,
     created_by_user_id uuid not null references users(id) on delete restrict,
     created_at timestamptz not null default now(),
     updated_at timestamptz not null default now(),
@@ -150,6 +160,7 @@ create table if not exists evaluation_dataset_versions (
     status text not null default 'building' check (status in ('building', 'frozen')),
     normalization_name text not null,
     normalization_version text not null,
+    definition_snapshot jsonb not null default '{}'::jsonb,
     split_strategy jsonb not null default '{}'::jsonb,
     case_count integer not null default 0 check (case_count >= 0),
     checksum text,
@@ -160,6 +171,7 @@ create table if not exists evaluation_dataset_versions (
     check (length(btrim(normalization_name)) > 0),
     check (length(btrim(normalization_version)) > 0),
     check (jsonb_typeof(split_strategy) = 'object'),
+    check (jsonb_typeof(definition_snapshot) = 'object'),
     check (
         (status = 'building' and checksum is null and frozen_at is null)
         or (status = 'frozen'
@@ -168,6 +180,9 @@ create table if not exists evaluation_dataset_versions (
             and frozen_at is not null)
     )
 );
+
+alter table evaluation_dataset_versions
+    add column if not exists definition_snapshot jsonb not null default '{}'::jsonb;
 
 comment on table evaluation_dataset_versions is
     '不可变评测数据集版本。frozen 后 case、切分、标准化版本和 checksum 均不得修改。';
@@ -235,6 +250,10 @@ returns trigger
 language plpgsql
 as $$
 begin
+    if current_setting('app.evaluation_maintenance', true) = 'on' then
+        if tg_op = 'DELETE' then return old; end if;
+        return new;
+    end if;
     if old.status = 'frozen' then
         raise exception 'evaluation dataset version % is frozen and immutable', old.id;
     end if;
@@ -253,6 +272,10 @@ declare
     old_version_status text;
     new_version_status text;
 begin
+    if current_setting('app.evaluation_maintenance', true) = 'on' then
+        if tg_op = 'DELETE' then return old; end if;
+        return new;
+    end if;
     if tg_op in ('UPDATE', 'DELETE') then
         select status
         into old_version_status
@@ -572,3 +595,412 @@ create unique index if not exists evaluation_metric_values_case_scope_uidx
 create index if not exists evaluation_metric_values_case_idx
     on evaluation_metric_values (evaluation_case_id, metric_name)
     where evaluation_case_id is not null;
+
+-- RAG retrieval evaluation -------------------------------------------------
+-- The generic dataset/version/run control plane above is shared with ASR.
+-- RAG cases, evidence judgments and ranked outputs remain task-specific.
+
+create table if not exists rag_evaluation_case_drafts (
+    id uuid primary key default gen_random_uuid(),
+    dataset_id uuid not null references evaluation_datasets(id) on delete restrict,
+    query text not null,
+    scope jsonb not null default '{}'::jsonb,
+    tags text[] not null default '{}',
+    status text not null default 'draft' check (status in ('draft', 'reviewed', 'approved')),
+    group_key text not null,
+    revision integer not null default 1 check (revision > 0),
+    reviewed_by_user_id uuid references users(id) on delete restrict,
+    reviewed_at timestamptz,
+    approved_by_user_id uuid references users(id) on delete restrict,
+    approved_at timestamptz,
+    created_by_user_id uuid not null references users(id) on delete restrict,
+    created_at timestamptz not null default now(),
+    updated_at timestamptz not null default now(),
+    check (length(btrim(query)) > 0),
+    check (length(btrim(group_key)) > 0),
+    check (jsonb_typeof(scope) = 'object'),
+    check ((reviewed_by_user_id is null) = (reviewed_at is null)),
+    check ((approved_by_user_id is null) = (approved_at is null)),
+    check (
+        (status = 'draft' and reviewed_by_user_id is null and approved_by_user_id is null)
+        or (status = 'reviewed' and reviewed_by_user_id is not null and approved_by_user_id is null)
+        or (status = 'approved' and reviewed_by_user_id is not null and approved_by_user_id is not null)
+    )
+);
+
+comment on table rag_evaluation_case_drafts is
+    'RAG 检索评测的可编辑问题工作区；修改问题或证据后必须回到 draft。';
+
+create index if not exists rag_evaluation_case_drafts_dataset_status_idx
+    on rag_evaluation_case_drafts (dataset_id, status, updated_at desc);
+
+alter table rag_evaluation_case_drafts
+    add column if not exists archived_by_user_id uuid references users(id) on delete restrict,
+    add column if not exists archived_at timestamptz;
+
+create table if not exists rag_evaluation_evidence_drafts (
+    id uuid primary key default gen_random_uuid(),
+    case_draft_id uuid not null references rag_evaluation_case_drafts(id) on delete cascade,
+    source_recording_id uuid not null,
+    source_chunk_id uuid,
+    quote text not null,
+    start_ms integer not null check (start_ms >= 0),
+    end_ms integer not null check (end_ms >= start_ms),
+    relevance integer not null default 3 check (relevance between 1 and 3),
+    content_checksum text not null,
+    metadata jsonb not null default '{}'::jsonb,
+    created_at timestamptz not null default now(),
+    check (length(btrim(quote)) > 0),
+    check (length(btrim(content_checksum)) > 0),
+    check (jsonb_typeof(metadata) = 'object'),
+    unique (case_draft_id, source_recording_id, start_ms, end_ms, content_checksum)
+);
+
+comment on table rag_evaluation_evidence_drafts is
+    '人工选择的相关 SearchChunk 快照。source_chunk_id 仅用于追踪，不设置强外键，以免重新索引阻塞或破坏标注。';
+
+create index if not exists rag_evaluation_evidence_drafts_case_idx
+    on rag_evaluation_evidence_drafts (case_draft_id, created_at);
+create index if not exists rag_evaluation_evidence_drafts_recording_idx
+    on rag_evaluation_evidence_drafts (source_recording_id, start_ms, end_ms);
+
+-- Recording IDs are weak provenance references. The evaluation server owns
+-- orphan cleanup so recording deletion never depends on evaluation tables.
+alter table rag_evaluation_evidence_drafts
+    drop constraint if exists rag_evaluation_evidence_drafts_source_recording_id_fkey;
+
+create or replace function reset_rag_case_draft_after_evidence_delete()
+returns trigger
+language plpgsql
+as $$
+begin
+    if current_setting('app.evaluation_maintenance', true) = 'on' then
+        return old;
+    end if;
+    update rag_evaluation_case_drafts
+    set status = 'draft', reviewed_by_user_id = null, reviewed_at = null,
+        approved_by_user_id = null, approved_at = null,
+        revision = revision + 1, updated_at = now()
+    where id = old.case_draft_id;
+    return old;
+end;
+$$;
+
+drop trigger if exists rag_evaluation_evidence_drafts_reset_case_trigger
+    on rag_evaluation_evidence_drafts;
+create trigger rag_evaluation_evidence_drafts_reset_case_trigger
+after delete on rag_evaluation_evidence_drafts
+for each row execute function reset_rag_case_draft_after_evidence_delete();
+
+create table if not exists rag_evaluation_cases (
+    id uuid primary key default gen_random_uuid(),
+    dataset_version_id uuid not null references evaluation_dataset_versions(id) on delete restrict,
+    source_draft_id uuid not null references rag_evaluation_case_drafts(id) on delete restrict,
+    query text not null,
+    query_normalized text not null,
+    scope jsonb not null default '{}'::jsonb,
+    tags text[] not null default '{}',
+    split text not null default 'test' check (split in ('validation', 'test')),
+    group_key text not null,
+    metadata jsonb not null default '{}'::jsonb,
+    created_at timestamptz not null default now(),
+    unique (dataset_version_id, source_draft_id),
+    check (length(btrim(query)) > 0),
+    check (length(btrim(query_normalized)) > 0),
+    check (length(btrim(group_key)) > 0),
+    check (jsonb_typeof(scope) = 'object'),
+    check (jsonb_typeof(metadata) = 'object')
+);
+
+create index if not exists rag_evaluation_cases_version_split_idx
+    on rag_evaluation_cases (dataset_version_id, split, id);
+
+create table if not exists rag_evaluation_evidence (
+    id uuid primary key default gen_random_uuid(),
+    evaluation_case_id uuid not null references rag_evaluation_cases(id) on delete restrict,
+    source_recording_id uuid not null,
+    source_chunk_id uuid,
+    quote text not null,
+    start_ms integer not null check (start_ms >= 0),
+    end_ms integer not null check (end_ms >= start_ms),
+    relevance integer not null check (relevance between 1 and 3),
+    content_checksum text not null,
+    metadata jsonb not null default '{}'::jsonb,
+    created_at timestamptz not null default now(),
+    check (length(btrim(quote)) > 0),
+    check (length(btrim(content_checksum)) > 0),
+    check (jsonb_typeof(metadata) = 'object'),
+    unique (evaluation_case_id, source_recording_id, start_ms, end_ms, content_checksum)
+);
+
+create index if not exists rag_evaluation_evidence_case_idx
+    on rag_evaluation_evidence (evaluation_case_id, relevance desc);
+create index if not exists rag_evaluation_evidence_recording_idx
+    on rag_evaluation_evidence (source_recording_id, start_ms, end_ms);
+
+-- Frozen evidence is a self-contained benchmark snapshot. Keep the source UUID
+-- for matching and provenance, but do not let it block lifecycle deletion of
+-- the live recording.
+alter table rag_evaluation_evidence
+    drop constraint if exists rag_evaluation_evidence_source_recording_id_fkey;
+
+create table if not exists rag_corpus_snapshots (
+    id uuid primary key default gen_random_uuid(),
+    workspace_id uuid not null references workspaces(id) on delete restrict,
+    name text not null,
+    status text not null default 'building' check (status in ('building', 'frozen')),
+    recording_pipeline_version text,
+    search_chunk_version text not null,
+    embedding_model_id uuid not null references embedding_models(id) on delete restrict,
+    config_snapshot jsonb not null default '{}'::jsonb,
+    recording_count integer not null default 0 check (recording_count >= 0),
+    chunk_count integer not null default 0 check (chunk_count >= 0),
+    checksum text,
+    created_by_user_id uuid not null references users(id) on delete restrict,
+    frozen_at timestamptz,
+    created_at timestamptz not null default now(),
+    check (length(btrim(name)) > 0),
+    check (length(btrim(search_chunk_version)) > 0),
+    check (jsonb_typeof(config_snapshot) = 'object'),
+    check (
+        (status = 'building' and checksum is null and frozen_at is null)
+        or (status = 'frozen' and checksum is not null and length(btrim(checksum)) > 0 and frozen_at is not null)
+    )
+);
+
+create index if not exists rag_corpus_snapshots_workspace_created_idx
+    on rag_corpus_snapshots (workspace_id, created_at desc);
+create unique index if not exists rag_corpus_snapshots_workspace_checksum_uidx
+    on rag_corpus_snapshots (workspace_id, checksum)
+    where status = 'frozen';
+
+create table if not exists rag_corpus_snapshot_chunks (
+    id uuid primary key default gen_random_uuid(),
+    corpus_snapshot_id uuid not null references rag_corpus_snapshots(id) on delete restrict,
+    source_chunk_id uuid,
+    recording_id uuid not null,
+    chunk_index integer not null check (chunk_index >= 0),
+    text text not null,
+    normalized_text text not null,
+    start_ms integer not null check (start_ms >= 0),
+    end_ms integer not null check (end_ms >= start_ms),
+    metadata jsonb not null default '{}'::jsonb,
+    content_checksum text not null,
+    created_at timestamptz not null default now(),
+    check (jsonb_typeof(metadata) = 'object'),
+    check (length(btrim(content_checksum)) > 0),
+    unique (corpus_snapshot_id, recording_id, chunk_index)
+);
+
+create index if not exists rag_corpus_snapshot_chunks_snapshot_idx
+    on rag_corpus_snapshot_chunks (corpus_snapshot_id, recording_id, chunk_index);
+
+alter table rag_corpus_snapshot_chunks
+    drop constraint if exists rag_corpus_snapshot_chunks_recording_id_fkey;
+
+create table if not exists rag_pipeline_versions (
+    id uuid primary key default gen_random_uuid(),
+    workspace_id uuid not null references workspaces(id) on delete restrict,
+    name text,
+    config_hash text not null,
+    config_snapshot jsonb not null,
+    code_commit text,
+    created_by_user_id uuid not null references users(id) on delete restrict,
+    created_at timestamptz not null default now(),
+    check (name is null or length(btrim(name)) > 0),
+    check (length(btrim(config_hash)) > 0),
+    check (jsonb_typeof(config_snapshot) = 'object'),
+    unique (workspace_id, config_hash)
+);
+
+create index if not exists rag_pipeline_versions_workspace_created_idx
+    on rag_pipeline_versions (workspace_id, created_at desc);
+
+create table if not exists rag_evaluation_run_specs (
+    evaluation_run_id uuid primary key references evaluation_runs(id) on delete cascade,
+    corpus_snapshot_id uuid not null references rag_corpus_snapshots(id) on delete restrict,
+    pipeline_version_id uuid not null references rag_pipeline_versions(id) on delete restrict,
+    baseline_run_id uuid references evaluation_runs(id) on delete set null,
+    created_at timestamptz not null default now()
+);
+
+create index if not exists rag_evaluation_run_specs_pipeline_idx
+    on rag_evaluation_run_specs (pipeline_version_id, created_at desc);
+
+create table if not exists rag_evaluation_case_results (
+    id uuid primary key default gen_random_uuid(),
+    evaluation_run_id uuid not null references evaluation_runs(id) on delete cascade,
+    evaluation_case_id uuid not null references rag_evaluation_cases(id) on delete restrict,
+    status text not null check (status in ('running', 'succeeded', 'failed')),
+    query_used text,
+    latency_ms integer check (latency_ms is null or latency_ms >= 0),
+    error_message text,
+    details jsonb not null default '{}'::jsonb,
+    created_at timestamptz not null default now(),
+    updated_at timestamptz not null default now(),
+    check (jsonb_typeof(details) = 'object'),
+    check (
+        (status in ('running', 'succeeded') and query_used is not null and error_message is null)
+        or (status = 'failed' and error_message is not null)
+    ),
+    unique (evaluation_run_id, evaluation_case_id)
+);
+
+create index if not exists rag_evaluation_case_results_run_status_idx
+    on rag_evaluation_case_results (evaluation_run_id, status, evaluation_case_id);
+
+create table if not exists rag_evaluation_step_results (
+    id uuid primary key default gen_random_uuid(),
+    case_result_id uuid not null references rag_evaluation_case_results(id) on delete cascade,
+    operation text not null,
+    operation_version text not null default '1',
+    sequence integer not null check (sequence >= 0),
+    attempt integer not null default 0 check (attempt >= 0),
+    output_kind text not null,
+    status text not null check (status in ('running', 'succeeded', 'failed', 'cancelled')),
+    latency_ms integer check (latency_ms is null or latency_ms >= 0),
+    input_summary jsonb not null default '{}'::jsonb,
+    output jsonb not null default '{}'::jsonb,
+    error_message text,
+    details jsonb not null default '{}'::jsonb,
+    created_at timestamptz not null default now(),
+    updated_at timestamptz not null default now(),
+    check (length(btrim(operation)) > 0),
+    check (length(btrim(operation_version)) > 0),
+    check (length(btrim(output_kind)) > 0),
+    check (jsonb_typeof(input_summary) = 'object'),
+    check (jsonb_typeof(output) = 'object'),
+    check (jsonb_typeof(details) = 'object'),
+    unique (case_result_id, sequence)
+);
+
+create index if not exists rag_evaluation_step_results_case_operation_idx
+    on rag_evaluation_step_results (case_result_id, operation, attempt);
+
+create table if not exists rag_evaluation_ranked_results (
+    step_result_id uuid not null references rag_evaluation_step_results(id) on delete cascade,
+    rank integer not null check (rank > 0),
+    corpus_snapshot_chunk_id uuid references rag_corpus_snapshot_chunks(id) on delete restrict,
+    recording_id uuid not null,
+    source_chunk_id uuid,
+    score numeric,
+    vector_score numeric,
+    lexical_score numeric,
+    rrf_score numeric,
+    rerank_score numeric,
+    matched_evidence_id uuid references rag_evaluation_evidence(id) on delete restrict,
+    matched_relevance integer not null default 0 check (matched_relevance between 0 and 3),
+    match_kind text not null default 'none' check (match_kind in ('time_overlap', 'quote', 'checksum', 'none')),
+    details jsonb not null default '{}'::jsonb,
+    primary key (step_result_id, rank),
+    check (jsonb_typeof(details) = 'object')
+);
+
+create index if not exists rag_evaluation_ranked_results_chunk_idx
+    on rag_evaluation_ranked_results (source_chunk_id, step_result_id);
+create index if not exists rag_evaluation_ranked_results_evidence_idx
+    on rag_evaluation_ranked_results (matched_evidence_id)
+    where matched_evidence_id is not null;
+
+alter table rag_evaluation_ranked_results
+    drop constraint if exists rag_evaluation_ranked_results_recording_id_fkey;
+
+create table if not exists rag_evaluation_metric_values (
+    id uuid primary key default gen_random_uuid(),
+    evaluation_run_id uuid not null references evaluation_runs(id) on delete cascade,
+    evaluation_case_id uuid references rag_evaluation_cases(id) on delete restrict,
+    step_result_id uuid references rag_evaluation_step_results(id) on delete cascade,
+    scope text not null check (scope in ('run', 'tag', 'case', 'operation', 'step')),
+    scope_key text,
+    operation text,
+    metric_name text not null,
+    metric_version text not null,
+    value numeric not null,
+    sample_count integer check (sample_count is null or sample_count >= 0),
+    details jsonb not null default '{}'::jsonb,
+    created_at timestamptz not null default now(),
+    check (length(btrim(metric_name)) > 0),
+    check (length(btrim(metric_version)) > 0),
+    check (jsonb_typeof(details) = 'object')
+);
+
+create unique index if not exists rag_evaluation_metric_values_identity_uidx
+    on rag_evaluation_metric_values (
+        evaluation_run_id,
+        scope,
+        coalesce(scope_key, ''),
+        coalesce(operation, ''),
+        coalesce(evaluation_case_id::text, ''),
+        coalesce(step_result_id::text, ''),
+        metric_name,
+        metric_version
+    );
+create index if not exists rag_evaluation_metric_values_run_scope_idx
+    on rag_evaluation_metric_values (evaluation_run_id, scope, operation, metric_name);
+
+create or replace function reject_frozen_rag_case_mutation()
+returns trigger
+language plpgsql
+as $$
+declare
+    version_status text;
+begin
+    if current_setting('app.evaluation_maintenance', true) = 'on' then
+        if tg_op = 'DELETE' then return old; end if;
+        return new;
+    end if;
+    select status into version_status
+    from evaluation_dataset_versions
+    where id = coalesce(new.dataset_version_id, old.dataset_version_id);
+    if version_status = 'frozen' then
+        raise exception 'RAG evaluation dataset version is frozen and immutable';
+    end if;
+    if tg_op = 'DELETE' then return old; end if;
+    return new;
+end;
+$$;
+
+create or replace function reject_frozen_rag_evidence_mutation()
+returns trigger
+language plpgsql
+as $$
+declare
+    version_status text;
+begin
+    if current_setting('app.evaluation_maintenance', true) = 'on' then
+        if tg_op = 'DELETE' then return old; end if;
+        return new;
+    end if;
+    select versions.status into version_status
+    from rag_evaluation_cases cases
+    join evaluation_dataset_versions versions on versions.id = cases.dataset_version_id
+    where cases.id = coalesce(new.evaluation_case_id, old.evaluation_case_id);
+    if version_status = 'frozen' then
+        raise exception 'RAG evaluation dataset version is frozen and immutable';
+    end if;
+    if tg_op = 'DELETE' then return old; end if;
+    return new;
+end;
+$$;
+
+do $$
+begin
+    if not exists (
+        select 1 from pg_trigger
+        where tgname = 'rag_evaluation_cases_immutable_trigger'
+          and tgrelid = 'rag_evaluation_cases'::regclass and not tgisinternal
+    ) then
+        execute 'create trigger rag_evaluation_cases_immutable_trigger
+                 before insert or update or delete on rag_evaluation_cases
+                 for each row execute function reject_frozen_rag_case_mutation()';
+    end if;
+    if not exists (
+        select 1 from pg_trigger
+        where tgname = 'rag_evaluation_evidence_immutable_trigger'
+          and tgrelid = 'rag_evaluation_evidence'::regclass and not tgisinternal
+    ) then
+        execute 'create trigger rag_evaluation_evidence_immutable_trigger
+                 before insert or update or delete on rag_evaluation_evidence
+                 for each row execute function reject_frozen_rag_evidence_mutation()';
+    end if;
+end $$;

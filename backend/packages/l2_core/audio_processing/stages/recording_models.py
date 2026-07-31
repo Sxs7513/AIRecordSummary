@@ -5,6 +5,7 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 from l1_foundation.pipeline.contracts import ArtifactRef
+from l2_core.rag.search_document import build_retrieval_text
 
 type AsrProvider = Literal["qwen_asr", "funasr_nano"]
 
@@ -83,7 +84,7 @@ class CorrectedAsrWindowTranscript(AsrWindowTranscript):
 class CorrectedAsrWindowTranscriptOutput(BaseModel):
     asr_provider: AsrProvider
     asr_model_name: str
-    correction_provider: Literal["pycorrector_llm", "pycorrector", "rules"]
+    correction_provider: Literal["pycorrector_llm", "pycorrector", "llm", "rules"]
     correction_model_name: str | None
     language: str | None
     windows: list[CorrectedAsrWindowTranscript]
@@ -158,8 +159,13 @@ class SearchChunk(BaseModel):
     source_utterance_indexes: list[int]
     source_diarization_segment_ids: list[str]
     topic: str | None = None
+    terms: list[str] = Field(default_factory=list, max_length=8)
+    search_context: str | None = Field(default=None, max_length=300)
     topic_section_index: int | None = Field(default=None, ge=0)
     build_method: Literal["topic_boundary", "deterministic_fallback"] = "deterministic_fallback"
+
+    def retrieval_text(self) -> str:
+        return build_retrieval_text(self.text, self.topic, self.terms, self.search_context)
 
 
 class SearchChunksOutput(BaseModel):
@@ -187,6 +193,6 @@ class GenerateSummaryInput(BaseModel):
 
 
 class RecordingSummaryOutput(BaseModel):
-    provider: Literal["local_llm"]
+    provider: Literal["local", "zhipu", "gemini"]
     model_name: str
     summary_text: str

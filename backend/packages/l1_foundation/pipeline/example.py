@@ -5,8 +5,8 @@ Run it with:
     backend/.venv/bin/python -c \
       'import asyncio; from l1_foundation.pipeline.example import run_example; print(asyncio.run(run_example()))'
 
-The production worker does the same thing, but reads the graph and state from
-PostgreSQL instead of using the in-memory loop in ``run_example``.
+The production worker uses the same versioned graph contract, with Kafka as the
+durable command/event log and Redis as the live-state projection.
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ from __future__ import annotations
 from typing import Any
 from uuid import UUID
 
-from l1_foundation.pipeline.contracts import PipelineRunId, PipelineSubjectId, ResourceQueue, RetryPolicy, StageContext, StageResult, StageRunId
+from l1_foundation.pipeline.contracts import PipelineRunId, PipelineSubjectId, RetryPolicy, StageContext, StageResult, StageRunId
 from l1_foundation.pipeline.definitions.graph import PipelineDefinition, PipelineNode
 from l1_foundation.pipeline.registry import StageRegistry
 
@@ -24,7 +24,6 @@ class PrepareExampleStage:
 
     name = "example_prepare"
     version = "1"
-    resource_queue = ResourceQueue.CPU
     retry_policy = RetryPolicy(max_attempts=2, initial_backoff_seconds=1)
 
     async def run(self, context: StageContext, input_payload: dict[str, Any]) -> StageResult[dict[str, Any]]:
@@ -36,7 +35,6 @@ class ConsumeExampleStage:
 
     name = "example_consume"
     version = "1"
-    resource_queue = ResourceQueue.CPU
     retry_policy = RetryPolicy(max_attempts=1)
 
     async def run(self, context: StageContext, input_payload: dict[str, Any]) -> StageResult[dict[str, Any]]:
@@ -48,8 +46,8 @@ example_pipeline = PipelineDefinition(
     name="example",
     version="1",
     nodes=(
-        PipelineNode("prepare", "example_prepare", "1", ResourceQueue.CPU, RetryPolicy(max_attempts=2), input_payload={"source": "example"}),
-        PipelineNode("consume", "example_consume", "1", ResourceQueue.CPU, RetryPolicy(max_attempts=1), depends_on=("prepare",)),
+        PipelineNode("prepare", "example_prepare", "1", RetryPolicy(max_attempts=2), input_payload={"source": "example"}),
+        PipelineNode("consume", "example_consume", "1", RetryPolicy(max_attempts=1), depends_on=("prepare",)),
     ),
 )
 

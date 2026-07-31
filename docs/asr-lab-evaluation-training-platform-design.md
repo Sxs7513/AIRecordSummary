@@ -99,7 +99,7 @@ backend/packages/l2_core/asr_lab/
 ├── training.py
 └── model_registry.py
 
-backend/packages/l3_app/shared-api/routes/
+backend/packages/l3_app/evaluation-api/ 与 backend/packages/l3_app/training-api/
 ├── evaluation_datasets.py
 ├── evaluation_runs.py
 ├── training_runs.py

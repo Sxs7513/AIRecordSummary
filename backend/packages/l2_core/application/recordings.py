@@ -3,21 +3,19 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 from typing import Any, cast
-from uuid import UUID, uuid4
+from uuid import UUID, uuid4, uuid5
 
 from fastapi import UploadFile
 from sqlalchemy import Engine, RowMapping, text
 
 from l1_foundation.infrastructure.storage.local import LocalStorage
-from l1_foundation.pipeline.contracts import ArtifactPayload, ArtifactRef, PipelineRunId, StageRunId
+from l1_foundation.pipeline.contracts import ArtifactRef, PipelineRunId, StageRunId
 from l1_foundation.pipeline.definitions.graph import PipelineDefinition
-from l1_foundation.pipeline.runtime.artifact_store import ArtifactStore
-from l1_foundation.pipeline.runtime.repository import PipelineRepository
+from l1_foundation.streaming import SyncRedisStreamStore
 from l2_core.access.recordings import RecordingAccessService
-from l2_core.application.recording_processing import StartRecordingProcessing
+from l2_core.application.processing_queue import ProcessingCommandPublisher, queued_processing_state
 from l2_core.audio_processing.contracts import RecordingId
 from l2_core.audio_processing.definition import recording_processing
-from l2_core.audio_processing.stages.recording_models import SearchChunksOutput
 from l2_core.auth.contracts import CurrentUser
 
 type DatabaseRow = dict[str, Any]
@@ -39,12 +37,20 @@ class RecordingStageNotRetryableError(ValueError):
 class RecordingService:
     """HTTP-facing use cases for recording creation, read models, and reruns."""
 
-    def __init__(self, engine: Engine, storage: LocalStorage, processing_definition: PipelineDefinition = recording_processing) -> None:
+    def __init__(
+        self,
+        engine: Engine,
+        storage: LocalStorage,
+        processing_definition: PipelineDefinition = recording_processing,
+        processing_publisher: ProcessingCommandPublisher | None = None,
+        processing_state_store: SyncRedisStreamStore | None = None,
+    ) -> None:
         self._engine = engine
         self._storage = storage
-        self._pipeline_repository = PipelineRepository(engine)
         self._access = RecordingAccessService(engine)
         self._processing_definition = processing_definition
+        self._processing_publisher = processing_publisher
+        self._processing_state_store = processing_state_store
 
     async def create_from_upload(self, user: CurrentUser, upload: UploadFile, title: str | None, location: str | None) -> tuple[DatabaseRow, PipelineRunId]:
         """Persist an uploaded file, create its recording, then enqueue the declared pipeline."""
@@ -65,9 +71,19 @@ class RecordingService:
                 mime_type=upload.content_type or "application/octet-stream",
                 file_size_bytes=file_size_bytes,
             )
-            run_id = StartRecordingProcessing(self._pipeline_repository, self._processing_definition).execute(
-                recording_id, self._source_audio_artifact(recording)
+            source = self._source_audio_artifact(recording)
+            if self._processing_publisher is None:
+                raise RuntimeError("Processing Kafka publisher is unavailable")
+            run_id = PipelineRunId(
+                await self._processing_publisher.submit_recording(
+                    recording_id,
+                    self._processing_definition.name,
+                    self._processing_definition.version,
+                    source,
+                )
             )
+            self._mark_processing(recording_id)
+            self._remember_processing(recording_id, run_id)
         except Exception:
             self._delete_recording(recording_id)
             destination.unlink(missing_ok=True)
@@ -75,6 +91,35 @@ class RecordingService:
         finally:
             await upload.close()
         return recording, run_id
+
+    def _mark_processing(self, recording_id: RecordingId) -> None:
+        with self._engine.begin() as connection:
+            connection.execute(
+                text("update recordings set status = 'processing', error_message = null, updated_at = now() where id = :recording_id"),
+                {"recording_id": recording_id},
+            )
+
+    def _remember_processing(self, recording_id: UUID, processing_id: UUID) -> None:
+        if self._processing_state_store is None:
+            return
+        self._processing_state_store.set_state_if_absent(
+            f"processing:{processing_id}:state",
+            queued_processing_state(
+                processing_id,
+                recording_id,
+                self._processing_definition.name,
+                self._processing_definition.version,
+            ),
+        )
+        self._processing_state_store.set_state(
+            f"recording:{recording_id}:processing",
+            {"processing_id": str(processing_id)},
+        )
+
+    async def _request_processing_cancel(self, recording_id: UUID) -> None:
+        if self._processing_publisher is None:
+            raise RuntimeError("Processing Kafka publisher is unavailable")
+        await self._processing_publisher.cancel_recording(recording_id)
 
     def list_recordings(self, user: CurrentUser, status: str | None, page: int, page_size: int) -> tuple[list[DatabaseRow], int, dict[str, int]]:
         normalized_status = status if status and status != "all" else None
@@ -208,7 +253,7 @@ class RecordingService:
                     .mappings()
                     .all()
                 ],
-                "pipeline_runs": self._pipeline_runs(connection, recording_id),
+                "pipeline_runs": self._runtime_pipeline_runs(recording_id),
             }
 
     def get_recording_audio(self, user: CurrentUser, recording_id: UUID) -> DatabaseRow:
@@ -225,52 +270,75 @@ class RecordingService:
         return dict(row)
 
     def get_pipeline_run(self, user: CurrentUser, run_id: UUID) -> dict[str, Any]:
-        with self._engine.connect() as connection:
-            run_row = connection.execute(text("select * from pipeline_runs where id = :run_id"), {"run_id": run_id}).mappings().one_or_none()
-            if run_row is None:
-                raise RecordingNotFoundError(str(run_id))
-            run = dict(run_row)
-            if run["subject_type"] != "recording":
-                raise RecordingNotFoundError(str(run_id))
-            self._access.require_view(UUID(str(run["subject_id"])), user)
-            stages = self._pipeline_stage_rows(connection, run_id)
-        return {
-            "run": self._as_recording_pipeline_run(run),
-            "stages": self.order_stage_rows(cast(str, run["pipeline_name"]), stages, self._processing_definition),
-        }
+        if self._processing_state_store is None:
+            raise RecordingNotFoundError(str(run_id))
+        state = self._processing_state_store.get_state(f"processing:{run_id}:state")
+        if state is None:
+            raise RecordingNotFoundError(str(run_id))
+        recording_id = UUID(str(state["subject_id"]))
+        self._access.require_view(recording_id, user)
+        return {"run": self._runtime_run(state), "stages": self._runtime_stages(state)}
+
+    def _runtime_pipeline_runs(self, recording_id: UUID) -> list[DatabaseRow]:
+        if self._processing_state_store is None:
+            return []
+        mapping = self._processing_state_store.get_state(f"recording:{recording_id}:processing")
+        if mapping is None:
+            return []
+        state = self._processing_state_store.get_state(f"processing:{mapping['processing_id']}:state")
+        return [] if state is None else [self._runtime_run(state)]
 
     @staticmethod
-    def _pipeline_stage_rows(connection: Any, run_id: UUID) -> list[DatabaseRow]:
-        """Keep recording details readable while an existing database awaits a schema reset."""
-        generation_table_exists = connection.execute(text("select to_regclass('public.generation_runs')")).scalar_one() is not None
-        generation_column = (
-            """
-            , (
-                select generation_runs.id from generation_runs
-                where generation_runs.parent_type = 'stage_run' and generation_runs.parent_id = stage_runs.id::text
-                order by generation_runs.created_at desc limit 1
-            ) as generation_run_id
-            """
-            if generation_table_exists
-            else ", null::uuid as generation_run_id"
-        )
-        return [
-            dict(row)
-            for row in connection.execute(
-                text(
-                    f"""
-                    select stage_runs.*, stage_runs.subject_id as recording_id {generation_column}
-                    from stage_runs where pipeline_run_id = :run_id
-                    order by created_at, id
-                    """
-                ),
-                {"run_id": run_id},
-            )
-            .mappings()
-            .all()
-        ]
+    def _runtime_run(state: dict[str, Any]) -> DatabaseRow:
+        started = state.get("started_at") or state["updated_at"]
+        return {
+            "id": UUID(str(state["processing_id"])),
+            "recording_id": UUID(str(state["subject_id"])),
+            "pipeline_name": state["pipeline_name"],
+            "pipeline_version": state["pipeline_version"],
+            "status": state["status"],
+            "started_at": state.get("started_at"),
+            "finished_at": state.get("finished_at"),
+            "error_message": state.get("error_message"),
+            "created_at": started,
+            "updated_at": state["updated_at"],
+        }
 
-    def retry_failed_recording(self, user: CurrentUser, recording_id: UUID) -> PipelineRunId:
+    def _runtime_stages(self, state: dict[str, Any]) -> list[DatabaseRow]:
+        raw_stages = cast(dict[str, dict[str, Any]], state.get("stages", {}))
+        now = state["updated_at"]
+        processing_id = UUID(str(state["processing_id"]))
+        recording_id = UUID(str(state["subject_id"]))
+        rows: list[DatabaseRow] = []
+        for node in self._processing_definition.topologically_sorted_nodes():
+            stage = raw_stages.get(node.name, {})
+            rows.append(
+                {
+                    "id": uuid5(processing_id, node.name),
+                    "pipeline_run_id": processing_id,
+                    "recording_id": recording_id,
+                    "node_name": node.name,
+                    "stage_name": node.stage_name,
+                    "stage_version": node.stage_version,
+                    "required": node.required,
+                    "status": stage.get("status", "pending"),
+                    "attempt_count": stage.get("attempt", 0),
+                    "max_attempts": node.retry_policy.max_attempts,
+                    "progress_percent": stage.get("progress_percent"),
+                    "progress_message": stage.get("progress_message"),
+                    "progress_updated_at": stage.get("progress_updated_at"),
+                    "generation_run_id": None,
+                    "error_message": stage.get("error"),
+                    "available_at": now,
+                    "started_at": None,
+                    "finished_at": now if stage.get("status") in {"succeeded", "failed"} else None,
+                    "created_at": state.get("started_at") or now,
+                    "updated_at": now,
+                }
+            )
+        return rows
+
+    async def retry_failed_recording(self, user: CurrentUser, recording_id: UUID) -> PipelineRunId:
         self._access.require_edit(recording_id, user)
         with self._engine.connect() as connection:
             row = (
@@ -285,89 +353,46 @@ class RecordingService:
         status = cast(str, row["status"])
         if status != "failed":
             raise RecordingNotRetryableError(f"Recording {recording_id} has status {status!r}, not 'failed'")
-        return StartRecordingProcessing(self._pipeline_repository, self._processing_definition).execute(
-            RecordingId(recording_id), self._source_audio_artifact(dict(row))
+        source = self._source_audio_artifact(dict(row))
+        if self._processing_publisher is None:
+            raise RuntimeError("Processing Kafka publisher is unavailable")
+        processing_id = await self._processing_publisher.submit_recording(
+            recording_id, self._processing_definition.name, self._processing_definition.version, source
         )
+        self._mark_processing(RecordingId(recording_id))
+        self._remember_processing(recording_id, processing_id)
+        return PipelineRunId(processing_id)
 
-    def retry_embedding_indexing(self, user: CurrentUser, recording_id: UUID) -> StageRunId:
-        """Requeue only the embedding node; the pipeline coordinator performs the execution."""
+    async def retry_embedding_indexing(self, user: CurrentUser, recording_id: UUID) -> StageRunId:
+        """Re-run only embedding indexing from the current run's successful search-chunk artifact."""
         self._access.require_edit(recording_id, user)
-        stage_run_id, stage_status = self._restore_embedding_retry_input(recording_id)
-        if stage_status == "retry_waiting":
-            self._pipeline_repository.resume_retry_stage(stage_run_id)
-            return stage_run_id
-        if stage_status in {"pending", "running"}:
-            return stage_run_id
-        try:
-            return self._pipeline_repository.requeue_stage("recording", recording_id, "embedding_indexing")
-        except (LookupError, ValueError) as error:
-            raise RecordingStageNotRetryableError(str(error)) from error
-
-    def _restore_embedding_retry_input(self, recording_id: UUID) -> tuple[StageRunId, str]:
-        """Restore only search.chunks from its durable stage output when startup cleanup removed the file."""
-        with self._engine.connect() as connection:
-            row = (
-                connection.execute(
-                    text(
-                        """
-                        select embedding_stage.id as embedding_stage_run_id,
-                               embedding_stage.status as embedding_stage_status,
-                               producer.id as producer_stage_run_id,
-                               producer.pipeline_run_id,
-                               producer.output_payload,
-                               artifacts.uri,
-                               artifacts.artifact_version
-                        from stage_runs embedding_stage
-                        join pipeline_runs on pipeline_runs.id = embedding_stage.pipeline_run_id
-                        join stage_run_dependencies dependencies on dependencies.stage_run_id = embedding_stage.id
-                        join stage_runs producer on producer.id = dependencies.depends_on_stage_run_id
-                        join artifacts on artifacts.stage_run_id = producer.id
-                        where pipeline_runs.subject_type = 'recording'
-                          and pipeline_runs.subject_id = :recording_id
-                          and embedding_stage.node_name = 'embedding_indexing'
-                          and producer.node_name = 'build_search_chunks'
-                          and artifacts.artifact_type = 'search.chunks'
-                        order by pipeline_runs.created_at desc, artifacts.created_at desc
-                        limit 1
-                        """
-                    ),
-                    {"recording_id": recording_id},
-                )
-                .mappings()
-                .one_or_none()
-            )
-        if row is None:
-            raise RecordingStageNotRetryableError("找不到 embedding_indexing 所需的 search.chunks 记录")
-
-        artifact_path = self._storage.resolve(cast(str, row["uri"]))
-        if not artifact_path.is_file():
-            output_payload = row["output_payload"]
-            if not isinstance(output_payload, dict) or not isinstance(output_payload.get("output"), dict):
-                raise RecordingStageNotRetryableError("build_search_chunks 没有可用于恢复 search.chunks 的持久化输出")
-            try:
-                chunks = SearchChunksOutput.model_validate(output_payload["output"])
-            except ValueError as error:
-                raise RecordingStageNotRetryableError("build_search_chunks 的持久化输出格式无效") from error
-            restored = ArtifactStore(self._storage.resolve("")).write_json(
-                RecordingId(recording_id),
-                PipelineRunId(cast(UUID, row["pipeline_run_id"])),
-                StageRunId(cast(UUID, row["producer_stage_run_id"])),
-                "build_search_chunks",
-                ArtifactPayload(
-                    artifact_type="search.chunks",
-                    artifact_version=cast(str, row["artifact_version"]),
-                    data=chunks.model_dump(mode="json"),
-                ),
-            )
-            if restored.uri != row["uri"]:
-                raise RecordingStageNotRetryableError("search.chunks 的恢复路径与原 artifact 记录不一致")
-            logger.info(
-                "录音索引：已从 build_search_chunks 持久化输出恢复输入 artifact，recording_id=%s uri=%s",
-                recording_id,
-                restored.uri,
-            )
-
-        return StageRunId(cast(UUID, row["embedding_stage_run_id"])), cast(str, row["embedding_stage_status"])
+        if self._processing_publisher is None:
+            raise RecordingStageNotRetryableError("Processing Kafka publisher is unavailable")
+        if self._processing_state_store is None:
+            raise RecordingStageNotRetryableError("Processing state is unavailable")
+        mapping = self._processing_state_store.get_state(f"recording:{recording_id}:processing")
+        if mapping is None or mapping.get("processing_id") is None:
+            raise RecordingStageNotRetryableError("Recording has no reusable processing run")
+        processing_id = UUID(str(mapping["processing_id"]))
+        state = self._processing_state_store.get_state(f"processing:{processing_id}:state")
+        if state is None:
+            raise RecordingStageNotRetryableError("Processing state has expired; search chunks cannot be reused")
+        stages = cast(dict[str, dict[str, Any]], state.get("stages", {}))
+        chunk_stage = stages.get("build_search_chunks")
+        if chunk_stage is None or chunk_stage.get("status") != "succeeded":
+            raise RecordingStageNotRetryableError("Search chunks were not generated successfully")
+        chunk_ref = next(
+            (
+                ArtifactRef.model_validate(raw)
+                for raw in cast(list[dict[str, Any]], chunk_stage.get("artifacts", []))
+                if raw.get("artifact_type") == "search.chunks"
+            ),
+            None,
+        )
+        if chunk_ref is None or not self._storage.resolve(chunk_ref.uri).is_file():
+            raise RecordingStageNotRetryableError("Search chunk artifact is no longer available")
+        await self._processing_publisher.retry_embedding_index(processing_id, recording_id, chunk_ref)
+        return StageRunId(uuid5(processing_id, "embedding_indexing"))
 
     def update_recording(
         self,
@@ -466,9 +491,10 @@ class RecordingService:
                 )
             connection.execute(text("update recordings set updated_at = now() where id = :recording_id"), {"recording_id": recording_id})
 
-    def delete_recording(self, user: CurrentUser, recording_id: UUID) -> None:
+    async def delete_recording(self, user: CurrentUser, recording_id: UUID) -> None:
         """Delete a recording, its database results, and all recording-owned storage trees."""
         self._access.require_edit(recording_id, user)
+        await self._request_processing_cancel(recording_id)
         with self._engine.begin() as connection:
             exists = connection.execute(
                 text("delete from recordings where id = :recording_id returning id"), {"recording_id": recording_id}
@@ -554,26 +580,6 @@ class RecordingService:
             destination.unlink(missing_ok=True)
             raise ValueError("Uploaded audio file is empty")
         return total
-
-    @staticmethod
-    def _pipeline_runs(connection: Any, recording_id: UUID) -> list[DatabaseRow]:
-        return [
-            dict(row)
-            for row in connection.execute(
-                text(
-                    "select pipeline_runs.*, pipeline_runs.subject_id as recording_id "
-                    "from pipeline_runs where subject_type = 'recording' and subject_id = :recording_id order by created_at desc"
-                ),
-                {"recording_id": recording_id},
-            )
-            .mappings()
-            .all()
-        ]
-
-    @staticmethod
-    def _as_recording_pipeline_run(run: DatabaseRow) -> DatabaseRow:
-        """Keep the recording HTTP contract independent of generic runtime subject naming."""
-        return {**run, "recording_id": run["subject_id"]}
 
     @staticmethod
     def _optional_row(row: RowMapping | None) -> DatabaseRow | None:

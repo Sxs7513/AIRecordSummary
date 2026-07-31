@@ -3,11 +3,16 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+from asr_lab_routes import evaluation_router
+from evaluation_auth_routes import router as evaluation_auth_router
+from evaluation_router import router as evaluation_api_router
 from fastapi import APIRouter
-
-from router import evaluation_api_router, production_api_router, training_api_router
-from routes.asr_lab import evaluation_router, training_router
-from routes.recordings import router as recordings_router
+from production_auth_routes import router as production_auth_router
+from production_router import router as production_api_router
+from recordings_routes import router as recordings_router
+from training_auth_routes import router as training_auth_router
+from training_router import router as training_api_router
+from training_routes import training_router
 
 BACKEND_ROOT = Path(__file__).resolve().parents[2]
 
@@ -22,6 +27,9 @@ def _includes(parent: APIRouter, child: APIRouter) -> bool:
 
 
 def test_l3_api_routers_have_separate_route_surfaces() -> None:
+    assert _includes(production_api_router, production_auth_router)
+    assert _includes(evaluation_api_router, evaluation_auth_router)
+    assert _includes(training_api_router, training_auth_router)
     assert _includes(production_api_router, recordings_router)
     assert not _includes(production_api_router, evaluation_router)
     assert not _includes(production_api_router, training_router)
@@ -34,6 +42,8 @@ def test_l3_api_routers_have_separate_route_surfaces() -> None:
 def test_expected_layer_projects_exist() -> None:
     expected_packages = (
         "packages/l1_foundation/settings",
+        "packages/l1_foundation/llm",
+        "packages/l1_foundation/worker",
         "packages/l1_foundation/task_runtime",
         "packages/l1_foundation/pipeline",
         "packages/l1_foundation/infrastructure",
@@ -47,10 +57,11 @@ def test_expected_layer_projects_exist() -> None:
         "packages/l2_core/conversations",
         "packages/l2_core/generation",
         "packages/l2_core/trainers/qwen-asr-lora",
-        "packages/l3_app/shared-api",
         "packages/l3_app/production-api",
         "packages/l3_app/evaluation-api",
+        "packages/l3_app/rag_evaluation_worker",
         "packages/l3_app/training-api",
+        "packages/l3_app/compute_worker",
     )
     for relative_path in expected_packages:
         assert (BACKEND_ROOT / relative_path).is_dir(), relative_path
@@ -72,7 +83,7 @@ def test_l3_app_sources_are_directly_under_app_root() -> None:
         if not app_dir.is_dir():
             continue
         assert not (app_dir / "src").exists(), app_dir
-        assert (app_dir / "main.py").is_file() or app_dir.name == "shared-api", app_dir
+        assert (app_dir / "main.py").is_file(), app_dir
 
     assert not (l3_root / "production-worker").exists()
     assert not (l3_root / "asr-compute-worker").exists()
@@ -89,6 +100,41 @@ def test_l1_source_does_not_import_l2_or_l3_packages() -> None:
         ]
         imports.extend(node.module or "" for node in ast.walk(tree) if isinstance(node, ast.ImportFrom))
         assert not any(value.startswith("l2_core") for value in imports), path
+
+
+def test_l2_llm_callers_use_worker_tasks_instead_of_model_instances() -> None:
+    roots = (
+        BACKEND_ROOT / "packages/l2_core/audio_processing",
+        BACKEND_ROOT / "packages/l2_core/rag",
+    )
+    for root in roots:
+        for path in root.rglob("*.py"):
+            source = path.read_text(encoding="utf-8")
+            assert "LanguageModel" not in source, path
+            assert "create_language_model" not in source, path
+            assert ".complete(" not in source or "_worker_client.execute(" in source, path
+
+
+def test_production_api_does_not_embed_compute_worker_runtime() -> None:
+    source = (BACKEND_ROOT / "packages/l3_app/production-api/app_factory.py").read_text(encoding="utf-8")
+    assert "l3_app.compute_worker" not in source
+    assert "build_compute_worker_runtime" not in source
+
+
+def test_l3_apps_do_not_import_other_l3_apps() -> None:
+    l3_root = BACKEND_ROOT / "packages/l3_app"
+    app_names = {path.name for path in l3_root.iterdir() if path.is_dir()}
+    for app_dir in (path for path in l3_root.iterdir() if path.is_dir()):
+        other_apps = app_names - {app_dir.name}
+        for path in app_dir.rglob("*.py"):
+            source = path.read_text(encoding="utf-8")
+            assert not any(f"l3_app.{name.replace('-', '_')}" in source for name in other_apps), path
+
+
+def test_pipeline_stage_contract_has_no_resource_queue() -> None:
+    pipeline_root = BACKEND_ROOT / "packages/l1_foundation/pipeline"
+    for path in pipeline_root.rglob("*.py"):
+        assert "resource_queue" not in path.read_text(encoding="utf-8"), path
 
 
 def test_backend_uses_explicit_layered_import_namespaces() -> None:

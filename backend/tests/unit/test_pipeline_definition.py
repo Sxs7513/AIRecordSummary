@@ -2,7 +2,7 @@ import asyncio
 
 import pytest
 
-from l1_foundation.pipeline.contracts import ResourceQueue, RetryPolicy
+from l1_foundation.pipeline.contracts import RetryPolicy
 from l1_foundation.pipeline.definitions.graph import PipelineDefinition, PipelineNode
 from l1_foundation.pipeline.example import build_example_registry, example_pipeline, run_example
 from l1_foundation.pipeline.registry import StageRegistry
@@ -14,16 +14,19 @@ def test_recording_processing_uses_diarization_segments_for_qwen_asr() -> None:
     nodes = {node.name: node for node in recording_processing.nodes}
 
     assert nodes["diarize_pyannote"].depends_on == ("normalize_audio",)
+    assert nodes["diarize_pyannote"].stage_version == "2"
     assert nodes["preprocess_asr_audio"].depends_on == ("normalize_audio",)
+    assert nodes["preprocess_asr_audio"].stage_version == "5"
     assert nodes["transcribe_qwen_asr"].depends_on == ("preprocess_asr_audio", "diarize_pyannote")
     assert nodes["transcribe_qwen_asr"].input_artifacts[1].artifact_type == "diarization.pyannote"
-    assert nodes["transcribe_qwen_asr"].resource_queue == ResourceQueue.GPU_HIGH
-    assert nodes["transcribe_qwen_asr"].stage_version == "5"
+    assert nodes["transcribe_qwen_asr"].stage_version == "11"
     assert nodes["correct_asr_windows"].depends_on == ("transcribe_qwen_asr",)
+    assert nodes["correct_asr_windows"].stage_version == "4"
     assert nodes["align_transcript"].depends_on == ("correct_asr_windows", "preprocess_asr_audio", "diarize_pyannote")
+    assert nodes["align_transcript"].stage_version == "2"
     assert nodes["build_utterances"].depends_on == ("align_transcript",)
     assert nodes["build_utterances"].stage_version == "4"
-    assert nodes["build_search_chunks"].stage_version == "2"
+    assert nodes["build_search_chunks"].stage_version == "4"
 
 
 def test_recording_processing_can_select_funasr_without_changing_downstream_contracts() -> None:
@@ -44,10 +47,10 @@ def test_recording_processing_indexes_and_summarizes_in_parallel() -> None:
     nodes = {node.name: node for node in recording_processing.nodes}
 
     assert nodes["embedding_indexing"].depends_on == ("build_search_chunks",)
+    assert nodes["embedding_indexing"].stage_version == "3"
     assert nodes["generate_summary"].depends_on == ("build_utterances",)
     assert nodes["generate_summary"].stage_version == "2"
     assert nodes["build_search_chunks"].output_artifacts == ("search.chunks",)
-    assert nodes["build_search_chunks"].resource_queue == ResourceQueue.GPU_NORMAL
 
 
 def test_pipeline_definition_rejects_cycles() -> None:
@@ -58,8 +61,8 @@ def test_pipeline_definition_rejects_cycles() -> None:
             name="cycle",
             version="1",
             nodes=(
-                PipelineNode("first", "noop", "1", ResourceQueue.CPU, retry_policy, ("second",)),
-                PipelineNode("second", "noop", "1", ResourceQueue.CPU, retry_policy, ("first",)),
+                PipelineNode("first", "noop", "1", retry_policy, ("second",)),
+                PipelineNode("second", "noop", "1", retry_policy, ("first",)),
             ),
         )
 

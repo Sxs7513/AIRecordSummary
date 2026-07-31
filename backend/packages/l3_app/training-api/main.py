@@ -7,12 +7,12 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from training_router import router
 
 from l1_foundation.infrastructure.db.session import create_database_engine
 from l1_foundation.infrastructure.storage.local import LocalStorage
 from l1_foundation.settings import get_settings
 from l2_core.asr_lab.worker import AsrLabWorker
-from router import training_api_router
 
 logger = logging.getLogger("train")
 
@@ -80,7 +80,7 @@ def create_app() -> FastAPI:
         allow_headers=["Accept", "Authorization", "Content-Type"],
     )
     app.state.settings = settings
-    app.include_router(training_api_router, prefix=settings.api_prefix)
+    app.include_router(router, prefix=settings.api_prefix)
     return app
 
 

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from l1_foundation.pipeline.contracts import ResourceQueue, RetryPolicy, StageContext, StageResult
+from l1_foundation.pipeline.contracts import RetryPolicy, StageContext, StageResult
 
 
 class NoopStage:
@@ -10,7 +10,6 @@ class NoopStage:
 
     name = "noop"
     version = "1"
-    resource_queue = ResourceQueue.CPU
     retry_policy = RetryPolicy(max_attempts=1)
 
     async def run(self, context: StageContext, input_payload: dict[str, Any]) -> StageResult[dict[str, Any]]:

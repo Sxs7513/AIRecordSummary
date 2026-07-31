@@ -37,6 +37,14 @@ export class HttpSseTransport {
     void this.run(runId, handlers, this.abortController.signal);
   }
 
+  connectPost(path: string, payload: unknown, handlers: EventHandlers): void {
+    this.close();
+    this.closed = false;
+    this.lastEventId = null;
+    this.abortController = new AbortController();
+    void this.runPost(path, payload, handlers, this.abortController.signal);
+  }
+
   close(): void {
     this.closed = true;
     this.abortController?.abort();
@@ -53,6 +61,41 @@ export class HttpSseTransport {
         if (this.lastEventId !== null) headers.set("Last-Event-ID", this.lastEventId);
         const response = await fetch(`${pythonApiOrigin}/api/generations/${encodeURIComponent(runId)}/events`, {
           headers,
+          signal,
+          credentials: "include"
+        });
+        if (!response.ok) throw new Error(`Generation SSE request failed: ${response.status}`);
+        if (response.body === null) throw new Error("Generation SSE response has no body");
+        handlers.onConnection("connected");
+        if (await this.readFrames(response.body, handlers)) {
+          handlers.onConnection("closed");
+          return;
+        }
+        if (this.closed) return;
+        throw new Error("Generation SSE connection ended before a terminal event");
+      } catch (reason) {
+        if (this.closed || signal.aborted) return;
+        handlers.onError(reason instanceof Error ? reason : new Error("Generation SSE connection failed"));
+        handlers.onConnection("reconnecting");
+        reconnecting = true;
+        await delay(this.options.reconnectDelayMs ?? 1_000, signal);
+      }
+    }
+  }
+
+  private async runPost(path: string, payload: unknown, handlers: EventHandlers, signal: AbortSignal): Promise<void> {
+    let reconnecting = false;
+    while (!this.closed) {
+      try {
+        handlers.onConnection(reconnecting ? "reconnecting" : "connecting");
+        const headers = new Headers(await this.options.getHeaders?.());
+        headers.set("Accept", "text/event-stream");
+        headers.set("Content-Type", "application/json");
+        if (this.lastEventId !== null) headers.set("Last-Event-ID", this.lastEventId);
+        const response = await fetch(`${pythonApiOrigin}${path}`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify(payload),
           signal,
           credentials: "include"
         });

@@ -538,7 +538,7 @@ on conflict (recording_id, speaker_cluster_id) do nothing;
 create table if not exists recording_summaries (
     id uuid primary key default gen_random_uuid(),
     recording_id uuid not null references recordings(id) on delete cascade,
-    provider text not null check (provider in ('local_llm', 'deepseek_api')),
+    provider text not null,
     model_name text not null,
     summary_text text not null,
     created_at timestamptz not null default now(),
@@ -546,12 +546,16 @@ create table if not exists recording_summaries (
     unique (recording_id)
 );
 
+-- 兼容旧数据库：provider 的可用值由应用层维护，避免新增模型提供方时写入失败。
+alter table recording_summaries
+    drop constraint if exists recording_summaries_provider_check;
+
 comment on table recording_summaries is
     '录音总结表，保存润色后文本生成的整条录音摘要。';
 comment on column recording_summaries.recording_id is
     '关联 recordings.id，表示这份总结属于哪条录音。';
 comment on column recording_summaries.provider is
-    '总结使用的模型提供方，例如 local_llm 或 deepseek_api。';
+    '总结使用的模型提供方标识，例如 local、zhipu、gemini；具体可用值由应用层校验。';
 comment on column recording_summaries.model_name is
     '总结使用的模型名称或文件名。';
 comment on column recording_summaries.summary_text is
@@ -606,241 +610,8 @@ create index if not exists recording_search_chunks_text_trgm_gist_idx
 create index if not exists recording_search_chunks_embedding_hnsw_idx
     on recording_search_chunks using hnsw (embedding halfvec_cosine_ops);
 
--- Pipeline runtime
--- Pipeline runs and stage runs are persisted so separate workers can safely
--- advance work, retry failures, and pass artifact references between stages.
-create table if not exists pipeline_runs (
-    id uuid primary key default gen_random_uuid(),
-    subject_type text not null,
-    subject_id uuid not null,
-    pipeline_name text not null,
-    pipeline_version text not null,
-    status text not null check (status in ('queued', 'running', 'succeeded', 'partial_failed', 'failed', 'cancelled')),
-    started_at timestamptz,
-    finished_at timestamptz,
-    error_message text,
-    created_at timestamptz not null default now(),
-    updated_at timestamptz not null default now()
-);
-
-comment on table pipeline_runs is
-    '流水线运行主表，记录任意业务对象一次完整处理工作流的名称、版本、总状态和失败信息。';
-comment on column pipeline_runs.id is
-    '流水线运行主键。';
-comment on column pipeline_runs.subject_type is
-    '业务对象类型，例如 recording；与 subject_id 共同定位流水线所属对象。';
-comment on column pipeline_runs.subject_id is
-    '业务对象主键；不建立跨领域外键，保持 pipeline runtime 通用。';
-comment on column pipeline_runs.pipeline_name is
-    '流水线定义名称，例如 recording_processing。';
-comment on column pipeline_runs.pipeline_version is
-    '创建本次运行时使用的流水线定义版本，用于结果可追溯。';
-comment on column pipeline_runs.status is
-    '流水线整体状态：queued、running、succeeded、partial_failed、failed 或 cancelled。';
-comment on column pipeline_runs.started_at is
-    '首个节点实际开始执行的时间。';
-comment on column pipeline_runs.finished_at is
-    '流水线进入最终状态的时间。';
-comment on column pipeline_runs.error_message is
-    '流水线级错误摘要，通常记录必需节点最终失败的原因。';
-comment on column pipeline_runs.created_at is
-    '流水线运行记录创建时间。';
-comment on column pipeline_runs.updated_at is
-    '流水线运行记录最近更新时间。';
-
-create table if not exists stage_runs (
-    id uuid primary key default gen_random_uuid(),
-    pipeline_run_id uuid not null references pipeline_runs(id) on delete cascade,
-    subject_type text not null,
-    subject_id uuid not null,
-    node_name text not null,
-    stage_name text not null,
-    stage_version text not null,
-    required boolean not null default true,
-    resource_queue text not null check (resource_queue in ('cpu', 'gpu_normal', 'gpu_high')),
-    status text not null check (status in ('pending', 'running', 'succeeded', 'retry_waiting', 'failed', 'cancelled', 'skipped')),
-    attempt_count integer not null default 0 check (attempt_count >= 0),
-    max_attempts integer check (max_attempts is null or max_attempts > 0),
-    progress_percent integer check (progress_percent is null or (progress_percent >= 0 and progress_percent <= 100)),
-    progress_message text,
-    progress_updated_at timestamptz,
-    input_fingerprint text not null,
-    input_payload jsonb not null default '{}'::jsonb,
-    input_artifacts jsonb not null default '[]'::jsonb,
-    output_payload jsonb,
-    available_at timestamptz not null default now(),
-    started_at timestamptz,
-    finished_at timestamptz,
-    error_message text,
-    created_at timestamptz not null default now(),
-    updated_at timestamptz not null default now(),
-    unique (pipeline_run_id, node_name)
-);
-
-comment on table stage_runs is
-    '流水线节点运行表，记录每个 stage 的队列、依赖输入、重试次数、输出与执行状态，由 pipeline runtime 推进。';
-comment on column stage_runs.id is
-    '节点运行主键。';
-comment on column stage_runs.pipeline_run_id is
-    '关联 pipeline_runs.id，表示节点所属的整次流水线运行。';
-comment on column stage_runs.subject_type is
-    '业务对象类型，从所属 pipeline_run 冗余保存，供节点执行快速读取。';
-comment on column stage_runs.subject_id is
-    '业务对象主键，从所属 pipeline_run 冗余保存，供节点执行和 artifact 分区使用。';
-comment on column stage_runs.node_name is
-    '流水线定义中的节点名称；同一流水线运行内唯一。';
-comment on column stage_runs.stage_name is
-    '实际执行的 stage 插件名称。';
-comment on column stage_runs.stage_version is
-    '实际执行的 stage 插件版本。';
-comment on column stage_runs.required is
-    '是否为流水线成功所必需的节点；非必需节点失败可形成 partial_failed。';
-comment on column stage_runs.resource_queue is
-    '资源队列：cpu、gpu_normal 或 gpu_high，决定 ResourceScheduler 的资源准入顺序。';
-comment on column stage_runs.status is
-    '节点状态：pending、running、succeeded、retry_waiting、failed、cancelled 或 skipped。';
-comment on column stage_runs.attempt_count is
-    '已领取并执行的次数。';
-comment on column stage_runs.max_attempts is
-    '节点允许的最大执行次数。为空表示不限次数，失败后按退避策略持续重试。';
-comment on column stage_runs.progress_percent is
-    '节点当前执行进度，范围 0 到 100。为空表示尚未开始或该 stage 不提供细粒度进度。';
-comment on column stage_runs.progress_message is
-    '节点当前进度说明，例如模型加载、分段转写的当前片段或 diarization 子阶段。';
-comment on column stage_runs.progress_updated_at is
-    '节点进度最后一次由 worker 写入的时间，用于前端判断进度是否仍在刷新。';
-comment on column stage_runs.input_fingerprint is
-    '节点输入与版本计算出的稳定指纹，用于幂等和缓存判定。';
-comment on column stage_runs.input_payload is
-    '节点声明时写入的非 artifact JSON 输入。';
-comment on column stage_runs.input_artifacts is
-    '节点所需 artifact 的声明性绑定，运行时由上游产物引用填充。';
-comment on column stage_runs.output_payload is
-    '节点成功后保存的结构化 JSON 输出摘要。';
-comment on column stage_runs.available_at is
-    '节点最早可被领取的时间；失败重试通过该字段实现退避等待。';
-comment on column stage_runs.started_at is
-    '节点首次开始执行的时间。';
-comment on column stage_runs.finished_at is
-    '节点最终成功、失败、取消或跳过的时间。';
-comment on column stage_runs.error_message is
-    '最近一次执行失败的错误信息，长度由应用层限制。';
-comment on column stage_runs.created_at is
-    '节点运行记录创建时间。';
-comment on column stage_runs.updated_at is
-    '节点运行记录最近更新时间。';
-
-create table if not exists stage_run_dependencies (
-    stage_run_id uuid not null references stage_runs(id) on delete cascade,
-    depends_on_stage_run_id uuid not null references stage_runs(id) on delete cascade,
-    primary key (stage_run_id, depends_on_stage_run_id),
-    check (stage_run_id <> depends_on_stage_run_id)
-);
-
-comment on table stage_run_dependencies is
-    '流水线节点依赖关系表，表示一个 stage_run 必须在其上游 stage_run 成功后才能开始执行。';
-comment on column stage_run_dependencies.stage_run_id is
-    '下游节点运行 ID；该节点等待 depends_on_stage_run_id 成功。';
-comment on column stage_run_dependencies.depends_on_stage_run_id is
-    '上游依赖节点运行 ID。';
-
-create table if not exists artifacts (
-    id uuid primary key default gen_random_uuid(),
-    subject_type text not null,
-    subject_id uuid not null,
-    pipeline_run_id uuid not null references pipeline_runs(id) on delete cascade,
-    stage_run_id uuid references stage_runs(id) on delete set null,
-    artifact_type text not null,
-    artifact_version text not null,
-    uri text not null,
-    checksum text,
-    metadata jsonb not null default '{}'::jsonb,
-    created_at timestamptz not null default now(),
-    unique (stage_run_id, artifact_type, artifact_version)
-);
-
-comment on table artifacts is
-    '流水线产物表，保存任意业务流水线 stage 输出的存储引用与元数据。';
-comment on column artifacts.id is
-    '产物记录主键。';
-comment on column artifacts.subject_type is
-    '业务对象类型；与 subject_id 共同定位产物所属对象。';
-comment on column artifacts.subject_id is
-    '业务对象主键；不建立跨领域外键，保持 artifact runtime 通用。';
-comment on column artifacts.pipeline_run_id is
-    '关联 pipeline_runs.id，表示产物所属的一次处理运行。';
-comment on column artifacts.stage_run_id is
-    '关联生成该产物的 stage_runs.id；原始输入产物可为空。';
-comment on column artifacts.artifact_type is
-    '产物逻辑类型，例如 audio.normalized、diarization.pyannote 或 transcript.qwen_asr。';
-comment on column artifacts.artifact_version is
-    '产物数据格式版本。';
-comment on column artifacts.uri is
-    '相对于 artifact 存储根目录的路径或对象存储键。';
-comment on column artifacts.checksum is
-    '产物内容校验和；可为空。';
-comment on column artifacts.metadata is
-    '产物附加元数据，例如时长、分段数量或存储属性。';
-comment on column artifacts.created_at is
-    '产物记录创建时间。';
-
-create table if not exists pipeline_events (
-    id bigserial primary key,
-    pipeline_run_id uuid not null references pipeline_runs(id) on delete cascade,
-    stage_run_id uuid references stage_runs(id) on delete cascade,
-    event_type text not null,
-    payload jsonb not null default '{}'::jsonb,
-    created_at timestamptz not null default now()
-);
-
-comment on table pipeline_events is
-    '流水线领域事件表，按时间记录 run 与 stage 的排队、领取、开始、成功、失败和重试等状态变化。';
-comment on column pipeline_events.id is
-    '按插入顺序递增的事件主键，供事件流稳定排序。';
-comment on column pipeline_events.pipeline_run_id is
-    '关联发生事件的 pipeline_runs.id。';
-comment on column pipeline_events.stage_run_id is
-    '关联发生事件的 stage_runs.id；流水线级事件可为空。';
-comment on column pipeline_events.event_type is
-    '领域事件类型，例如 pipeline.queued、stage.running 或 stage.succeeded。';
-comment on column pipeline_events.payload is
-    '事件附带的结构化 JSON 数据。';
-comment on column pipeline_events.created_at is
-    '事件写入时间。';
-
-create table if not exists outbox_events (
-    id uuid primary key default gen_random_uuid(),
-    topic text not null,
-    aggregate_type text not null,
-    aggregate_id uuid not null,
-    payload jsonb not null,
-    available_at timestamptz not null default now(),
-    published_at timestamptz,
-    created_at timestamptz not null default now()
-);
-
-comment on table outbox_events is
-    '事务外盒事件表，用于在数据库事务提交后可靠投递 pipeline run 创建等跨进程消息。';
-comment on column outbox_events.id is
-    '外盒事件主键。';
-comment on column outbox_events.topic is
-    '消息主题，例如 pipeline.run.created。';
-comment on column outbox_events.aggregate_type is
-    '事件所属聚合类型，例如 pipeline_run。';
-comment on column outbox_events.aggregate_id is
-    '事件所属聚合的主键。';
-comment on column outbox_events.payload is
-    '等待投递的结构化 JSON 消息体。';
-comment on column outbox_events.available_at is
-    '事件最早允许投递的时间，用于延迟投递和重试退避。';
-comment on column outbox_events.published_at is
-    '成功投递的时间；为空表示仍待投递。';
-comment on column outbox_events.created_at is
-    '外盒事件创建时间。';
-
-
--- Generation runtime
--- 独立于流水线的通用生成任务基座。录音总结、录音问答等长文本生成都通过它保存可恢复快照和流式事件。
+-- Generation terminal query projection
+-- 活跃状态和流式事件位于 Redis；该表只由 Kafka 终态投影器写入。
 create table if not exists generation_runs (
     id uuid primary key default gen_random_uuid(),
     kind text not null check (kind in ('text')),
@@ -851,15 +622,9 @@ create table if not exists generation_runs (
     owner_user_id uuid references users(id) on delete set null,
     subject_type text,
     subject_id uuid,
-    status text not null default 'queued' check (status in ('queued', 'running', 'succeeded', 'failed', 'cancelled')),
+    status text not null check (status in ('succeeded', 'failed', 'cancelled')),
     input_payload jsonb not null default '{}'::jsonb,
-    phase jsonb,
-    progress_percent integer check (progress_percent is null or (progress_percent >= 0 and progress_percent <= 100)),
-    output_blocks jsonb not null default '[]'::jsonb,
     output_payload jsonb,
-    last_sequence bigint not null default 0 check (last_sequence >= 0),
-    first_token_at timestamptz,
-    cancel_requested boolean not null default false,
     error_code text,
     error_message text,
     created_at timestamptz not null default now(),
@@ -870,13 +635,13 @@ create table if not exists generation_runs (
 );
 
 comment on table generation_runs is
-    '通用生成任务主表，保存录音总结、问答等长文本生成的当前快照、状态和可恢复的输出内容。';
+    '通用生成任务终态查询投影；不承担排队、运行时状态或流式事件存储。';
 comment on column generation_runs.id is
-    '生成任务主键，使用 UUID，供 API、SSE 连接和事件表关联。';
+    '生成任务关联 ID，由命令入口生成，并由 Kafka 终态投影器幂等写入。';
 comment on column generation_runs.kind is
     '生成内容类型。当前统一为 text，业务模块可在通用运行时之上定义自己的生成用例。';
 comment on column generation_runs.priority is
-    '调度优先级。interactive 用于用户等待中的问答，background 用于总结等后台生成。';
+    '命令创建时的调度优先级元数据；实际排队与调度由 Kafka Consumer 完成。';
 comment on column generation_runs.idempotency_key is
     '创建命令的幂等键。同一个键只能对应一个生成任务，避免浏览器或 worker 重试造成重复生成。';
 comment on column generation_runs.parent_type is
@@ -890,23 +655,11 @@ comment on column generation_runs.subject_type is
 comment on column generation_runs.subject_id is
     '受保护业务对象主键；不建立跨领域外键，以保持 generation runtime 通用。';
 comment on column generation_runs.status is
-    '生成任务状态：queued、running、succeeded、failed 或 cancelled。';
+    'Kafka 终态投影：succeeded、failed 或 cancelled；活跃状态只存在于 Redis/Kafka。';
 comment on column generation_runs.input_payload is
     '创建时冻结的类型化输入 JSON，例如问答 query、过滤条件和 artifact 引用；不承担授权范围。';
-comment on column generation_runs.phase is
-    '当前用户可见阶段 JSON，包含稳定阶段名 name 和展示文案 label。';
-comment on column generation_runs.progress_percent is
-    '可选的任务进度百分比，范围为 0 到 100。';
-comment on column generation_runs.output_blocks is
-    '当前已持久化的完整内容块快照。第一版仅包含按顺序追加的 text block。';
 comment on column generation_runs.output_payload is
     '生成完成后的结构化输出。问答的最终 sources 作为 JSON 数组保存在此字段，与最终 SSE 事件保持一致。';
-comment on column generation_runs.last_sequence is
-    '已成功写入快照和事件表的最大流事件序号；页面刷新和 SSE 续传的原子边界。';
-comment on column generation_runs.first_token_at is
-    '首个用户可见文本块被写入的时间，用于统计首 token 延迟。';
-comment on column generation_runs.cancel_requested is
-    '是否已请求协作取消。执行器应在 token 或 chunk 边界检查并结束任务。';
 comment on column generation_runs.error_code is
     '失败的稳定错误码，便于前端判断是否可重试和聚合观测。';
 comment on column generation_runs.error_message is
@@ -920,43 +673,105 @@ comment on column generation_runs.finished_at is
 comment on column generation_runs.updated_at is
     '任务快照最后更新时间。';
 
-create table if not exists generation_events (
-    id bigserial primary key,
-    generation_run_id uuid not null references generation_runs(id) on delete cascade,
-    sequence bigint not null check (sequence > 0),
-    event_type text not null,
-    payload jsonb not null default '{}'::jsonb,
-    created_at timestamptz not null default now(),
-    unique (generation_run_id, sequence)
-);
-
-comment on table generation_events is
-    '生成任务的追加式流事件表。与 generation_runs 的快照共同支持 SSE 重连和页面刷新恢复。';
-comment on column generation_events.id is
-    '数据库事件主键，按插入顺序递增，主要用于运维排障。';
-comment on column generation_events.generation_run_id is
-    '关联 generation_runs.id，表示事件所属生成任务。';
-comment on column generation_events.sequence is
-    '同一生成任务内严格递增的协议序号，SSE id 和客户端去重依据。';
-comment on column generation_events.event_type is
-    '协议事件类型，例如 run.status、phase、content.delta、output.final、run.error 或 run.cancelled。';
-comment on column generation_events.payload is
-    '事件携带的 JSON 数据，不包含 envelope 的 run_id、sequence 和时间字段。';
-comment on column generation_events.created_at is
-    '事件持久化时间。';
-
 create index if not exists generation_runs_parent_idx on generation_runs (parent_type, parent_id);
 create index if not exists generation_runs_status_priority_idx on generation_runs (status, priority, created_at);
 create index if not exists generation_runs_owner_idx on generation_runs (owner_user_id, created_at desc) where owner_user_id is not null;
 create index if not exists generation_runs_subject_idx on generation_runs (subject_type, subject_id, created_at desc) where subject_id is not null;
-create index if not exists generation_events_run_sequence_idx on generation_events (generation_run_id, sequence);
+
+-- RAG observability
+-- Caller-generated UUIDs make ingestion idempotent across retries. Mutable records
+-- preserve the running state even when a process exits before publishing a terminal update.
+create table if not exists rag_execution_spans (
+    id uuid primary key,
+    workspace_id uuid not null references workspaces(id) on delete restrict,
+    generation_run_id uuid not null,
+    parent_span_id uuid references rag_execution_spans(id) on delete set null,
+    component text not null default 'rag',
+    operation text not null,
+    operation_version text not null default '1',
+    attempt integer not null default 0 check (attempt >= 0),
+    status text not null check (status in ('running', 'succeeded', 'failed', 'cancelled', 'abandoned')),
+    started_at timestamptz not null,
+    finished_at timestamptz,
+    elapsed_ms numeric,
+    error_type text,
+    metadata jsonb not null default '{}'::jsonb,
+    created_at timestamptz not null default now(),
+    updated_at timestamptz not null default now(),
+    check (length(btrim(component)) > 0),
+    check (length(btrim(operation)) > 0),
+    check (length(btrim(operation_version)) > 0),
+    check (jsonb_typeof(metadata) = 'object'),
+    check (
+        (status = 'running' and finished_at is null and elapsed_ms is null)
+        or
+        (status <> 'running' and finished_at is not null and elapsed_ms is not null and elapsed_ms >= 0)
+    )
+);
+
+create table if not exists model_invocations (
+    id uuid primary key,
+    workspace_id uuid not null references workspaces(id) on delete restrict,
+    generation_run_id uuid not null,
+    -- Deliberately no FK: best-effort delivery may lose or reorder a Span record.
+    span_id uuid,
+    component text not null default 'rag',
+    operation text not null,
+    operation_version text not null default '1',
+    attempt integer not null default 0 check (attempt >= 0),
+    usage_kind text not null default 'llm',
+    provider text not null,
+    model text,
+    stream boolean not null default false,
+    status text not null check (status in ('running', 'succeeded', 'failed', 'cancelled', 'abandoned')),
+    prompt_tokens integer check (prompt_tokens is null or prompt_tokens >= 0),
+    completion_tokens integer check (completion_tokens is null or completion_tokens >= 0),
+    cached_input_tokens integer check (cached_input_tokens is null or cached_input_tokens >= 0),
+    reasoning_tokens integer check (reasoning_tokens is null or reasoning_tokens >= 0),
+    usage_source text not null check (usage_source in ('provider', 'local_tokenizer', 'estimated', 'unavailable')),
+    finish_reason text,
+    provider_request_id text,
+    error_type text,
+    estimated_cost_micros bigint check (estimated_cost_micros is null or estimated_cost_micros >= 0),
+    currency text,
+    started_at timestamptz not null,
+    finished_at timestamptz,
+    elapsed_ms numeric,
+    metadata jsonb not null default '{}'::jsonb,
+    created_at timestamptz not null default now(),
+    updated_at timestamptz not null default now(),
+    check (length(btrim(component)) > 0),
+    check (length(btrim(operation)) > 0),
+    check (length(btrim(operation_version)) > 0),
+    check (length(btrim(usage_kind)) > 0),
+    check (length(btrim(provider)) > 0),
+    check (jsonb_typeof(metadata) = 'object'),
+    check ((estimated_cost_micros is null) = (currency is null)),
+    check (
+        (status = 'running' and finished_at is null and elapsed_ms is null)
+        or
+        (status <> 'running' and finished_at is not null and elapsed_ms is not null and elapsed_ms >= 0)
+    )
+);
+
+comment on table rag_execution_spans is 'RAG 动态执行节点的状态、耗时和非敏感指标。';
+comment on table model_invocations is '模型逐调用状态及 Token usage；开始和终态使用同一调用 ID 幂等更新。';
+
+create index if not exists rag_execution_spans_run_started_idx on rag_execution_spans (generation_run_id, started_at, id);
+create index if not exists rag_execution_spans_workspace_started_idx on rag_execution_spans (workspace_id, started_at desc);
+create index if not exists rag_execution_spans_operation_started_idx on rag_execution_spans (workspace_id, operation, started_at desc);
+create index if not exists model_invocations_run_started_idx on model_invocations (generation_run_id, started_at, id);
+create index if not exists model_invocations_workspace_started_idx on model_invocations (workspace_id, started_at desc);
+create index if not exists model_invocations_operation_started_idx on model_invocations (workspace_id, operation, started_at desc);
+create index if not exists model_invocations_provider_model_started_idx on model_invocations (workspace_id, provider, model, started_at desc);
 
 -- conversations
 -- 多轮录音问答的长期会话。Generation 仅表示其中一条助手消息的一次流式执行。
 create table if not exists conversations (
     id uuid primary key default gen_random_uuid(),
     workspace_id uuid not null references workspaces(id) on delete cascade,
-    owner_user_id uuid not null references users(id) on delete restrict,
+    owner_user_id uuid references users(id) on delete set null,
+    client_creation_id uuid,
     title text not null default '新对话',
     next_message_sequence bigint not null default 0 check (next_message_sequence >= 0),
     archived_at timestamptz,
@@ -964,10 +779,20 @@ create table if not exists conversations (
     updated_at timestamptz not null default now()
 );
 
+-- 删除会话只解除用户关联并归档，历史消息、Generation 与观测数据继续保留。
+alter table conversations alter column owner_user_id drop not null;
+alter table conversations drop constraint if exists conversations_owner_user_id_fkey;
+alter table conversations
+    add constraint conversations_owner_user_id_fkey
+    foreign key (owner_user_id) references users(id) on delete set null;
+
+alter table conversations add column if not exists client_creation_id uuid;
+
 comment on table conversations is '多轮录音问答的长期会话，归属于一个工作区。';
 comment on column conversations.id is '会话主键。';
 comment on column conversations.workspace_id is '会话所属工作区，也是默认访问授权边界。';
 comment on column conversations.owner_user_id is '创建会话的用户，用于审计与默认展示。';
+comment on column conversations.client_creation_id is '浏览器创建首轮会话时生成的幂等 UUID，用于 POST SSE 断线重连。';
 comment on column conversations.title is '会话展示标题；首版可使用用户首条提问自动生成。';
 comment on column conversations.next_message_sequence is '会话内下一次消息写入使用的原子计数器；每轮问答递增 2。';
 comment on column conversations.archived_at is '归档时间；非空时默认不出现在活跃会话列表。';
@@ -982,7 +807,7 @@ create table if not exists conversation_messages (
     reply_to_message_id uuid references conversation_messages(id) on delete set null,
     content_blocks jsonb not null default '[]'::jsonb,
     sources jsonb not null default '[]'::jsonb,
-    generation_run_id uuid unique references generation_runs(id) on delete set null,
+    generation_run_id uuid unique,
     status text not null check (status in ('pending', 'streaming', 'completed', 'failed', 'cancelled')),
     client_message_id uuid,
     error_message text,
@@ -1010,16 +835,12 @@ comment on column conversation_messages.created_at is '消息创建时间。';
 comment on column conversation_messages.updated_at is '消息最后更新时间。';
 
 create index if not exists conversations_workspace_updated_idx on conversations (workspace_id, updated_at desc) where archived_at is null;
+create unique index if not exists conversations_owner_client_creation_idx
+    on conversations (owner_user_id, client_creation_id) where client_creation_id is not null;
 create index if not exists conversation_messages_conversation_sequence_idx on conversation_messages (conversation_id, sequence desc);
 create index if not exists conversation_messages_active_assistant_idx on conversation_messages (conversation_id)
     where role = 'assistant' and status in ('pending', 'streaming');
 
-create index if not exists stage_runs_claim_idx on stage_runs (resource_queue, status, available_at, created_at);
-create index if not exists stage_runs_pipeline_idx on stage_runs (pipeline_run_id, status);
-create index if not exists stage_run_dependencies_upstream_idx on stage_run_dependencies (depends_on_stage_run_id);
-create index if not exists pipeline_runs_subject_idx on pipeline_runs (subject_type, subject_id, created_at desc);
-create index if not exists pipeline_events_run_idx on pipeline_events (pipeline_run_id, id);
-create index if not exists outbox_events_pending_idx on outbox_events (available_at) where published_at is null;
 
 -- Optional helper trigger target for app layer:
 -- update updated_at on row modifications in application code or via triggers later.

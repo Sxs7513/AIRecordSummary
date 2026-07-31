@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import gc
 import json
 import logging
@@ -14,11 +13,13 @@ from importlib import import_module
 from pathlib import Path
 from typing import Any, Protocol, cast
 
-from l1_foundation.pipeline.contracts import ArtifactPayload, ResourceQueue, RetryPolicy, StageContext, StageResult
+from l1_foundation.pipeline.contracts import ArtifactPayload, RetryPolicy, StageContext, StageResult
 from l1_foundation.pipeline.runtime.artifact_store import ArtifactStore
+from l1_foundation.worker import WorkerClient
 from l2_core.audio_processing.stages.recording_models import DiarizationOutput, DiarizationSegment, DiarizeInput
+from l2_core.audio_processing.worker_tasks import audio_diarize_command
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("audio_processing")
 
 
 class PyannoteProgressHook:
@@ -57,8 +58,7 @@ class PyannoteDiarizeStage:
     """Produce project-standard speaker segments from normalized audio."""
 
     name = "diarize_pyannote"
-    version = "1"
-    resource_queue = ResourceQueue.GPU_HIGH
+    version = "2"
     retry_policy = RetryPolicy(initial_backoff_seconds=30)
     input_model = DiarizeInput
 
@@ -73,6 +73,8 @@ class PyannoteDiarizeStage:
         merge_max_gap_ms: int = 3_000,
         merge_max_duration_ms: int = 80_000,
         short_segment_absorb_max_duration_ms: int = 2_000,
+        short_segment_absorb_max_gap_ms: int = 2_000,
+        worker_client: WorkerClient | None = None,
     ) -> None:
         self._storage_root = storage_root.resolve()
         self._artifact_store = artifact_store
@@ -83,19 +85,47 @@ class PyannoteDiarizeStage:
         self._merge_max_gap_ms = merge_max_gap_ms
         self._merge_max_duration_ms = merge_max_duration_ms
         self._short_segment_absorb_max_duration_ms = short_segment_absorb_max_duration_ms
+        self._short_segment_absorb_max_gap_ms = short_segment_absorb_max_gap_ms
+        self._worker_client = worker_client
+        self._pipeline: Any | None = None
+        self._torch: Any | None = None
+        self._temporary_config_path: Path | None = None
+
+    async def try_restore(self, context: StageContext, _input_payload: DiarizeInput) -> StageResult[DiarizationOutput] | None:
+        return self._artifact_store.try_restore_json(
+            context.pipeline_run_id,
+            context.stage_run_id,
+            self.name,
+            self.version,
+            "diarization.pyannote",
+            DiarizationOutput,
+        )
 
     async def run(self, context: StageContext, input_payload: DiarizeInput) -> StageResult[DiarizationOutput]:
         audio_descriptor = self._artifact_store.read_json(input_payload.audio)
         storage_path = audio_descriptor.get("storage_path")
         if not isinstance(storage_path, str):
             raise ValueError("Normalized audio artifact is missing storage_path")
-        audio_path = self._resolve_storage_path(storage_path)
-        segments = await asyncio.to_thread(self._run_pyannote, audio_path, context.report_progress)
-        output = DiarizationOutput(provider="pyannote", model_name=self._model_name, segments=segments)
+        if self._worker_client is None:
+            raise RuntimeError("PyannoteDiarizeStage requires WorkerClient")
+        inference = await self._worker_client.execute(
+            audio_diarize_command(storage_path),
+            result_type=DiarizationOutput,
+            on_progress=lambda progress, message: context.report_progress(round(progress * 100), message or "说话人分离"),
+        )
+        output = inference.model_copy(update={"segments": self._postprocess_segments(inference.segments)})
         return StageResult(
             output=output,
             artifacts=(ArtifactPayload(artifact_type="diarization.pyannote", data=output.model_dump(mode="json")),),
         )
+
+    def compute(self, audio_path: Path, progress: Callable[[int, str], None]) -> DiarizationOutput:
+        raw = self.infer(audio_path, progress)
+        return raw.model_copy(update={"segments": self._postprocess_segments(raw.segments)})
+
+    def infer(self, audio_path: Path, progress: Callable[[int, str], None]) -> DiarizationOutput:
+        """Run only pyannote model inference and return unsmoothed speaker turns."""
+        return DiarizationOutput(provider="pyannote", model_name=self._model_name, segments=self._run_pyannote(audio_path, progress))
 
     def _run_pyannote(self, audio_path: Path, progress: Callable[[int, str], None]) -> list[DiarizationSegment]:
         logger.info("pyannote：准备依赖和模型（%s）", self._model_name)
@@ -107,12 +137,20 @@ class PyannoteDiarizeStage:
         except ImportError as error:
             raise RuntimeError("pyannote.audio is not installed in the Python worker environment") from error
         progress(15, "加载 pyannote diarization pipeline")
-        pipeline, temporary_config_path = self._load_pipeline(pipeline_module.Pipeline)
+        if self._pipeline is None:
+            loaded_pipeline, self._temporary_config_path = self._load_pipeline(pipeline_module.Pipeline)
+            device = self._resolve_device(torch)
+            loaded_pipeline.to(device)
+            self._pipeline = loaded_pipeline
+            self._torch = torch
+            logger.info("pyannote：模型加载完成，运行设备 %s", device)
+        pipeline = self._pipeline
+        if pipeline is None:
+            raise RuntimeError("pyannote pipeline was not initialized")
+        device = self._resolve_device(torch)
         prediction: object | None = None
         audio: dict[str, object] | None = None
         try:
-            device = self._resolve_device(torch)
-            pipeline.to(device)
             logger.info("pyannote：运行设备 %s", device)
             progress(25, f"pyannote 运行设备 {device}")
             audio = self._load_audio_waveform(audio_path, torch, progress)
@@ -130,14 +168,19 @@ class PyannoteDiarizeStage:
         finally:
             del prediction
             del audio
-            del pipeline
-            gc.collect()
-            if getattr(torch, "cuda", None) is not None and torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            if getattr(torch, "backends", None) is not None and torch.backends.mps.is_available() and hasattr(torch, "mps"):
-                torch.mps.empty_cache()
-            if temporary_config_path is not None:
-                temporary_config_path.unlink(missing_ok=True)
+
+    def release(self) -> None:
+        self._pipeline = None
+        torch = self._torch
+        self._torch = None
+        gc.collect()
+        if torch is not None and getattr(torch, "cuda", None) is not None and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        if torch is not None and getattr(torch, "backends", None) is not None and torch.backends.mps.is_available() and hasattr(torch, "mps"):
+            torch.mps.empty_cache()
+        if self._temporary_config_path is not None:
+            self._temporary_config_path.unlink(missing_ok=True)
+            self._temporary_config_path = None
 
     def _configure_model_cache(self) -> None:
         if self._model_cache_dir is None:
@@ -273,11 +316,15 @@ class PyannoteDiarizeStage:
                         speaker_label=label_by_cluster[cluster],
                     )
                 )
+        return segments
+
+    def _postprocess_segments(self, segments: list[DiarizationSegment]) -> list[DiarizationSegment]:
         merged, absorbed_count = self._smooth_segments(
             segments,
             self._short_segment_absorb_max_duration_ms,
             self._merge_max_gap_ms,
             self._merge_max_duration_ms,
+            self._short_segment_absorb_max_gap_ms,
         )
         logger.info(
             "pyannote：完成，原始=%d 个说话人片段，夹心短段吸收=%d 个，合并后=%d 个",
@@ -294,14 +341,16 @@ class PyannoteDiarizeStage:
         short_segment_max_duration_ms: int,
         merge_max_gap_ms: int,
         merge_max_duration_ms: int,
+        short_segment_max_gap_ms: int | None = None,
     ) -> tuple[list[DiarizationSegment], int]:
         current = cls._merge_adjacent_segments(segments, merge_max_gap_ms, merge_max_duration_ms)
+        absorb_max_gap_ms = merge_max_gap_ms if short_segment_max_gap_ms is None else short_segment_max_gap_ms
         absorbed_total = 0
         while True:
             smoothed, absorbed_count = cls._absorb_short_sandwiched_segments(
                 current,
                 short_segment_max_duration_ms,
-                merge_max_gap_ms,
+                absorb_max_gap_ms,
             )
             if absorbed_count == 0:
                 return current, absorbed_total

@@ -4,7 +4,10 @@ Phase 1 follows `docs/technical-architecture.md` and `docs/phase-1-implementatio
 
 - Frontend and API: Next.js App Router + TypeScript
 - Database: PostgreSQL, schema in `sql/base.sql`
-- Offline processing: embedded PostgreSQL-backed worker started with the Next.js backend
+- Async messaging: Kafka
+- Live state and resumable streams: Redis
+- Offline orchestration: Kafka-driven Processing Worker with Redis live state
+- Atomic model/CPU/GPU compute: Kafka lane consumers with Redis result/stream projections
 - Audio pipeline adapters: Whisper, pyannote.audio, SpeechBrain
 
 ## Setup
@@ -77,19 +80,28 @@ Set it to `false` if you want startup to fail fast instead of installing Python 
 
 ## Run
 
-Start the frontend and three Python API entry points:
+Start Kafka and Redis first, then the frontend and Python processes:
 
 ```bash
+npm run infra:up
 npm run dev
 npm run dev:production-api
+npm run dev:compute-worker
+npm run dev:generation-worker
+npm run dev:processing-worker
+npm run dev:observability-api
+npm run dev:observability-worker
 npm run dev:evaluation-api
+npm run dev:rag-evaluation-worker
 npm run dev:training-api
 ```
 
-The APIs listen on ports 8000, 8001, and 8002 respectively.
+If Redis is cleared, stop command processing temporarily and replay the compacted Kafka state topics with `npm run infra:rebuild-redis` before resuming traffic.
+
+The Production API, Compute Worker, Evaluation API, and Training API listen on ports 8000, 8010, 8001, and 8002 respectively.
 `npm run dev:python-web` remains as an alias for the production API.
 
-`production-api` starts the recording pipeline coordinator in its lifespan.
+Generation, recording Processing, and atomic Compute work are submitted through Kafka. `generation-worker`, `processing-worker`, and `compute-worker` consume them independently; the Production API does not run an in-process task coordinator.
 `training-api` likewise starts the single-GPU ASR evaluation/training worker,
 so no separate worker process is required.
 
@@ -110,6 +122,6 @@ Useful pages:
 
 ## Notes
 
-Uploaded files are stored under `uploads/` in development. Metadata, transcriptions, speaker diarization segments, target-speaker matches, pipeline runs, and stage runs are persisted in PostgreSQL.
+Uploaded files are stored under `uploads/` in development. PostgreSQL stores business data and final query projections; Redis stores live task state and streams; Kafka stores commands and durable lifecycle events.
 
-The Python backend owns database initialization and background pipeline execution. Recording processing progress is tracked by `pipeline_runs` and `stage_runs`.
+The Python backend owns database initialization. Recording processing commands and durable lifecycle events live in Kafka, live progress lives in Redis, and PostgreSQL stores only recording business results and terminal projections.

@@ -8,6 +8,11 @@ interface PlaybackPositionEventDetail {
   currentMs: number | null;
 }
 
+interface HighlightRange {
+  startMs: number;
+  endMs: number;
+}
+
 function timedTokenAt(tokens: TranscriptionToken[], currentMs: number): TranscriptionToken | null {
   let left = 0;
   let right = tokens.length - 1;
@@ -33,20 +38,50 @@ function tokenContent(text: string, active: boolean) {
   ));
 }
 
-export function UtteranceList({ segments, tokens = [], speakerProfiles, highlightMs }: { segments: UtteranceSegment[]; tokens?: TranscriptionToken[]; speakerProfiles: SpeakerProfile[]; highlightMs: number | null }) {
+function tokenOverlapMs(token: TranscriptionToken, segment: UtteranceSegment): number {
+  return Math.max(0, Math.min(token.endMs, segment.endMs) - Math.max(token.startMs, segment.startMs));
+}
+
+function tokenDistanceMs(token: TranscriptionToken, segment: UtteranceSegment): number {
+  if (token.endMs < segment.startMs) return segment.startMs - token.endMs;
+  if (token.startMs > segment.endMs) return token.startMs - segment.endMs;
+  return 0;
+}
+
+function assignTokensToSegments(segments: UtteranceSegment[], tokens: TranscriptionToken[]): Map<string, TranscriptionToken[]> {
+  const assigned = new Map(segments.map((segment) => [segment.id, [] as TranscriptionToken[]]));
+  for (const token of tokens) {
+    const overlapping = segments
+      .map((segment) => ({ segment, overlapMs: tokenOverlapMs(token, segment) }))
+      .filter((candidate) => candidate.overlapMs > 0);
+    const candidates = overlapping.length > 0
+      ? overlapping
+      : segments.map((segment) => ({ segment, overlapMs: 0 }));
+    if (candidates.length === 0) continue;
+
+    const sameSpeaker = token.speakerClusterId
+      ? candidates.filter((candidate) => candidate.segment.speakerClusterId === token.speakerClusterId)
+      : [];
+    const ranked = sameSpeaker.length > 0 ? sameSpeaker : candidates;
+    ranked.sort((left, right) => {
+      if (left.overlapMs !== right.overlapMs) return right.overlapMs - left.overlapMs;
+      const leftDistance = tokenDistanceMs(token, left.segment);
+      const rightDistance = tokenDistanceMs(token, right.segment);
+      return leftDistance - rightDistance || left.segment.utteranceIndex - right.segment.utteranceIndex;
+    });
+    assigned.get(ranked[0].segment.id)?.push(token);
+  }
+  return assigned;
+}
+
+export function UtteranceList({ segments, tokens = [], speakerProfiles, highlightRange }: { segments: UtteranceSegment[]; tokens?: TranscriptionToken[]; speakerProfiles: SpeakerProfile[]; highlightRange: HighlightRange | null }) {
   const [activeTokenId, setActiveTokenId] = useState<string | null>(null);
   const sortedTokens = useMemo(() => [...tokens].sort((left, right) => left.startMs - right.startMs || left.endMs - right.endMs), [tokens]);
-  const tokensBySegmentId = useMemo(
-    () => new Map(segments.map((segment) => [
-      segment.id,
-      sortedTokens.filter((token) => token.startMs >= segment.startMs && token.endMs <= segment.endMs)
-    ])),
-    [segments, sortedTokens]
-  );
+  const tokensBySegmentId = useMemo(() => assignTokensToSegments(segments, sortedTokens), [segments, sortedTokens]);
 
   useEffect(() => {
     document.querySelector(".segment.highlight")?.scrollIntoView({ block: "center", behavior: "smooth" });
-  }, [highlightMs]);
+  }, [highlightRange?.startMs, highlightRange?.endMs]);
 
   useEffect(() => {
     const updateActiveToken = (event: Event) => {
@@ -63,7 +98,9 @@ export function UtteranceList({ segments, tokens = [], speakerProfiles, highligh
     <div className="segments">
       {segments.map((segment) => {
         const profile = segment.matchedSpeakerProfileId ? profileById.get(segment.matchedSpeakerProfileId) : null;
-        const highlighted = highlightMs !== null && highlightMs >= segment.startMs && highlightMs <= segment.endMs;
+        const highlighted = highlightRange !== null
+          && segment.startMs <= highlightRange.endMs
+          && segment.endMs >= highlightRange.startMs;
         return (
           <article
             className={`segment utterance-segment ${segment.isTargetPerson ? "target" : ""} ${highlighted ? "highlight" : ""}`}
@@ -85,7 +122,8 @@ export function UtteranceList({ segments, tokens = [], speakerProfiles, highligh
             </div>
             <div>{(() => {
               const segmentTokens = tokensBySegmentId.get(segment.id) ?? [];
-              return segmentTokens.length
+              const reconstructedText = segmentTokens.map((token) => token.text).join("");
+              return segmentTokens.length > 0 && reconstructedText === segment.text
                 ? segmentTokens.map((token) => (
                     <button
                       key={token.id}

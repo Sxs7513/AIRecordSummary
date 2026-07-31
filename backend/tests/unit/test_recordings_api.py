@@ -8,10 +8,12 @@ from fastapi.testclient import TestClient
 from httpx import Response
 
 from app_factory import create_app
-from dependencies import get_recording_service, get_recording_summary_regeneration_service, require_current_user
+from l1_foundation.messaging import EventEnvelope, KafkaEventProducer
 from l1_foundation.settings import Settings
+from l1_foundation.worker import SyncWorkerClient, WorkerClient
 from l2_core.application.recordings import RecordingNotFoundError, RecordingNotRetryableError
 from l2_core.auth.contracts import CurrentUser
+from production_dependencies import get_recording_service, get_recording_summary_regeneration_service, require_current_user
 
 
 def _settings() -> Settings:
@@ -25,6 +27,7 @@ def _settings() -> Settings:
             "DB_ADMIN_DATABASE": "postgres",
             "DB_SSL": False,
             "LOCAL_STORAGE_ROOT": "uploads-test",
+            "OBSERVABILITY_ENABLED": False,
         }
     )
 
@@ -143,7 +146,29 @@ class FakeSummaryRegenerationService:
 
 
 def _client(service: FakeRecordingService) -> TestClient:
-    app = create_app(_settings(), start_pipeline_worker=False)
+    class ReadyWorkerClient:
+        async def ready(self) -> None:
+            return
+
+    class FakeKafkaProducer(KafkaEventProducer):
+        def __init__(self) -> None:
+            pass
+
+        async def start(self) -> None:
+            return
+
+        async def stop(self) -> None:
+            return
+
+        async def publish(self, topic: str, key: str, event: EventEnvelope) -> None:
+            del topic, key, event
+
+    app = create_app(
+        _settings(),
+        worker_client=cast(WorkerClient, ReadyWorkerClient()),
+        sync_worker_client=cast(SyncWorkerClient, object()),
+        kafka_producer=FakeKafkaProducer(),
+    )
     app.dependency_overrides[get_recording_service] = lambda: service
     app.dependency_overrides[get_recording_summary_regeneration_service] = lambda: FakeSummaryRegenerationService(service.recording_id, service.run_id)
     app.dependency_overrides[require_current_user] = lambda: CurrentUser(uuid4(), "test@example.com", "Test", uuid4(), ())

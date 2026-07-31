@@ -2,12 +2,14 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from contextlib import AbstractContextManager
+from datetime import UTC, datetime
 from typing import Any, cast
 from uuid import UUID, uuid4
 
 from sqlalchemy import Engine
 
 from l1_foundation.settings import Settings
+from l1_foundation.worker import SyncWorkerClient
 from l2_core.rag.contracts import ResolvedFilters
 from l2_core.rag.normalization import normalize_search_text
 from l2_core.rag.retrieval import RagRetriever
@@ -70,7 +72,11 @@ class FakeSettings:
 
 
 def _retriever(connection: FakeConnection) -> RagRetriever:
-    return RagRetriever(cast(Engine, cast(Any, FakeEngine(connection))), cast(Settings, cast(Any, FakeSettings())))
+    return RagRetriever(
+        cast(Engine, cast(Any, FakeEngine(connection))),
+        cast(Settings, cast(Any, FakeSettings())),
+        cast(SyncWorkerClient, object()),
+    )
 
 
 def _recording(recording_id: UUID, title: str) -> dict[str, object]:
@@ -80,6 +86,7 @@ def _recording(recording_id: UUID, title: str) -> dict[str, object]:
         "file_name": f"{title}.mp3",
         "location": None,
         "duration_seconds": 60,
+        "created_at": datetime(2026, 8, 8, 9, 30, tzinfo=UTC),
     }
 
 
@@ -122,12 +129,48 @@ def test_retrieve_scope_loads_all_recording_utterances_in_one_batch_query() -> N
     evidence = _retriever(connection).retrieve_scope(ResolvedFilters(recording_ids=[first_id, second_id]), limit=2, rank=None)
 
     assert len(connection.executions) == 2
+    assert "recordings.created_at" in connection.executions[0][0]
     assert connection.executions[1][1]["recording_ids"] == [str(first_id), str(second_id)]
     assert evidence[0].chunk.text == "张三: 第一句话\n李四: 第二句话"
     assert evidence[0].facts.utterance_count == 2
     assert evidence[0].chunk.matched_speaker_profiles == [profile_id]
+    assert evidence[0].recording.created_at == datetime(2026, 8, 8, 9, 30, tzinfo=UTC)
     assert evidence[1].chunk.text == "该录音暂无连续发言文本。"
     assert evidence[1].facts.utterance_count == 0
+
+
+def test_retrieve_metadata_uses_resolved_scope_and_only_selects_trusted_fields() -> None:
+    recording_id = uuid4()
+    created_at = datetime(2026, 8, 8, 9, 30, tzinfo=UTC)
+    connection = FakeConnection(
+        [
+            [
+                {
+                    **_recording(recording_id, "产品周会"),
+                    "created_at": created_at,
+                    "status": "completed",
+                }
+            ]
+        ]
+    )
+
+    rows = _retriever(connection).retrieve_metadata(
+        ResolvedFilters(recording_scope_resolved=True, recording_ids=[recording_id]),
+        limit=None,
+        rank=None,
+    )
+
+    sql, values = connection.executions[0]
+    assert rows[0]["id"] == recording_id
+    assert "recordings.duration_seconds" in sql
+    assert "recordings.created_at" in sql
+    assert "utterance_segments" in sql
+    assert "recording_speaker_mappings" in sql
+    assert "coalesce(speakers.stats" in sql
+    assert "speaking_duration_seconds" in sql
+    assert "speaking_ratio" not in sql
+    assert "recordings.id = any" in sql
+    assert values["recording_ids"] == [str(recording_id)]
 
 
 def test_chunk_context_expansion_loads_all_candidates_in_one_batch_query() -> None:
@@ -217,6 +260,20 @@ def test_recording_scope_is_resolved_with_one_recording_query() -> None:
     assert values == {"locations": ["%上海%"]}
 
 
+def test_recording_scope_uses_exact_file_name_filter() -> None:
+    recording_id = uuid4()
+    connection = FakeConnection([[recording_id]])
+
+    result = _retriever(connection).resolve_recording_scope(
+        ResolvedFilters(file_names=["test3.m4a"]), limit=None, rank=None
+    )
+
+    assert result == [recording_id]
+    sql, values = connection.executions[0]
+    assert "recordings.file_name = any" in sql
+    assert values["file_names"] == ["test3.m4a"]
+
+
 def test_resolved_scope_reuses_ids_but_preserves_chunk_level_person_filter() -> None:
     recording_id = uuid4()
     clauses = ["recordings.status = 'completed'"]
@@ -252,8 +309,12 @@ def test_lexical_candidates_apply_resolved_scope_and_chunk_filters() -> None:
 
     assert result == []
     sql, values = connection.executions[0]
+    assert "position(:query in chunks.normalized_text) > 0" in sql
     assert "word_similarity(:query, chunks.normalized_text)" in sql
-    assert "order by :query <<-> chunks.normalized_text" in sql
+    assert "as exact_match" in sql
+    assert "then 1.0" in sql
+    assert "order by (position(:query in chunks.normalized_text) > 0) desc" in sql
+    assert ":query <<-> chunks.normalized_text" in sql
     assert "chunks.recording_id = any" in sql
     assert "chunk_speakers.speaker_profile_id" in sql
     assert values["query"] == "api 版本"
@@ -276,6 +337,25 @@ def test_rrf_fusion_deduplicates_and_marks_match_types() -> None:
     assert [row["chunk_id"] for row in result] == [overlap_id, first_id, lexical_id]
     assert [row["match_type"] for row in result] == ["hybrid", "vector", "lexical"]
     assert float(cast(float, result[0]["score"])) > float(cast(float, result[1]["score"]))
+
+
+def test_rrf_fusion_rewards_a_chunk_returned_by_multiple_query_variants() -> None:
+    original_only = uuid4()
+    expansion_only = uuid4()
+    returned_by_both = uuid4()
+    retriever = _retriever(FakeConnection([]))
+
+    result = retriever.fuse_candidate_lists(
+        [
+            [{"chunk_id": original_only, "score": 0.9}, {"chunk_id": returned_by_both, "score": 0.8}],
+            [{"chunk_id": expansion_only, "score": 0.9}, {"chunk_id": returned_by_both, "score": 0.8}],
+        ],
+        [],
+        limit=10,
+    )
+
+    assert result[0]["chunk_id"] == returned_by_both
+    assert {row["chunk_id"] for row in result[1:]} == {original_only, expansion_only}
 
 
 def test_overlapping_expanded_contexts_are_merged_without_duplicate_lines() -> None:

@@ -253,7 +253,7 @@ class RecordingProjectionService:
                         "embedding_model_id": embedding_model_id,
                         "chunk_index": chunk.chunk_index,
                         "text": chunk.text,
-                        "normalized_text": normalize_search_text(chunk.text),
+                        "normalized_text": normalize_search_text(chunk.retrieval_text()),
                         "start_ms": chunk.start_ms,
                         "end_ms": chunk.end_ms,
                         "speaker_labels": chunk.speaker_labels,
@@ -264,6 +264,8 @@ class RecordingProjectionService:
                         "metadata": json.dumps(
                             {
                                 "topic": chunk.topic,
+                                "terms": chunk.terms,
+                                "search_context": chunk.search_context,
                                 "topic_section_index": chunk.topic_section_index,
                                 "build_method": chunk.build_method,
                             },

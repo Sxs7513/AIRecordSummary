@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 from app_factory import create_app
-from router import production_api_router
 
-app = create_app(router=production_api_router)
+app = create_app()
 
 
 def run() -> None:

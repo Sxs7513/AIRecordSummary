@@ -25,7 +25,7 @@ class ConversationMessageStatus(StrEnum):
 class Conversation(BaseModel):
     id: UUID
     workspace_id: UUID
-    owner_user_id: UUID
+    owner_user_id: UUID | None
     title: str
     archived_at: datetime | None
     created_at: datetime

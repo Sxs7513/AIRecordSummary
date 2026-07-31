@@ -12,4 +12,3 @@ export default function AsrLabLayout({ children }: { children: React.ReactNode }
     </div>
   );
 }
-

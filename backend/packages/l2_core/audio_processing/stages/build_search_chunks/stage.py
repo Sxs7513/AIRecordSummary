@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from pathlib import Path
+from collections.abc import Callable
 from typing import Literal
 
-from l1_foundation.pipeline.contracts import ArtifactPayload, ResourceQueue, RetryPolicy, StageContext, StageResult
+from l1_foundation.llm import LlmProvider
+from l1_foundation.pipeline.contracts import ArtifactPayload, RetryPolicy, StageContext, StageResult
 from l1_foundation.pipeline.runtime.artifact_store import ArtifactStore
+from l1_foundation.worker import SyncWorkerClient
 from l2_core.audio_processing.stages.build_search_chunks.builder import SearchChunkBuilder
 from l2_core.audio_processing.stages.build_search_chunks.contracts import TopicSection
 from l2_core.audio_processing.stages.build_search_chunks.detector import TopicBoundaryDetector
@@ -19,28 +21,33 @@ class BuildSearchChunksStage:
     """Build bounded, topic-aware retrieval chunks from final utterances."""
 
     name = "build_search_chunks"
-    version = "2"
-    resource_queue = ResourceQueue.GPU_NORMAL
+    version = "4"
     retry_policy = RetryPolicy(initial_backoff_seconds=30)
     input_model = BuildSearchChunksInput
 
     def __init__(
         self,
         artifact_store: ArtifactStore,
-        max_chars: int = 1_200,
+        token_counter: Callable[[str], int],
+        max_tokens: int = 800,
         max_duration_ms: int = 180_000,
         max_utterances: int = 30,
         topic_detection_enabled: bool = False,
-        topic_model_path: Path | None = None,
-        topic_model_context_size: int = 8192,
-        topic_model_verbose: bool = False,
+        worker_client: SyncWorkerClient | None = None,
+        topic_provider: LlmProvider | None = None,
+        topic_context_size: int = 8192,
     ) -> None:
         self._artifact_store = artifact_store
-        self._builder = SearchChunkBuilder(max_chars, max_duration_ms, max_utterances)
+        self._builder = SearchChunkBuilder(token_counter, max_tokens, max_duration_ms, max_utterances)
         self._detector = (
-            TopicBoundaryDetector(topic_model_path, topic_model_context_size, topic_model_verbose)
-            if topic_detection_enabled and topic_model_path is not None
+            TopicBoundaryDetector(worker_client, topic_provider, topic_context_size)
+            if topic_detection_enabled and worker_client is not None and topic_provider is not None
             else None
+        )
+
+    async def try_restore(self, context: StageContext, _input_payload: BuildSearchChunksInput) -> StageResult[SearchChunksOutput] | None:
+        return self._artifact_store.try_restore_json(
+            context.pipeline_run_id, context.stage_run_id, self.name, self.version, "search.chunks", SearchChunksOutput
         )
 
     async def run(self, context: StageContext, input_payload: BuildSearchChunksInput) -> StageResult[SearchChunksOutput]:
@@ -55,8 +62,6 @@ class BuildSearchChunksStage:
             except Exception as error:
                 logger.warning("检索分块：主题识别失败，使用确定性分块：%s", error)
                 logger.debug("检索分块主题识别异常详情", exc_info=True)
-            finally:
-                self._detector.release()
         build_method: Literal["topic_boundary", "deterministic_fallback"] = "topic_boundary" if sections is not None else "deterministic_fallback"
         context.report_progress(75, "构建有界检索分块")
         chunks = self._builder.build(utterances, sections)

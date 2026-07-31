@@ -5,6 +5,7 @@ from enum import StrEnum
 
 
 class ResourceQueue(StrEnum):
+    IO = "io"
     CPU = "cpu"
     GPU_NORMAL = "gpu_normal"
     GPU_HIGH = "gpu_high"

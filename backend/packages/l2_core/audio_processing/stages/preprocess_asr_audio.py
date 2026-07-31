@@ -3,17 +3,18 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
-from l1_foundation.pipeline.contracts import ArtifactPayload, ResourceQueue, RetryPolicy, StageContext, StageResult
+from l1_foundation.pipeline.contracts import ArtifactPayload, RetryPolicy, StageContext, StageResult
 from l1_foundation.pipeline.runtime.artifact_store import ArtifactStore
 from l2_core.audio_processing.stages.recording_models import NormalizedAudioOutput, PreprocessAsrAudioInput
 
+ASR_AUDIO_OUTPUT_ARGS = ("-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le")
+
 
 class PreprocessAsrAudioStage:
-    """Create a time-preserving, lightly conditioned ASR input waveform."""
+    """Create a time-preserving ASR waveform without altering speech characteristics."""
 
     name = "preprocess_asr_audio"
-    version = "1"
-    resource_queue = ResourceQueue.CPU
+    version = "5"
     retry_policy = RetryPolicy(initial_backoff_seconds=10)
     input_model = PreprocessAsrAudioInput
 
@@ -22,6 +23,23 @@ class PreprocessAsrAudioStage:
         self._artifact_store = artifact_store
         self._enabled = enabled
         self._ffmpeg_binary = ffmpeg_binary
+
+    async def try_restore(self, context: StageContext, _input_payload: PreprocessAsrAudioInput) -> StageResult[NormalizedAudioOutput] | None:
+        restored = self._artifact_store.try_restore_json(
+            context.pipeline_run_id,
+            context.stage_run_id,
+            self.name,
+            self.version,
+            "audio.asr_preprocessed",
+            NormalizedAudioOutput,
+        )
+        if restored is None:
+            return None
+        try:
+            self._resolve(restored.output.storage_path)
+        except FileNotFoundError:
+            return None
+        return restored
 
     async def run(self, context: StageContext, input_payload: PreprocessAsrAudioInput) -> StageResult[NormalizedAudioOutput]:
         descriptor = self._artifact_store.read_json(input_payload.audio)
@@ -35,7 +53,6 @@ class PreprocessAsrAudioStage:
                 output=output,
                 artifacts=(ArtifactPayload(artifact_type="audio.asr_preprocessed", data=output.model_dump(mode="json")),),
             )
-
         target_relative = Path("asr-preprocessed") / str(context.subject_id) / f"{context.pipeline_run_id}.wav"
         target = self._storage_root / target_relative
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -46,19 +63,19 @@ class PreprocessAsrAudioStage:
             "-i",
             str(source),
             "-vn",
-            "-ar",
-            "16000",
-            "-ac",
-            "1",
-            "-af",
-            "highpass=f=80,acompressor=threshold=-30dB:ratio=2.5:attack=20:release=250:makeup=4,loudnorm=I=-19:TP=-1.5:LRA=11,alimiter=limit=0.95",
-            "-c:a",
-            "pcm_s16le",
+            *ASR_AUDIO_OUTPUT_ARGS,
             str(target),
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
         )
-        _, stderr = await process.communicate()
+        try:
+            _, stderr = await process.communicate()
+        except asyncio.CancelledError:
+            if process.returncode is None:
+                process.terminate()
+                await process.wait()
+            target.unlink(missing_ok=True)
+            raise
         if process.returncode != 0:
             raise RuntimeError(f"ffmpeg ASR preprocessing failed: {stderr.decode('utf-8', errors='replace')[-2000:]}")
         output = NormalizedAudioOutput(storage_path=target_relative.as_posix(), sample_rate_hz=16000, channels=1, format="wav")

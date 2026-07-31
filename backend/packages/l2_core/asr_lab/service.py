@@ -75,6 +75,7 @@ class AsrLabService:
                      and annotations.source_asset_id = assets.id
                     left join evaluation_dataset_versions versions on versions.dataset_id = datasets.id
                     where datasets.workspace_id = :workspace_id
+                      and datasets.task_type = 'asr'
                       and datasets.status = 'active'
                     group by datasets.id
                     order by datasets.updated_at desc
@@ -114,7 +115,7 @@ class AsrLabService:
         with self._engine.begin() as connection:
             self._dataset_row(connection, user, dataset_id)
             connection.execute(
-                text("select id from evaluation_datasets where id = :dataset_id for update"),
+                text("select id from evaluation_datasets where id = :dataset_id and task_type = 'asr' for update"),
                 {"dataset_id": dataset_id},
             )
             version_count = cast(
@@ -1575,6 +1576,7 @@ class AsrLabService:
                 from evaluation_datasets
                 where id = :dataset_id
                   and workspace_id = :workspace_id
+                  and task_type = 'asr'
                   and status = 'active'
                 """
             ),

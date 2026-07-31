@@ -3,58 +3,164 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any, Literal, cast
 from uuid import UUID
 
+from langchain_core.messages import BaseMessage
 from langgraph.graph import END, START, StateGraph
 
-from l1_foundation.task_runtime.resources import ResourceQueue
-from l1_foundation.task_runtime.scheduler import ResourceScheduler
-from l2_core.rag.contracts import AnswerPlan, AnswerPlanItem, Evidence, EvidenceGrade, RagGraphState, RagHistoryMessage, RagRoute, ResolvedFilters
-from l2_core.rag.model import RagLanguageModel
+from l1_foundation.llm import (
+    ChatMessage,
+    ChatRole,
+    CompletionOptions,
+    LlmGenerateResult,
+    LlmProvider,
+    ResponseFormat,
+    ResponseFormatType,
+    build_llm_generate_command,
+)
+from l1_foundation.observability import (
+    InstrumentedModelClient,
+    finish_span,
+    start_span,
+)
+from l1_foundation.observability.context import current_span
+from l2_core.rag.citations import normalize_answer_citations
+from l2_core.rag.contracts import (
+    AnswerPlan,
+    AnswerPlanItem,
+    Evidence,
+    EvidenceGrade,
+    RagGraphState,
+    RagHistoryMessage,
+    RagRoute,
+    ResolvedFilters,
+    RetrievalTerms,
+    StrategyId,
+)
+from l2_core.rag.execution_middleware import RagExecutionCancelled, rag_execution_middleware
+from l2_core.rag.hooks import (
+    RagExecutionHook,
+    RagNodeCompleted,
+    RagOperationCompleted,
+    current_rag_execution_hook,
+    rag_execution_hook_scope,
+)
 from l2_core.rag.observability import elapsed_ms, log_event, started_at
-from l2_core.rag.prompts import answer_plan_prompt, answer_prompt, grade_prompt, route_prompt
+from l2_core.rag.prompts import answer_plan_prompt, answer_prompt, grade_prompt, retrieval_terms_prompt, route_prompt
 from l2_core.rag.retrieval import RagRetriever
 from l2_core.rag.routing import AMBIGUOUS_RECORDING_SCOPE_MESSAGE, ROUTE_UNRESOLVED_MESSAGE, parse_route_response
-from l2_core.rag.scope import make_filters, resolve_date_range
+from l2_core.rag.scope import make_filters, resolve_time_range
+from l2_core.rag.strategies.base import StrategyResult
+from l2_core.rag.strategies.fact_lookup import FactLookupStrategy
+from l2_core.rag.strategies.metadata_lookup import MetadataLookupStrategy
+from l2_core.rag.strategies.registry import StrategyRegistry
+from l2_core.rag.strategies.scope_summary import ScopeSummaryStrategy
 from l2_core.rag.streaming import ThinkTagFilter
+from l2_core.rag.token_budget import RagTokenBudgetMiddleware
+from l2_core.rag.workflows.chunk_evidence import ChunkEvidencePipeline
 
-MAX_RETRIEVAL_ATTEMPTS = 1
 logger = logging.getLogger("rag")
 
 
 class RagGraph:
     """Typed LangGraph implementation of route, retrieval, evidence checks and answer generation."""
 
-    def __init__(self, retriever: RagRetriever, model: RagLanguageModel, scheduler: ResourceScheduler | None = None) -> None:
+    def __init__(
+        self,
+        retriever: RagRetriever,
+        model_client: InstrumentedModelClient,
+        online_provider: LlmProvider,
+        context_size: int,
+        *,
+        plan_local_input_tokens: int = 4_000,
+        max_total_tokens: int = 50_000,
+        route_model_profile: Literal["default", "rag"] = "default",
+        node_model_profile: Literal["default", "rag"] = "default",
+        query_term_expansion_enabled: bool = False,
+    ) -> None:
         self._retriever = retriever
-        self._model = model
-        self._scheduler = scheduler
-        builder = cast(Any, StateGraph(RagGraphState))
-        builder.add_node("route", self._route)
-        builder.add_node("retrieve", self._retrieve)
-        builder.add_node("grade", self._grade)
-        builder.add_node("rewrite", self._rewrite)
-        builder.add_node("decide_plan", self._decide_plan)
-        builder.add_node("plan", self._plan)
-        builder.add_node("validate_plan", self._validate_plan)
-        builder.add_node("select_direct_evidence", self._select_direct_evidence)
-        builder.add_node("select_planned_evidence", self._select_planned_evidence)
-        builder.add_edge(START, "route")
-        builder.add_conditional_edges("route", self._after_route, {"retrieve": "retrieve", "unresolved": END})
-        builder.add_edge("retrieve", "grade")
-        builder.add_conditional_edges("grade", self._after_grade, {"rewrite": "rewrite", "decide_plan": "decide_plan", "done": END})
-        builder.add_conditional_edges("rewrite", self._after_rewrite, {"retrieve": "retrieve", "grade": "grade"})
-        builder.add_conditional_edges(
-            "decide_plan",
-            self._after_plan_decision,
-            {"plan": "plan", "select_direct_evidence": "select_direct_evidence"},
+        self._model_client = model_client
+        self._online_provider = online_provider
+        self._context_size = context_size
+        self._plan_local_input_tokens = plan_local_input_tokens
+        self._route_model_profile: Literal["default", "rag"] = route_model_profile
+        self._node_model_profile: Literal["default", "rag"] = node_model_profile
+        self._query_term_expansion_enabled = query_term_expansion_enabled
+        self._token_budget = RagTokenBudgetMiddleware(max_total_tokens)
+        self._chunk_evidence = ChunkEvidencePipeline(
+            retriever,
+            node_started=self._node_started,
+            node_completed=self._node_completed,
+            operation_completed=self._operation_completed,
+            transition=self._transition,
         )
-        builder.add_edge("plan", "validate_plan")
-        builder.add_edge("validate_plan", "select_planned_evidence")
-        builder.add_edge("select_direct_evidence", END)
-        builder.add_edge("select_planned_evidence", END)
+        self._strategies = StrategyRegistry(
+            (
+                FactLookupStrategy(
+                    chunk_evidence_pipeline=self._chunk_evidence,
+                    expand_retrieval_terms=self._expand_retrieval_terms,
+                    grade=self._grade,
+                    plan=self._plan,
+                    validate_plan=self._validate_plan,
+                    select_planned_evidence=self._select_planned_evidence,
+                    after_grade=self._after_grade,
+                    transition=self._transition,
+                    rerank_enabled=bool(getattr(retriever, "rerank_enabled", False)),
+                    query_term_expansion_enabled=query_term_expansion_enabled,
+                    render_evidence=self._evidence_text,
+                ),
+                MetadataLookupStrategy(
+                    retriever,
+                    node_started=self._node_started,
+                    node_completed=self._node_completed,
+                    operation_completed=self._operation_completed,
+                ),
+                ScopeSummaryStrategy(
+                    retriever,
+                    node_started=self._node_started,
+                    node_completed=self._node_completed,
+                    operation_completed=self._operation_completed,
+                    decide_plan=self._decide_plan,
+                    plan=self._plan,
+                    validate_plan=self._validate_plan,
+                    select_direct_evidence=self._select_direct_evidence,
+                    select_planned_evidence=self._select_planned_evidence,
+                    after_plan_decision=self._after_plan_decision,
+                    render_evidence=self._evidence_text,
+                ),
+            )
+        )
+        self._strategies.validate_complete({"fact_lookup", "metadata_lookup", "scope_summary"})
+        builder = cast(Any, StateGraph(RagGraphState))
+        builder.add_node(
+            "route",
+            rag_execution_middleware.wrap_node(self._route, graph_name="root", node_name="route"),
+        )
+        for strategy in self._strategies.all():
+            node_name = f"strategy_{strategy.id}"
+            builder.add_node(
+                node_name,
+                rag_execution_middleware.wrap_node(
+                    self._strategy_node(strategy.id),
+                    graph_name="root",
+                    node_name=node_name,
+                ),
+            )
+        builder.add_edge(START, "route")
+        builder.add_conditional_edges(
+            "route",
+            self._after_route_strategy,
+            {
+                "fact_lookup": "strategy_fact_lookup",
+                "metadata_lookup": "strategy_metadata_lookup",
+                "scope_summary": "strategy_scope_summary",
+                "unresolved": END,
+            },
+        )
+        for strategy in self._strategies.all():
+            builder.add_edge(f"strategy_{strategy.id}", END)
         self._graph: Any = builder.compile()
 
     async def run(
@@ -66,6 +172,34 @@ class RagGraph:
         on_delta: Callable[[str], None],
         history: list[RagHistoryMessage] | None = None,
         run_id: UUID | None = None,
+        hook: RagExecutionHook | None = None,
+        existing_answer: str | None = None,
+        restored_state: RagGraphState | None = None,
+    ) -> tuple[str, list[dict[str, object]], bool, str | None]:
+        with rag_execution_hook_scope(hook):
+            return await self._run(
+                query,
+                limit,
+                scope_recording_ids,
+                on_phase,
+                on_delta,
+                history,
+                run_id,
+                existing_answer,
+                restored_state,
+            )
+
+    async def _run(
+        self,
+        query: str,
+        limit: int,
+        scope_recording_ids: list[UUID],
+        on_phase: Callable[[str, str, int | None], None],
+        on_delta: Callable[[str], None],
+        history: list[RagHistoryMessage] | None = None,
+        run_id: UUID | None = None,
+        existing_answer: str | None = None,
+        restored_state: RagGraphState | None = None,
     ) -> tuple[str, list[dict[str, object]], bool, str | None]:
         trace_id = str(run_id) if run_id is not None else "standalone"
         graph_started = started_at()
@@ -79,27 +213,40 @@ class RagGraph:
         )
         on_phase("routing", "正在理解问题", 10)
         try:
-            result = await self._graph.ainvoke(
-                RagGraphState(
+            initial_state = self._initial_state(trace_id, "answer", query, limit, scope_recording_ids, history)
+            if restored_state is not None:
+                initial_state.update(restored_state)
+                initial_state.update(
                     run_id=trace_id,
+                    execution_mode="answer",
                     query=query,
                     history=history or [],
                     limit=limit,
                     scope_recording_ids=[str(item) for item in scope_recording_ids],
-                    route=None,
-                    route_error=None,
-                    filters=None,
-                    retrieval_query=query,
-                    retrieval_attempt=0,
-                    evidence=[],
-                    answer_evidence=[],
-                    message=None,
-                    grade=None,
-                    planning_required=False,
-                    answer_plan=None,
                 )
+            result = await self._graph.ainvoke(initial_state)
+        except asyncio.CancelledError:
+            finish_span(current_span(), "cancelled", error_type="CancelledError")
+            log_event(
+                "graph_completed",
+                trace_id,
+                status="cancelled",
+                stage="graph_nodes",
+                elapsed_ms=elapsed_ms(graph_started),
             )
+            raise
+        except RagExecutionCancelled:
+            finish_span(current_span(), "cancelled", error_type="RagExecutionCancelled")
+            log_event(
+                "graph_completed",
+                trace_id,
+                status="cancelled",
+                stage="graph_nodes",
+                elapsed_ms=elapsed_ms(graph_started),
+            )
+            raise
         except Exception as error:
+            finish_span(current_span(), "failed", error_type=type(error).__name__)
             log_event(
                 "graph_completed",
                 trace_id,
@@ -111,7 +258,6 @@ class RagGraph:
             )
             raise
         state = cast(RagGraphState, result)
-        evidence = state["evidence"]
         if state["route_error"] is not None:
             message = AMBIGUOUS_RECORDING_SCOPE_MESSAGE if state["route_error"] == "ambiguous_recording_scope" else ROUTE_UNRESOLVED_MESSAGE
             log_event(
@@ -122,57 +268,93 @@ class RagGraph:
                 elapsed_ms=elapsed_ms(graph_started),
             )
             return message, [], True, state["route_error"]
-        grade = state["grade"]
+        strategy_result = cast(StrategyResult | None, state["strategy_result"])
+        if strategy_result is None:
+            raise RuntimeError("RAG graph completed without a strategy result")
+        evidence = strategy_result.evidence
         plan = state["answer_plan"]
-        if not evidence or grade is None or not grade.sufficient:
+        if strategy_result.status != "ready":
             log_event(
                 "graph_completed",
                 trace_id,
                 status="insufficient_evidence",
-                reason=state["message"] or (grade.reason if grade is not None else "missing_grade"),
+                reason=strategy_result.message or "strategy_not_ready",
                 evidence_count=len(evidence),
                 elapsed_ms=elapsed_ms(graph_started),
             )
-            return "没有在录音中找到足够依据。", [], True, state["message"]
+            return "没有在录音中找到足够依据。", [], True, strategy_result.message
         if state["planning_required"] and plan is None:
             raise RuntimeError("RAG answer planning was required but no valid plan was produced")
-        answer_evidence = state["answer_evidence"]
-        if not answer_evidence:
-            raise RuntimeError("RAG graph completed without selecting answer evidence")
         on_phase("generating", "正在生成回答", 75)
         answer_started = self._node_started(state, "answer")
         log_event(
             "answer_mode_selected",
             trace_id,
             mode="planned" if plan is not None else "direct",
-            retrieved_evidence_count=len(evidence),
-            answer_evidence_count=len(answer_evidence),
+            strategy_id=state["route"].strategy_id if state["route"] is not None else None,
+            retrieved_evidence_count=len(state["evidence"]),
+            answer_evidence_count=len(strategy_result.sources),
+            answer_evidence_text=self._evidence_log_entries(strategy_result.evidence),
         )
         prompt, values = answer_prompt(
-            query,
+            state["query"],
             plan.model_dump_json() if plan is not None else None,
-            self._evidence_text(answer_evidence),
+            strategy_result.answer_context,
             self._history_text(state["history"]),
+            state["grade"].verdict if state["grade"] is not None else None,
+            existing_answer,
         )
         messages = prompt.invoke(values).to_messages()
         first_token_logged = False
 
-        def traced_delta(delta: str) -> None:
+        def trace_delta(delta: str) -> None:
             nonlocal first_token_logged
             if not first_token_logged:
                 first_token_logged = True
                 log_event("answer_first_token", trace_id, elapsed_ms=elapsed_ms(answer_started))
             on_delta(delta)
 
+        traced_delta = rag_execution_middleware.wrap_delta(trace_delta)
+
+        answer_provider = LlmProvider.LOCAL if state["route"] is not None and state["route"].strategy_id == "metadata_lookup" else self._online_provider
         try:
-            answer = await self._generate_streaming_answer(messages, 2048, traced_delta)
+            answer, answer_result = await self._generate_streaming_answer(state, messages, 2048, traced_delta, provider=answer_provider)
+        except asyncio.CancelledError:
+            finish_span(current_span(), "cancelled", error_type="CancelledError")
+            log_event(
+                "graph_completed",
+                trace_id,
+                status="cancelled",
+                stage="answer",
+                elapsed_ms=elapsed_ms(graph_started),
+            )
+            raise
+        except RagExecutionCancelled:
+            finish_span(current_span(), "cancelled", error_type="RagExecutionCancelled")
+            log_event(
+                "graph_completed",
+                trace_id,
+                status="cancelled",
+                stage="answer",
+                elapsed_ms=elapsed_ms(graph_started),
+            )
+            raise
         except Exception as error:
+            model_execution = "local" if answer_provider == LlmProvider.LOCAL else "online"
+            finish_span(
+                current_span(),
+                "failed",
+                error_type=type(error).__name__,
+                metadata={"model_execution": model_execution, "provider": answer_provider.value},
+            )
             log_event(
                 "node_failed",
                 trace_id,
                 level=logging.ERROR,
                 node="answer",
                 error_type=type(error).__name__,
+                model_execution=model_execution,
+                provider=answer_provider.value,
                 elapsed_ms=elapsed_ms(answer_started),
             )
             log_event(
@@ -186,29 +368,113 @@ class RagGraph:
             )
             raise
         if not answer:
-            raise RuntimeError("Local RAG model returned an empty streamed answer")
+            raise RuntimeError("RAG answer model returned an empty streamed answer")
+        complete_answer = f"{existing_answer or ''}{answer}"
+        normalized_citations = normalize_answer_citations(complete_answer, strategy_result.sources)
+        answer = normalized_citations.text
+        sources = normalized_citations.sources
+        if normalized_citations.invalid_indexes:
+            log_event(
+                "answer_invalid_citations_removed",
+                trace_id,
+                level=logging.WARNING,
+                invalid_indexes=list(normalized_citations.invalid_indexes),
+            )
+        state["token_usage"] += self._token_budget.actual_usage(answer_result)
         self._node_completed(
             state,
             "answer",
             answer_started,
             answer_chars=len(answer),
-            evidence_count=len(answer_evidence),
+            evidence_count=len(sources),
             mode="planned" if plan is not None else "direct",
+            total_tokens=state["token_usage"],
+            model_execution="local" if answer_provider == LlmProvider.LOCAL else "online",
+            provider=answer_provider.value,
         )
         log_event(
             "graph_completed",
             trace_id,
             status="succeeded",
-            evidence_count=len(answer_evidence),
-            retrieved_evidence_count=len(evidence),
+            evidence_count=len(sources),
+            retrieved_evidence_count=len(state["evidence"]),
             planning_required=state["planning_required"],
             elapsed_ms=elapsed_ms(graph_started),
         )
-        return answer, [item.source_payload() for item in answer_evidence], False, state["message"]
+        return answer, sources, False, strategy_result.message
+
+    async def run_retrieval(
+        self,
+        query: str,
+        limit: int,
+        scope_recording_ids: list[UUID],
+        *,
+        history: list[RagHistoryMessage] | None = None,
+        run_id: UUID | None = None,
+        hook: RagExecutionHook | None = None,
+    ) -> RagGraphState:
+        """Execute the production routing and retrieval nodes without grade or answer generation."""
+        trace_id = str(run_id) if run_id is not None else "standalone"
+        with rag_execution_hook_scope(hook):
+            result = await self._graph.ainvoke(self._initial_state(trace_id, "retrieval", query, limit, scope_recording_ids, history))
+        return cast(RagGraphState, result)
+
+    async def grade_retrieval(
+        self,
+        state: RagGraphState,
+        *,
+        hook: RagExecutionHook | None = None,
+    ) -> RagGraphState:
+        """Run the production evidence gate against an already retrieved evaluation state."""
+
+        with rag_execution_hook_scope(hook):
+            update = await self._grade(state)
+        result = cast(RagGraphState, {**state, **update})
+        result["token_usage"] = state.get("token_usage", 0) + cast(int, update.get("token_usage", 0))
+        return result
+
+    @staticmethod
+    def _initial_state(
+        trace_id: str,
+        execution_mode: Literal["answer", "retrieval"],
+        query: str,
+        limit: int,
+        scope_recording_ids: list[UUID],
+        history: list[RagHistoryMessage] | None,
+    ) -> RagGraphState:
+        return RagGraphState(
+            run_id=trace_id,
+            execution_mode=execution_mode,
+            query=query,
+            history=history or [],
+            limit=limit,
+            scope_recording_ids=[str(item) for item in scope_recording_ids],
+            route=None,
+            route_error=None,
+            filters=None,
+            content_query=query,
+            retrieval_expanded_query=None,
+            retrieval_lexical_queries=[],
+            retrieval_protected_lexical_queries=[],
+            retrieval_attempt=0,
+            retrieval_candidates=[],
+            protected_chunk_ids=[],
+            rerank_input_tokens=0,
+            rerank_skipped_candidates=0,
+            evidence=[],
+            answer_evidence=[],
+            message=None,
+            grade=None,
+            planning_required=False,
+            answer_plan=None,
+            token_usage=0,
+            strategy_result=None,
+        )
 
     @staticmethod
     def _node_started(state: RagGraphState, node: str) -> float:
         start = started_at()
+        start_span(node, attempt=state.get("retrieval_attempt", 0))
         log_event(
             "node_started",
             state.get("run_id", "standalone"),
@@ -219,13 +485,60 @@ class RagGraph:
 
     @staticmethod
     def _node_completed(state: RagGraphState, node: str, start: float, **fields: object) -> None:
+        fields.setdefault("model_execution", RagGraph._node_model_execution(node))
+        duration = elapsed_ms(start)
+        safe_metadata = {
+            key: value
+            for key, value in fields.items()
+            if not any(sensitive in key.lower() for sensitive in ("raw", "prompt", "query", "text", "message", "transcript"))
+        }
+        finish_span(current_span(), "succeeded", metadata=safe_metadata)
         log_event(
             "node_completed",
             state.get("run_id", "standalone"),
             node=node,
             attempt=state.get("retrieval_attempt", 0),
-            elapsed_ms=elapsed_ms(start),
+            elapsed_ms=duration,
             data=fields,
+        )
+        current_rag_execution_hook().on_node_completed(
+            RagNodeCompleted(
+                node=node,
+                attempt=state.get("retrieval_attempt", 0),
+                elapsed_ms=duration,
+                metadata=fields,
+            )
+        )
+
+    @staticmethod
+    def _node_model_execution(node: str) -> Literal["local", "online", "none"]:
+        """Execution location for nodes with a fixed model dependency."""
+
+        if node == "route":
+            return "online"
+        if node in {"retrieve", "rerank"}:
+            return "local"
+        return "none"
+
+    @staticmethod
+    def _operation_completed(
+        node: str,
+        operation: str,
+        output: object,
+        start: float,
+        *,
+        status: str = "succeeded",
+        details: Mapping[str, object] | None = None,
+    ) -> None:
+        current_rag_execution_hook().on_operation_completed(
+            RagOperationCompleted(
+                node=node,
+                operation=operation,
+                output=output,
+                elapsed_ms=elapsed_ms(start),
+                status=status,
+                details=details or {},
+            )
         )
 
     @staticmethod
@@ -241,10 +554,17 @@ class RagGraph:
 
     async def _route(self, state: RagGraphState) -> dict[str, object]:
         node_started = self._node_started(state, "route")
-        prompt, values, _ = route_prompt(
-            state["retrieval_query"], self._route_history_messages(state["history"]), self._route_history_sources(state["history"])
+        prompt, values, _ = route_prompt(state["query"], self._route_history_context(state["history"]))
+        result = await self._complete(
+            state,
+            "route",
+            prompt.invoke(values).to_messages(),
+            max_tokens=700,
+            json_schema=RagRoute.model_json_schema(),
+            provider=self._online_provider,
         )
-        raw = await self._complete(prompt.invoke(values).to_messages(), max_tokens=700, json_schema=RagRoute.model_json_schema())
+        raw = result.text
+        token_usage = self._token_budget.actual_usage(result)
         logger.debug("rag route raw output: %s", raw)
         route = parse_route_response(raw)
         if route is None:
@@ -253,11 +573,12 @@ class RagGraph:
                 "route",
                 node_started,
                 outcome="route_unresolved",
-                query_chars=len(state["retrieval_query"]),
+                query=state["query"],
+                query_chars=len(state["query"]),
                 response_chars=len(raw),
                 raw=raw,
             )
-            return {"route_error": "route_unresolved"}
+            return {"route_error": "route_unresolved", "token_usage": token_usage}
         if route.status != "resolved":
             route_error = route.error_code or "route_unresolved"
             self._node_completed(
@@ -265,22 +586,24 @@ class RagGraph:
                 "route",
                 node_started,
                 outcome=route.status,
+                query=state["query"],
                 reason=route_error,
                 response_chars=len(raw),
                 raw=raw,
             )
-            return {"route_error": route_error}
-        if route.time_range is not None and resolve_date_range(route) == (None, None):
+            return {"route_error": route_error, "token_usage": token_usage}
+        if route.time_range is not None and resolve_time_range(route) == (None, None):
             self._node_completed(
                 state,
                 "route",
                 node_started,
                 outcome="unresolved",
+                query=state["query"],
                 reason="unsupported_time_expression",
                 response_chars=len(raw),
                 raw=raw,
             )
-            return {"route_error": "unsupported_time_expression"}
+            return {"route_error": "unsupported_time_expression", "token_usage": token_usage}
         route_error = self._validate_selected_recording_ids(route, [UUID(value) for value in state["scope_recording_ids"]])
         if route_error is not None:
             self._node_completed(
@@ -288,11 +611,12 @@ class RagGraph:
                 "route",
                 node_started,
                 outcome="rejected",
+                query=state["query"],
                 reason=route_error,
                 response_chars=len(raw),
                 raw=raw,
             )
-            return {"route_error": route_error}
+            return {"route_error": route_error, "token_usage": token_usage}
         scope_ids = [UUID(value) for value in state["scope_recording_ids"]]
         preliminary = make_filters(route, None, scope_ids)
         recording_ids = self._retriever.resolve_recording_scope(preliminary, route.recording_limit, route.recording_rank)
@@ -302,7 +626,8 @@ class RagGraph:
             "route",
             node_started,
             outcome="resolved",
-            strategy=route.strategy,
+            query=state["query"],
+            strategy_id=route.strategy_id,
             recording_limit=route.recording_limit,
             recording_rank=route.recording_rank,
             filtered_recording_count=len(filters.recording_ids),
@@ -315,13 +640,111 @@ class RagGraph:
             "route": route,
             "route_error": None,
             "filters": filters,
+            "content_query": route.content_query.strip() if route.content_query and route.content_query.strip() else state["query"],
+            "token_usage": token_usage,
         }
+
+    async def _expand_retrieval_terms(self, state: RagGraphState) -> dict[str, object]:
+        """Prepare a scope-free content query and faithful lexical anchors."""
+
+        node_started = self._node_started(state, "expand_retrieval_terms")
+        if not self._query_term_expansion_enabled:
+            self._node_completed(state, "expand_retrieval_terms", node_started, enabled=False, term_count=0, phrase_count=0)
+            return {
+                "content_query": state["content_query"],
+                "retrieval_expanded_query": None,
+                "retrieval_lexical_queries": [],
+                "retrieval_protected_lexical_queries": [],
+            }
+        prompt, values, parser = retrieval_terms_prompt(state["content_query"])
+        try:
+            result = await self._complete(
+                state,
+                "expand_retrieval_terms",
+                prompt.invoke(values).to_messages(),
+                max_tokens=240,
+                json_schema=RetrievalTerms.model_json_schema(),
+                provider=self._provider_for_input(prompt.invoke(values).to_messages(), 1_000),
+            )
+            terms = parser.parse(result.text)
+        except Exception as error:
+            log_event(
+                "node_warning",
+                state.get("run_id", "standalone"),
+                level=logging.WARNING,
+                node="expand_retrieval_terms",
+                reason="term_extraction_fallback",
+                error_type=type(error).__name__,
+            )
+            self._node_completed(
+                state,
+                "expand_retrieval_terms",
+                node_started,
+                enabled=True,
+                fallback=True,
+                term_count=0,
+                phrase_count=0,
+            )
+            return {
+                "content_query": state["content_query"],
+                "retrieval_expanded_query": None,
+                "retrieval_lexical_queries": [],
+                "retrieval_protected_lexical_queries": [],
+            }
+        content_query = terms.content_query.strip() or state["content_query"]
+        anchors = list(dict.fromkeys([*terms.phrases, *terms.terms]))
+        expanded_query = " ".join(anchors).strip() or None
+        lexical_queries = [item for item in anchors if item != content_query]
+        protected_lexical_queries = [item for item in lexical_queries if self._is_protected_lexical_query(item)]
+        self._node_completed(
+            state,
+            "expand_retrieval_terms",
+            node_started,
+            enabled=True,
+            fallback=False,
+            term_count=len(terms.terms),
+            phrase_count=len(terms.phrases),
+            expanded_query_present=expanded_query is not None,
+            extracted_terms=terms.terms,
+            extracted_phrases=terms.phrases,
+            lexical_queries=lexical_queries,
+            protected_lexical_queries=protected_lexical_queries,
+            content_query=content_query,
+        )
+        return {
+            "content_query": content_query,
+            "retrieval_expanded_query": expanded_query if expanded_query != content_query else None,
+            "retrieval_lexical_queries": lexical_queries,
+            "retrieval_protected_lexical_queries": protected_lexical_queries,
+            "token_usage": self._token_budget.actual_usage(result),
+        }
+
+    @staticmethod
+    def _is_protected_lexical_query(value: str) -> bool:
+        return value.strip() not in {"最近", "今天", "昨天", "这次", "这条", "那个", "这个", "是否", "是不是", "有没有"}
 
     @staticmethod
     def _after_route(state: RagGraphState) -> Literal["retrieve", "unresolved"]:
         target: Literal["retrieve", "unresolved"] = "unresolved" if state["route_error"] is not None else "retrieve"
         RagGraph._transition(state, "route", target, state["route_error"] or "route_resolved")
         return target
+
+    def _strategy_node(self, strategy_id: StrategyId) -> Callable[[RagGraphState], object]:
+        async def invoke(state: RagGraphState) -> object:
+            return await self._strategies.get(strategy_id).invoke(state)
+
+        return invoke
+
+    @staticmethod
+    def _after_route_strategy(
+        state: RagGraphState,
+    ) -> Literal["fact_lookup", "metadata_lookup", "scope_summary", "unresolved"]:
+        route = state["route"]
+        if state["route_error"] is not None or route is None or route.strategy_id is None:
+            RagGraph._transition(state, "route", "unresolved", state["route_error"] or "missing_strategy")
+            return "unresolved"
+        RagGraph._transition(state, "route", route.strategy_id, "route_resolved")
+        return route.strategy_id
 
     async def _retrieve(self, state: RagGraphState) -> dict[str, object]:
         node_started = self._node_started(state, "retrieve")
@@ -339,117 +762,134 @@ class RagGraph:
                 strategy=route.strategy,
                 evidence_count=0,
             )
-            return {"evidence": [], "answer_evidence": [], "message": "没有找到符合范围的已完成录音"}
+            return {
+                "retrieval_candidates": [],
+                "evidence": [],
+                "answer_evidence": [],
+                "message": "没有找到符合范围的已完成录音",
+            }
         if route.strategy == "scope_summary":
+            operation_started = started_at()
             evidence = self._retriever.retrieve_scope(filters, route.recording_limit, route.recording_rank)
+            self._operation_completed("retrieve", "retrieve.scope", evidence, operation_started)
+            candidates: list[dict[str, object]] = []
         elif route.strategy == "chunk_search":
-            query = route.topic or state["retrieval_query"]
-            evidence = await self._retrieve_chunks(query, filters, state["limit"], state.get("run_id", "standalone"))
+            query = state["content_query"]
+            candidates = await self._retrieve_candidates(query, filters, state["limit"], state.get("run_id", "standalone"))
+            evidence = []
         else:
             raise RuntimeError("Resolved RAG route has no retrieval strategy")
         self._node_completed(
             state,
             "retrieve",
             node_started,
-            outcome="succeeded" if evidence else "empty",
+            outcome="succeeded" if evidence or candidates else "empty",
             strategy=route.strategy,
             evidence_count=len(evidence),
+            candidate_count=len(candidates),
             recording_count=len({item.recording.id for item in evidence}),
             requested_limit=state["limit"],
         )
         return {
+            "retrieval_candidates": candidates,
             "evidence": evidence,
             "answer_evidence": [],
-            "message": None if evidence else "没有找到足够相关的录音片段",
+            "rerank_input_tokens": 0,
+            "rerank_skipped_candidates": 0,
+            "message": None if evidence or candidates else "没有找到足够相关的录音片段",
         }
 
-    async def _retrieve_chunks(
+    def _after_retrieve(self, state: RagGraphState) -> Literal["expand_context", "grade", "done"]:
+        route = state["route"]
+        if route is not None and route.strategy == "chunk_search" and state["retrieval_candidates"]:
+            target: Literal["expand_context", "grade", "done"] = "expand_context"
+            reason = "candidates_ready"
+        elif state["execution_mode"] == "retrieval":
+            target = "done"
+            reason = "retrieval_terminal"
+        else:
+            target = "grade"
+            reason = "scope_evidence_ready" if state["evidence"] else "no_candidates"
+        self._transition(state, "retrieve", target, reason)
+        return target
+
+    async def _retrieve_candidates(
         self,
         query: str,
         filters: ResolvedFilters,
         limit: int,
         run_id: str,
-    ) -> list[Evidence]:
-        if not self._retriever.hybrid_search_enabled:
-            if self._scheduler is None:
-                return await asyncio.to_thread(self._retriever.retrieve_chunks, query, filters, limit, run_id)
-            return await self._scheduler.submit(
-                ResourceQueue.GPU_HIGH,
-                lambda: self._retriever.retrieve_chunks(query, filters, limit, run_id),
-            )
-
-        started = started_at()
-        lexical_task = asyncio.create_task(
-            asyncio.to_thread(self._retriever.retrieve_lexical_candidates, query, filters)
-        )
-        vector_rows: list[dict[str, object]] = []
-        lexical_rows: list[dict[str, object]] = []
-        vector_error: Exception | None = None
-        lexical_error: Exception | None = None
-        try:
-            embedding = (
-                await asyncio.to_thread(self._retriever.generate_query_embedding, query)
-                if self._scheduler is None
-                else await self._scheduler.submit(ResourceQueue.GPU_HIGH, lambda: self._retriever.generate_query_embedding(query))
-            )
-            vector_rows = await asyncio.to_thread(self._retriever.retrieve_vector_candidates, embedding, filters)
-        except Exception as error:
-            vector_error = error
-            log_event(
-                "retrieval_branch_failed",
-                run_id,
-                level=logging.WARNING,
-                exc_info=True,
-                branch="vector",
-                error_type=type(error).__name__,
-            )
-        try:
-            lexical_rows = await lexical_task
-        except Exception as error:
-            lexical_error = error
-            log_event(
-                "retrieval_branch_failed",
-                run_id,
-                level=logging.WARNING,
-                exc_info=True,
-                branch="lexical",
-                error_type=type(error).__name__,
-            )
-        if vector_error is not None and lexical_error is not None:
-            raise RuntimeError("Both RAG hybrid retrieval branches failed") from vector_error
-        fused = self._retriever.fuse_candidates(vector_rows, lexical_rows, limit)
-        evidence = await asyncio.to_thread(self._retriever.expand_candidates, fused)
-        overlap = len({row["chunk_id"] for row in vector_rows} & {row["chunk_id"] for row in lexical_rows})
-        log_event(
-            "hybrid_retrieval_completed",
+        *,
+        expanded_query: str | None = None,
+        lexical_queries: list[str] | None = None,
+        protected_lexical_queries: list[str] | None = None,
+    ) -> list[dict[str, object]]:
+        return await self._chunk_evidence.retrieve_candidates(
+            query,
+            filters,
+            limit,
             run_id,
-            query_chars=len(query),
-            scope_recording_count=len(filters.recording_ids),
-            vector_candidates=len(vector_rows),
-            lexical_candidates=len(lexical_rows),
-            overlap=overlap,
-            fused_candidates=len(fused),
-            evidence_count=len(evidence),
-            vector_degraded=vector_error is not None,
-            lexical_degraded=lexical_error is not None,
-            elapsed_ms=elapsed_ms(started),
+            expanded_query=expanded_query,
+            lexical_queries=lexical_queries,
+            protected_lexical_queries=protected_lexical_queries,
         )
-        return evidence
+
+    async def _rerank(self, state: RagGraphState) -> dict[str, object]:
+        return await self._chunk_evidence.rerank(state)
+
+    async def _expand_context(self, state: RagGraphState) -> dict[str, object]:
+        return await self._chunk_evidence.expand_context(state)
+
+    def _after_expand_context(self, state: RagGraphState) -> Literal["rerank", "grade", "done"]:
+        if state["evidence"] and bool(getattr(self._retriever, "rerank_enabled", False)):
+            target: Literal["rerank", "grade", "done"] = "rerank"
+            reason = "expanded_evidence_ready"
+        elif state["execution_mode"] == "retrieval":
+            target = "done"
+            reason = "retrieval_terminal"
+        else:
+            target = "grade"
+            reason = "rerank_disabled_or_empty"
+        self._transition(state, "expand_context", target, reason)
+        return target
+
+    @staticmethod
+    def _after_rerank(state: RagGraphState) -> Literal["grade", "done"]:
+        if state["execution_mode"] == "retrieval":
+            RagGraph._transition(state, "rerank", "done", "retrieval_terminal")
+            return "done"
+        RagGraph._transition(state, "rerank", "grade", "rerank_completed_or_degraded")
+        return "grade"
 
     async def _grade(self, state: RagGraphState) -> dict[str, object]:
         node_started = self._node_started(state, "grade")
         evidence = state["evidence"]
         route = state["route"]
-        grade_query = state["query"]
-        retrieval_fallback = (route.topic if route is not None else None) or state["retrieval_query"]
+        grade_query = state["content_query"]
         if not evidence:
-            grade = EvidenceGrade(sufficient=False, rewrite_query=retrieval_fallback, reason="empty_evidence")
-            self._node_completed(state, "grade", node_started, outcome="insufficient", reason=grade.reason, evidence_count=0)
+            grade = EvidenceGrade(
+                verdict="abstain",
+                reason="empty_evidence",
+            )
+            self._node_completed(
+                state,
+                "grade",
+                node_started,
+                outcome="insufficient",
+                reason=grade.reason,
+                evidence_count=0,
+                evidence_refs=[],
+                model_execution="skipped",
+                provider=None,
+            )
             return {"grade": grade}
         if route is not None and route.strategy == "scope_summary" and route.recording_limit:
             covered = {item.recording.id for item in evidence}
             if len(covered) < route.recording_limit:
-                grade = EvidenceGrade(sufficient=False, rewrite_query=retrieval_fallback, reason="incomplete_recording_scope")
+                grade = EvidenceGrade(
+                    verdict="abstain",
+                    reason="incomplete_recording_scope",
+                )
                 self._node_completed(
                     state,
                     "grade",
@@ -457,12 +897,25 @@ class RagGraph:
                     outcome="insufficient",
                     reason=grade.reason,
                     evidence_count=len(evidence),
+                    evidence_refs=self._grade_evidence_refs(evidence),
                     covered_recordings=len(covered),
                     required_recordings=route.recording_limit,
+                    model_execution="skipped",
+                    provider=None,
                 )
                 return {"grade": grade}
-        prompt, values, parser = grade_prompt(grade_query, self._evidence_text(evidence))
-        raw = await self._complete(prompt.invoke(values).to_messages(), max_tokens=500, json_schema=EvidenceGrade.model_json_schema())
+        prompt, values, parser = grade_prompt(grade_query, self._grade_evidence_text(evidence))
+        messages = prompt.invoke(values).to_messages()
+        provider = LlmProvider.LOCAL
+        result = await self._complete(
+            state,
+            "grade",
+            messages,
+            max_tokens=500,
+            json_schema=EvidenceGrade.model_json_schema(),
+            provider=provider,
+        )
+        raw = result.text
         logger.debug("rag grade raw output: %s", raw)
         try:
             grade = parser.parse(raw)
@@ -476,32 +929,74 @@ class RagGraph:
                 error_type=type(error).__name__,
                 response_chars=len(raw),
             )
-            grade = EvidenceGrade(sufficient=True, reason="grader_parse_fallback")
+            grade = EvidenceGrade(
+                verdict="abstain",
+                reason="grader_parse_fallback",
+            )
         self._node_completed(
             state,
             "grade",
             node_started,
-            outcome="sufficient" if grade.sufficient else "insufficient",
+            outcome=grade.verdict,
+            verdict=grade.verdict,
+            grade_query=grade_query,
             reason=grade.reason,
-            planning_required=grade.planning_required,
             evidence_count=len(evidence),
+            evidence_refs=self._grade_evidence_refs(evidence),
             response_chars=len(raw),
+            model_execution="local" if provider == LlmProvider.LOCAL else "online",
+            provider=provider.value,
         )
-        return {"grade": grade}
+        return {"grade": grade, "token_usage": self._token_budget.actual_usage(result)}
 
     @staticmethod
-    def _after_grade(state: RagGraphState) -> Literal["rewrite", "decide_plan", "done"]:
+    def _grade_evidence_refs(evidence: list[Evidence]) -> list[dict[str, str]]:
+        """Return log-safe evidence identities without transcript content."""
+
+        refs: list[dict[str, str]] = []
+        for item in evidence:
+            ref = {
+                "recording_id": str(item.recording.id),
+                "chunk_id": str(item.chunk.id),
+            }
+            refs.append(ref)
+        return refs
+
+    @staticmethod
+    def _grade_evidence_text(evidence: list[Evidence]) -> str:
+        """Provide grade with transcript content and its recording context."""
+
+        blocks: list[str] = []
+        for item in evidence:
+            lines = [f"证据 {item.index}：", f"录音名字：{item.recording.title}"]
+            if item.recording.created_at is not None:
+                lines.append(f"录音发生时间：{item.recording.created_at.isoformat()}")
+            if item.recording.location and item.recording.location.strip():
+                lines.append(f"录音发生地点：{item.recording.location}")
+            lines.append(f"录音正文：\n{item.chunk.retrieval_text()}")
+            blocks.append("\n".join(lines))
+        return "\n\n".join(blocks)
+
+    @staticmethod
+    def _evidence_log_entries(evidence: list[Evidence]) -> list[dict[str, object]]:
+        """Diagnostic evidence details for application logs; excluded from span metadata."""
+
+        return [
+            {
+                "index": item.index,
+                "recording_id": str(item.recording.id),
+                "chunk_id": str(item.chunk.id),
+                "start_ms": item.chunk.start_ms,
+                "end_ms": item.chunk.end_ms,
+            }
+            for item in evidence
+        ]
+
+    @staticmethod
+    def _after_grade(state: RagGraphState) -> Literal["plan", "done"]:
         grade = state["grade"]
-        route = state["route"]
-        if grade is not None and grade.sufficient:
-            target: Literal["rewrite", "decide_plan", "done"] = "decide_plan"
-            reason = "evidence_sufficient"
-        elif route is not None and grade is not None and state["retrieval_attempt"] < MAX_RETRIEVAL_ATTEMPTS:
-            target = "rewrite"
-            reason = grade.reason or "evidence_insufficient"
-        else:
-            target = "done"
-            reason = grade.reason if grade is not None else "missing_grade"
+        target: Literal["plan", "done"] = "plan" if grade is not None and grade.verdict != "abstain" else "done"
+        reason = grade.reason if grade is not None else "missing_grade"
         RagGraph._transition(state, "grade", target, reason)
         return target
 
@@ -510,28 +1005,26 @@ class RagGraph:
         node_started = RagGraph._node_started(state, "decide_plan")
         grade = state["grade"]
         route = state["route"]
-        if grade is None or not grade.sufficient:
-            raise RuntimeError("Answer planning decision requires a sufficient evidence grade")
+        if grade is None or grade.verdict == "abstain":
+            raise RuntimeError("Answer planning decision requires an answerable evidence assessment")
         recording_count = len({item.recording.id for item in state["evidence"]})
         scope_override = route is not None and route.strategy == "scope_summary" and recording_count > 1
-        planning_required = grade.planning_required or scope_override
+        planning_required = scope_override
         RagGraph._node_completed(
             state,
             "decide_plan",
             node_started,
             planning_required=planning_required,
-            model_required=grade.planning_required,
+            model_required=False,
             scope_override=scope_override,
             recording_count=recording_count,
-            reason=grade.planning_reason,
+            reason=grade.reason,
         )
         return {"planning_required": planning_required}
 
     @staticmethod
     def _after_plan_decision(state: RagGraphState) -> Literal["plan", "select_direct_evidence"]:
-        target: Literal["plan", "select_direct_evidence"] = (
-            "plan" if state["planning_required"] else "select_direct_evidence"
-        )
+        target: Literal["plan", "select_direct_evidence"] = "plan" if state["planning_required"] else "select_direct_evidence"
         RagGraph._transition(
             state,
             "decide_plan",
@@ -540,54 +1033,29 @@ class RagGraph:
         )
         return target
 
-    @staticmethod
-    async def _rewrite(state: RagGraphState) -> dict[str, object]:
-        node_started = RagGraph._node_started(state, "rewrite")
-        grade = state["grade"]
-        route = state["route"]
-        rewritten = (grade.rewrite_query if grade is not None else None) or (route.topic if route is not None else None) or state["query"]
-        rewritten_route = route.model_copy(update={"topic": rewritten}) if route is not None and route.strategy == "chunk_search" else route
-        update: dict[str, object] = {
-            "retrieval_query": rewritten,
-            "retrieval_attempt": state["retrieval_attempt"] + 1,
-            "route": rewritten_route,
-            "grade": None,
-            "planning_required": False,
-            "answer_plan": None,
-            "answer_evidence": [],
-        }
-        if rewritten_route is None or rewritten_route.strategy == "chunk_search":
-            update["evidence"] = []
-        RagGraph._node_completed(
-            state,
-            "rewrite",
-            node_started,
-            strategy=route.strategy if route is not None else None,
-            rewritten_query_chars=len(rewritten),
-            filters_preserved=state["filters"] is not None,
-            next_attempt=state["retrieval_attempt"] + 1,
-            evidence_cleared="evidence" in update,
-        )
-        return update
-
-    @staticmethod
-    def _after_rewrite(state: RagGraphState) -> Literal["retrieve", "grade"]:
-        route = state["route"]
-        target: Literal["retrieve", "grade"] = "grade" if route is not None and route.strategy == "scope_summary" else "retrieve"
-        RagGraph._transition(
-            state,
-            "rewrite",
-            target,
-            "reuse_scope_evidence" if target == "grade" else "retrieve_rewritten_query",
-        )
-        return target
-
     async def _plan(self, state: RagGraphState) -> dict[str, object]:
         node_started = self._node_started(state, "plan")
         if not state["evidence"]:
             raise RuntimeError("Answer planning requires evidence")
-        prompt, values, parser = answer_plan_prompt(state["query"], self._evidence_text(state["evidence"]))
-        raw = await self._complete(prompt.invoke(values).to_messages(), max_tokens=900, json_schema=AnswerPlan.model_json_schema())
+        grade = state["grade"]
+        if grade is None or grade.verdict == "abstain":
+            raise RuntimeError("Answer planning requires an answerable evidence assessment")
+        prompt, values, parser = answer_plan_prompt(
+            state["query"],
+            self._evidence_text(state["evidence"]),
+            grade.verdict,
+        )
+        messages = prompt.invoke(values).to_messages()
+        provider = self._provider_for_input(messages, self._plan_local_input_tokens)
+        result = await self._complete(
+            state,
+            "plan",
+            messages,
+            max_tokens=900,
+            json_schema=AnswerPlan.model_json_schema(),
+            provider=provider,
+        )
+        raw = result.text
         logger.debug("rag answer plan raw output: %s", raw)
         fallback_used = False
         try:
@@ -613,8 +1081,10 @@ class RagGraph:
             evidence_count=len(state["evidence"]),
             response_chars=len(raw),
             next_node="validate_plan",
+            model_execution="local" if provider == LlmProvider.LOCAL else "online",
+            provider=provider.value,
         )
-        return {"answer_plan": plan}
+        return {"answer_plan": plan, "token_usage": self._token_budget.actual_usage(result)}
 
     @staticmethod
     async def _validate_plan(state: RagGraphState) -> dict[str, object]:
@@ -729,33 +1199,19 @@ class RagGraph:
             if include_sources and message.role == "assistant" and message.sources:
                 lines.append("该回答引用的录音 source（仅用于判断范围）：")
                 for source in message.sources:
-                    time_range = "" if source.start_ms is None or source.end_ms is None else f"，时间范围：{source.start_ms}-{source.end_ms}ms"
-                    lines.append(f"- recording_id：{source.recording_id}，标题：{source.title}{time_range}")
+                    lines.append(f"- recording_id：{source.recording_id}")
         return "\n".join(lines)
 
     @staticmethod
-    def _route_history_messages(history: list[RagHistoryMessage]) -> str:
+    def _route_history_context(history: list[RagHistoryMessage]) -> str:
+        turns: list[dict[str, object]] = []
+        for message in history:
+            turn: dict[str, object] = {"role": message.role, "content": message.content}
+            if message.role == "assistant":
+                turn["sources"] = [{"recording_id": str(source.recording_id)} for source in message.sources]
+            turns.append(turn)
         return json.dumps(
-            [{"role": message.role, "content": message.content} for message in history],
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
-
-    @staticmethod
-    def _route_history_sources(history: list[RagHistoryMessage]) -> str:
-        return json.dumps(
-            [
-                {
-                    "message_index": message_index,
-                    "recording_id": str(source.recording_id),
-                    "title": source.title,
-                    "start_ms": source.start_ms,
-                    "end_ms": source.end_ms,
-                }
-                for message_index, message in enumerate(history)
-                if message.role == "assistant"
-                for source in message.sources
-            ],
+            turns,
             ensure_ascii=False,
             separators=(",", ":"),
         )
@@ -769,16 +1225,52 @@ class RagGraph:
             return "referenced_recording_unavailable"
         return None
 
-    async def _complete(self, messages: object, max_tokens: int, json_schema: dict[str, Any] | None = None) -> str:
-        if self._scheduler is None:
-            return await self._model.complete(cast(Any, messages), max_tokens=max_tokens, json_schema=json_schema)
-        return await self._scheduler.submit(
-            ResourceQueue.GPU_HIGH,
-            lambda: self._model.complete(cast(Any, messages), max_tokens=max_tokens, json_schema=json_schema),
+    async def _complete(
+        self,
+        state: RagGraphState,
+        node: str,
+        messages: object,
+        max_tokens: int,
+        json_schema: dict[str, Any] | None = None,
+        *,
+        provider: LlmProvider,
+        local_model_profile: Literal["default", "rag"] | None = None,
+    ) -> LlmGenerateResult:
+        self._token_budget.before_model(state.get("token_usage", 0), node)
+        options = CompletionOptions(
+            max_tokens=max_tokens,
+            response_format=ResponseFormat(
+                type=ResponseFormatType.JSON_SCHEMA,
+                json_schema=json_schema,
+                strict=False,
+            )
+            if json_schema is not None
+            else ResponseFormat(),
         )
+        result = await self._model_client.execute(
+            build_llm_generate_command(
+                provider,
+                self._worker_messages(cast(list[BaseMessage], messages)),
+                options,
+                context_size=self._context_size,
+                stream=False,
+                model_profile=(local_model_profile or self._node_model_profile) if provider == LlmProvider.LOCAL else "default",
+            ),
+            result_type=LlmGenerateResult,
+        )
+        return result
 
-    async def _generate_streaming_answer(self, messages: object, max_tokens: int, on_delta: Callable[[str], None]) -> str:
-        async def generate() -> str:
+    async def _generate_streaming_answer(
+        self,
+        state: RagGraphState,
+        messages: object,
+        max_tokens: int,
+        on_delta: Callable[[str], None],
+        *,
+        provider: LlmProvider,
+    ) -> tuple[str, LlmGenerateResult]:
+        async def generate() -> tuple[str, LlmGenerateResult]:
+            self._token_budget.before_model(state.get("token_usage", 0), "answer")
             chunks: list[str] = []
 
             def publish_visible(delta: str) -> None:
@@ -786,12 +1278,32 @@ class RagGraph:
                 on_delta(delta)
 
             visible_stream = ThinkTagFilter(publish_visible)
-            async for delta in self._model.stream(cast(Any, messages), max_tokens=max_tokens):
-                if delta:
-                    visible_stream.feed(delta)
+            result = await self._model_client.execute_streaming(
+                build_llm_generate_command(
+                    provider,
+                    self._worker_messages(cast(list[BaseMessage], messages)),
+                    CompletionOptions(max_tokens=max_tokens, temperature=0.1),
+                    context_size=self._context_size,
+                    stream=True,
+                ),
+                result_type=LlmGenerateResult,
+                on_delta=visible_stream.feed,
+            )
             visible_stream.finish()
-            return "".join(chunks).strip()
+            return "".join(chunks).strip(), result
 
-        if self._scheduler is None:
-            return await generate()
-        return await self._scheduler.submit(ResourceQueue.GPU_HIGH, generate)
+        return await generate()
+
+    def _provider_for_input(self, messages: object, local_limit: int) -> LlmProvider:
+        worker_messages = self._worker_messages(cast(list[BaseMessage], messages))
+        estimated = self._token_budget.estimate_input_tokens(worker_messages)
+        return LlmProvider.LOCAL if estimated <= local_limit else self._online_provider
+
+    @staticmethod
+    def _worker_messages(messages: list[BaseMessage]) -> list[ChatMessage]:
+        output: list[ChatMessage] = []
+        for message in messages:
+            role = ChatRole.ASSISTANT if message.type == "ai" else ChatRole.SYSTEM if message.type == "system" else ChatRole.USER
+            content = message.content if isinstance(message.content, str) else str(message.content)
+            output.append(ChatMessage(role, content))
+        return output

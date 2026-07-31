@@ -8,11 +8,13 @@ from pathlib import Path
 from typing import Any, Protocol, cast
 
 from l1_foundation.infrastructure.huggingface import resolve_local_snapshot
-from l1_foundation.pipeline.contracts import ArtifactPayload, ResourceQueue, RetryPolicy, StageContext, StageResult
+from l1_foundation.pipeline.contracts import ArtifactPayload, RetryPolicy, StageContext, StageResult
 from l1_foundation.pipeline.runtime.artifact_store import ArtifactStore
+from l1_foundation.worker import WorkerClient
 from l2_core.audio_processing.stages.recording_models import EmbeddedSearchChunk, EmbeddingIndexingInput, EmbeddingIndexingOutput, SearchChunksOutput
+from l2_core.audio_processing.worker_tasks import EmbeddingEncodeTaskResult, embedding_encode_command
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("audio_processing")
 
 
 class EmbeddingModel(Protocol):
@@ -27,34 +29,59 @@ class EmbeddingIndexingStage:
     """Create normalized local Qwen embeddings; persistence is handled by the projection service."""
 
     name = "embedding_indexing"
-    version = "1"
-    resource_queue = ResourceQueue.GPU_NORMAL
+    version = "3"
     retry_policy = RetryPolicy(initial_backoff_seconds=30)
     input_model = EmbeddingIndexingInput
 
-    def __init__(self, artifact_store: ArtifactStore, model_name: str, model_cache_dir: Path, dimensions: int, device: str = "auto") -> None:
+    def __init__(
+        self,
+        artifact_store: ArtifactStore,
+        model_name: str,
+        model_cache_dir: Path,
+        dimensions: int,
+        device: str = "auto",
+        worker_client: WorkerClient | None = None,
+    ) -> None:
         self._artifact_store = artifact_store
         self._model_name = model_name
         self._model_cache_dir = model_cache_dir
         self._dimensions = dimensions
         self._device = device
         self._model: EmbeddingModel | None = None
+        self._worker_client = worker_client
+
+    async def try_restore(self, context: StageContext, _input_payload: EmbeddingIndexingInput) -> StageResult[EmbeddingIndexingOutput] | None:
+        return self._artifact_store.try_restore_json(
+            context.pipeline_run_id,
+            context.stage_run_id,
+            self.name,
+            self.version,
+            "search.embedding_index",
+            EmbeddingIndexingOutput,
+        )
 
     async def run(self, context: StageContext, input_payload: EmbeddingIndexingInput) -> StageResult[EmbeddingIndexingOutput]:
-        try:
-            chunks = SearchChunksOutput.model_validate(self._artifact_store.read_json(input_payload.chunks)).chunks
-            embeddings = self._embed([chunk.text for chunk in chunks]) if chunks else []
-            if any(len(vector) != self._dimensions for vector in embeddings):
-                raise ValueError(f"Embedding dimension does not match configured {self._dimensions}")
-            output = EmbeddingIndexingOutput(
-                provider="sentence_transformers",
-                model_name=self._model_name,
-                dimensions=self._dimensions,
-                chunks=[EmbeddedSearchChunk(**chunk.model_dump(), embedding=vector) for chunk, vector in zip(chunks, embeddings, strict=True)],
+        chunks = SearchChunksOutput.model_validate(self._artifact_store.read_json(input_payload.chunks)).chunks
+        if self._worker_client is None:
+            raise RuntimeError("EmbeddingIndexingStage requires WorkerClient")
+        if chunks:
+            result = await self._worker_client.execute(
+                embedding_encode_command([chunk.retrieval_text() for chunk in chunks]),
+                result_type=EmbeddingEncodeTaskResult,
+                on_progress=lambda progress, message: context.report_progress(round(progress * 100), message or "Embedding 编码"),
             )
-            return StageResult(output=output, artifacts=(ArtifactPayload(artifact_type="search.embedding_index", data=output.model_dump(mode="json")),))
-        finally:
-            self.release()
+            embeddings = result.vectors
+        else:
+            embeddings = []
+        if any(len(vector) != self._dimensions for vector in embeddings):
+            raise ValueError(f"Embedding dimension does not match configured {self._dimensions}")
+        output = EmbeddingIndexingOutput(
+            provider="sentence_transformers",
+            model_name=self._model_name,
+            dimensions=self._dimensions,
+            chunks=[EmbeddedSearchChunk(**chunk.model_dump(), embedding=vector) for chunk, vector in zip(chunks, embeddings, strict=True)],
+        )
+        return StageResult(output=output, artifacts=(ArtifactPayload(artifact_type="search.embedding_index", data=output.model_dump(mode="json")),))
 
     def release(self) -> None:
         had_model = self._model is not None
@@ -63,6 +90,9 @@ class EmbeddingIndexingStage:
         self._empty_torch_device_caches()
         if had_model:
             logger.info("录音索引：embedding 模型和设备缓存已释放")
+
+    def encode(self, texts: Sequence[str]) -> list[list[float]]:
+        return self._embed(texts)
 
     def _embed(self, texts: Sequence[str]) -> list[list[float]]:
         model = self._load_model()

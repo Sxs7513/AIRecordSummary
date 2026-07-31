@@ -52,7 +52,16 @@ export function reduceGenerationEvent(current: GenerationViewState | undefined, 
     return { ...state, phase: asPhase(event.data), lastSequence: event.seq };
   }
   if (event.type === "output.final") {
-    return { ...state, status: "succeeded", output: asRecord(event.data.output), sources: asRecords(event.data.sources), lastSequence: event.seq };
+    const output = asRecord(event.data.output);
+    const finalBlocks = output === null ? [] : asBlocks(output.content_blocks);
+    return {
+      ...state,
+      status: "succeeded",
+      blocks: finalBlocks.length > 0 ? finalBlocks : state.blocks,
+      output,
+      sources: asRecords(event.data.sources),
+      lastSequence: event.seq
+    };
   }
   if (event.type === "run.error") {
     return { ...state, status: "failed", error: asError(event.data), lastSequence: event.seq };

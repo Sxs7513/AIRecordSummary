@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from l1_foundation.pipeline.contracts import ArtifactPayload, ResourceQueue, RetryPolicy, StageContext, StageResult
+from l1_foundation.pipeline.contracts import ArtifactPayload, RetryPolicy, StageContext, StageResult
 from l1_foundation.pipeline.runtime.artifact_store import ArtifactStore
 from l2_core.audio_processing.stages.recording_models import BuildUtterancesInput, TranscriptOutput, Utterance, UtterancesOutput
 
@@ -10,12 +10,21 @@ class BuildUtterancesStage:
 
     name = "build_utterances"
     version = "4"
-    resource_queue = ResourceQueue.CPU
     retry_policy = RetryPolicy(initial_backoff_seconds=10)
     input_model = BuildUtterancesInput
 
     def __init__(self, artifact_store: ArtifactStore) -> None:
         self._artifact_store = artifact_store
+
+    async def try_restore(self, context: StageContext, _input_payload: BuildUtterancesInput) -> StageResult[UtterancesOutput] | None:
+        return self._artifact_store.try_restore_json(
+            context.pipeline_run_id,
+            context.stage_run_id,
+            self.name,
+            self.version,
+            "utterances.final",
+            UtterancesOutput,
+        )
 
     async def run(self, context: StageContext, input_payload: BuildUtterancesInput) -> StageResult[UtterancesOutput]:
         context.report_progress(10, "读取对齐转写")

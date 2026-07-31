@@ -28,6 +28,28 @@ export class GenerationStreamClient {
     });
   }
 
+  startConversationTurn(
+    payload: unknown,
+    onReady: (event: GenerationEvent) => void,
+    onError: (error: Error) => void,
+  ): void {
+    let runId: string | null = null;
+    this.transport.connectPost("/api/conversations/turn/events", payload, {
+      onEvent: (event) => {
+        runId = event.run_id;
+        if (event.type === "conversation.ready") {
+          onReady(event);
+          return;
+        }
+        this.consume(event);
+      },
+      onConnection: (connection) => {
+        if (runId !== null) useGenerationStore.getState().setConnection(runId, connection);
+      },
+      onError,
+    });
+  }
+
   close(runId: string): void {
     this.flush(runId);
     this.transport.close();
@@ -35,11 +57,15 @@ export class GenerationStreamClient {
   }
 
   async cancel(runId: string): Promise<void> {
-    await fetch(`${pythonApiOrigin}/api/generations/${encodeURIComponent(runId)}`, {
+    const response = await fetch(`${pythonApiOrigin}/api/generations/${encodeURIComponent(runId)}`, {
       method: "DELETE",
       headers: await this.options.getHeaders?.(),
       credentials: "include"
     });
+    if (!response.ok) {
+      const body = await response.json().catch(() => ({})) as { detail?: string };
+      throw new Error(body.detail || `Generation cancellation request failed: ${response.status}`);
+    }
   }
 
   async start(path: string, payload: unknown): Promise<string> {

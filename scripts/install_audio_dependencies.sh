@@ -142,9 +142,12 @@ load_env_file() {
     done <"${env_file}"
   done
 
+  LLM_DEFAULT_PROVIDER="${LLM_DEFAULT_PROVIDER:-local}"
   LLM_CORRECTION_ENABLED="${LLM_CORRECTION_ENABLED:-false}"
-  LLM_CORRECTION_MODEL_REPO="${LLM_CORRECTION_MODEL_REPO:-Qwen/Qwen2.5-7B-Instruct-GGUF}"
-  LLM_CORRECTION_MODEL_FILE="${LLM_CORRECTION_MODEL_FILE:-qwen2.5-7b-instruct-q4_k_m-00001-of-00002.gguf,qwen2.5-7b-instruct-q4_k_m-00002-of-00002.gguf}"
+  LLM_CORRECTION_PROVIDER="${LLM_CORRECTION_PROVIDER:-${LLM_DEFAULT_PROVIDER}}"
+  TOPIC_DETECTION_PROVIDER="${TOPIC_DETECTION_PROVIDER:-${LLM_DEFAULT_PROVIDER}}"
+  LOCAL_LLM_MODEL_REPO="${LOCAL_LLM_MODEL_REPO:-${LLM_CORRECTION_MODEL_REPO:-Qwen/Qwen2.5-7B-Instruct-GGUF}}"
+  LOCAL_LLM_MODEL_FILE="${LOCAL_LLM_MODEL_FILE:-${LLM_CORRECTION_MODEL_FILE:-qwen2.5-7b-instruct-q4_k_m-00001-of-00002.gguf,qwen2.5-7b-instruct-q4_k_m-00002-of-00002.gguf}}"
   AUDIO_MODEL_CACHE_ROOT="${AUDIO_MODEL_CACHE_ROOT:-model-cache}"
   ASR_PROVIDER="${ASR_PROVIDER:-qwen_asr}"
   QWEN_ASR_MODEL="${QWEN_ASR_MODEL:-Qwen/Qwen3-ASR-1.7B}"
@@ -156,10 +159,15 @@ load_env_file() {
   EMBEDDING_MODEL="${EMBEDDING_MODEL:-Qwen/Qwen3-Embedding-4B}"
   EMBEDDING_MODEL_CACHE_DIR="${EMBEDDING_MODEL_CACHE_DIR:-model-cache/embedding}"
   RAG_ANSWER_ENABLED="${RAG_ANSWER_ENABLED:-true}"
-  RAG_ANSWER_PROVIDER="${RAG_ANSWER_PROVIDER:-local_llm}"
-  RECORDING_SUMMARY_PROVIDER="${RECORDING_SUMMARY_PROVIDER:-local_llm}"
-  LOCAL_LLM_MODEL_REPO="${LOCAL_LLM_MODEL_REPO:-${RAG_ANSWER_MODEL_REPO:-DevQuasar/Qwen.Qwen3.5-9B-GGUF}}"
-  LOCAL_LLM_MODEL_FILE="${LOCAL_LLM_MODEL_FILE:-${RAG_ANSWER_MODEL_FILE:-Qwen.Qwen3.5-9B.Q8_0.gguf}}"
+  RAG_ANSWER_PROVIDER="${RAG_ANSWER_PROVIDER:-${LLM_DEFAULT_PROVIDER}}"
+  RAG_LOCAL_MODEL_REPO="${RAG_LOCAL_MODEL_REPO:-Qwen/Qwen3-4B-GGUF}"
+  RAG_LOCAL_MODEL_FILE="${RAG_LOCAL_MODEL_FILE:-Qwen3-4B-Q4_K_M.gguf}"
+  RAG_ROUTE_MODEL_PROFILE="${RAG_ROUTE_MODEL_PROFILE:-default}"
+  RAG_NODE_MODEL_PROFILE="${RAG_NODE_MODEL_PROFILE:-default}"
+  RAG_RERANK_ENABLED="${RAG_RERANK_ENABLED:-true}"
+  RAG_RERANK_MODEL="${RAG_RERANK_MODEL:-Qwen/Qwen3-Reranker-0.6B}"
+  RAG_RERANK_MODEL_CACHE_DIR="${RAG_RERANK_MODEL_CACHE_DIR:-model-cache/rerank}"
+  RECORDING_SUMMARY_PROVIDER="${RECORDING_SUMMARY_PROVIDER:-${LLM_DEFAULT_PROVIDER}}"
   PGVECTOR_VERSION="${PGVECTOR_VERSION:-0.8.2}"
 }
 
@@ -706,9 +714,8 @@ ensure_huggingface_snapshot() {
   local cache_dir="$2"
   local display_name="$3"
   mkdir -p "${cache_dir}"
-  log "Ensuring ${display_name} model is downloaded: ${model_name}"
-  "${VENV_PYTHON}" -c 'import sys; from huggingface_hub import snapshot_download; path = snapshot_download(repo_id=sys.argv[1], cache_dir=sys.argv[2]); print(f"[install-audio-deps] Model cache: {path}")' \
-    "${model_name}" "${cache_dir}"
+  log "Ensuring ${display_name} model is available: ${model_name}"
+  "${VENV_PYTHON}" -u "${ROOT_DIR}/scripts/ensure_hf_snapshot.py" "${model_name}" "${cache_dir}"
 }
 
 ensure_funasr_nano() {
@@ -798,11 +805,7 @@ ensure_qwen_asr_trainer() {
   fi
 
   local hf_hub_cache="${ROOT_DIR}/${AUDIO_MODEL_CACHE_ROOT}/huggingface/hub"
-  mkdir -p "${hf_hub_cache}"
-  log "Ensuring Qwen HF training model is downloaded: ${QWEN_ASR_TRAINING_MODEL}"
-  "${trainer_python}" -c \
-    'import sys; from huggingface_hub import snapshot_download; print(snapshot_download(repo_id=sys.argv[1], cache_dir=sys.argv[2]))' \
-    "${QWEN_ASR_TRAINING_MODEL}" "${hf_hub_cache}"
+  ensure_huggingface_snapshot "${QWEN_ASR_TRAINING_MODEL}" "${hf_hub_cache}" "Qwen HF training"
 }
 
 ensure_pyannote() {
@@ -861,11 +864,15 @@ ensure_embedding_runtime() {
 
   local embedding_cache_dir="${ROOT_DIR}/${EMBEDDING_MODEL_CACHE_DIR}"
   ensure_huggingface_snapshot "${EMBEDDING_MODEL}" "${embedding_cache_dir}" "embedding"
+  if [[ "${RAG_RERANK_ENABLED:-true}" == "true" ]]; then
+    local rerank_cache_dir="${ROOT_DIR}/${RAG_RERANK_MODEL_CACHE_DIR}"
+    ensure_huggingface_snapshot "${RAG_RERANK_MODEL}" "${rerank_cache_dir}" "RAG reranker"
+  fi
 }
 
 ensure_llm_correction_runtime() {
-  if [[ "${LLM_CORRECTION_ENABLED:-false}" != "true" ]]; then
-    log "Skipping local LLM correction setup because LLM_CORRECTION_ENABLED is not true."
+  if [[ "${LLM_CORRECTION_ENABLED:-false}" != "true" || "${LLM_CORRECTION_PROVIDER:-local}" != "local" ]]; then
+    log "Skipping local LLM correction setup because correction is disabled or uses a remote provider."
     return
   fi
 
@@ -874,9 +881,9 @@ ensure_llm_correction_runtime() {
     install_llama_cpp_python
   fi
 
-  local model_dir="${ROOT_DIR}/${AUDIO_MODEL_CACHE_ROOT}/llm-correction/${LLM_CORRECTION_MODEL_REPO//\//__}"
+  local model_dir="${ROOT_DIR}/${AUDIO_MODEL_CACHE_ROOT}/llm-correction/${LOCAL_LLM_MODEL_REPO//\//__}"
   mkdir -p "${model_dir}"
-  IFS=',' read -ra model_files <<< "${LLM_CORRECTION_MODEL_FILE}"
+  IFS=',' read -ra model_files <<< "${LOCAL_LLM_MODEL_FILE}"
   for model_file in "${model_files[@]}"; do
     model_file="${model_file#"${model_file%%[![:space:]]*}"}"
     model_file="${model_file%"${model_file##*[![:space:]]}"}"
@@ -886,8 +893,8 @@ ensure_llm_correction_runtime() {
       continue
     fi
 
-    log "Downloading local LLM correction model file: ${LLM_CORRECTION_MODEL_REPO}/${model_file}"
-    local model_url="https://huggingface.co/${LLM_CORRECTION_MODEL_REPO}/resolve/main/${model_file}"
+    log "Downloading local LLM model file: ${LOCAL_LLM_MODEL_REPO}/${model_file}"
+    local model_url="https://huggingface.co/${LOCAL_LLM_MODEL_REPO}/resolve/main/${model_file}"
     "${PYTHON_BIN}" "${ROOT_DIR}/scripts/download_hf_file.py" "${model_url}" "${model_path}"
   done
 }
@@ -895,14 +902,17 @@ ensure_llm_correction_runtime() {
 ensure_local_llm_runtime() {
   local rag_uses_local_llm="false"
   local summary_uses_local_llm="false"
-  if [[ "${RAG_ANSWER_ENABLED:-true}" == "true" && "${RAG_ANSWER_PROVIDER:-local_llm}" == "local_llm" ]]; then
+  if [[ "${RAG_ANSWER_ENABLED:-true}" == "true" ]]; then
     rag_uses_local_llm="true"
   fi
-  if [[ "${RECORDING_SUMMARY_PROVIDER:-local_llm}" == "local_llm" ]]; then
+  if [[ "${RECORDING_SUMMARY_PROVIDER:-local}" == "local" || "${TOPIC_DETECTION_PROVIDER:-local}" == "local" ]]; then
+    summary_uses_local_llm="true"
+  fi
+  if [[ "${RAG_ROUTE_MODEL_PROFILE:-default}" == "default" || "${RAG_NODE_MODEL_PROFILE:-default}" == "default" ]]; then
     summary_uses_local_llm="true"
   fi
   if [[ "${rag_uses_local_llm}" != "true" && "${summary_uses_local_llm}" != "true" ]]; then
-    log "Skipping shared local LLM setup because neither RAG answer nor recording summary uses local_llm."
+    log "Skipping shared local LLM setup because no enabled feature uses provider=local."
     return
   fi
 
@@ -913,27 +923,36 @@ ensure_local_llm_runtime() {
     log "llama-cpp-python already installed."
   fi
 
-  local model_dir="${ROOT_DIR}/${AUDIO_MODEL_CACHE_ROOT}/local-llm/${LOCAL_LLM_MODEL_REPO//\//__}"
-  local legacy_model_dir="${ROOT_DIR}/${AUDIO_MODEL_CACHE_ROOT}/rag-answer/${LOCAL_LLM_MODEL_REPO//\//__}"
-  mkdir -p "${model_dir}"
-  IFS=',' read -ra model_files <<< "${LOCAL_LLM_MODEL_FILE}"
-  for model_file in "${model_files[@]}"; do
-    model_file="${model_file#"${model_file%%[![:space:]]*}"}"
-    model_file="${model_file%"${model_file##*[![:space:]]}"}"
-    local model_path="${model_dir}/${model_file}"
-    if [[ -f "${model_path}" ]]; then
-      log "Shared local LLM model file already exists: ${model_path}"
-      continue
-    fi
-    if [[ -f "${legacy_model_dir}/${model_file}" ]]; then
-      log "Shared local LLM model file already exists in legacy cache: ${legacy_model_dir}/${model_file}"
-      continue
-    fi
+  if [[ "${summary_uses_local_llm}" == "true" ]]; then
+    local model_dir="${ROOT_DIR}/${AUDIO_MODEL_CACHE_ROOT}/llm-correction/${LOCAL_LLM_MODEL_REPO//\//__}"
+    mkdir -p "${model_dir}"
+    IFS=',' read -ra model_files <<< "${LOCAL_LLM_MODEL_FILE}"
+    for model_file in "${model_files[@]}"; do
+      model_file="${model_file#"${model_file%%[![:space:]]*}"}"
+      model_file="${model_file%"${model_file##*[![:space:]]}"}"
+      local model_path="${model_dir}/${model_file}"
+      if [[ -f "${model_path}" ]]; then
+        log "Shared local LLM model file already exists: ${model_path}"
+        continue
+      fi
+      log "Downloading shared local LLM model file: ${LOCAL_LLM_MODEL_REPO}/${model_file}"
+      local model_url="https://huggingface.co/${LOCAL_LLM_MODEL_REPO}/resolve/main/${model_file}"
+      "${PYTHON_BIN}" "${ROOT_DIR}/scripts/download_hf_file.py" "${model_url}" "${model_path}"
+    done
+  fi
 
-    log "Downloading shared local LLM model file: ${LOCAL_LLM_MODEL_REPO}/${model_file}"
-    local model_url="https://huggingface.co/${LOCAL_LLM_MODEL_REPO}/resolve/main/${model_file}"
-    "${PYTHON_BIN}" "${ROOT_DIR}/scripts/download_hf_file.py" "${model_url}" "${model_path}"
-  done
+  if [[ "${rag_uses_local_llm}" == "true" ]]; then
+    local rag_model_dir="${ROOT_DIR}/${AUDIO_MODEL_CACHE_ROOT}/rag-llm/${RAG_LOCAL_MODEL_REPO//\//__}"
+    mkdir -p "${rag_model_dir}"
+    local rag_model_path="${rag_model_dir}/${RAG_LOCAL_MODEL_FILE}"
+    if [[ ! -f "${rag_model_path}" ]]; then
+      log "Downloading local RAG model file: ${RAG_LOCAL_MODEL_REPO}/${RAG_LOCAL_MODEL_FILE}"
+      local rag_model_url="https://huggingface.co/${RAG_LOCAL_MODEL_REPO}/resolve/main/${RAG_LOCAL_MODEL_FILE}"
+      "${PYTHON_BIN}" "${ROOT_DIR}/scripts/download_hf_file.py" "${rag_model_url}" "${rag_model_path}"
+    else
+      log "Local RAG model file already exists: ${rag_model_path}"
+    fi
+  fi
 }
 
 print_summary() {

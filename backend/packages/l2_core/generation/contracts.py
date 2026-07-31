@@ -24,6 +24,10 @@ class GenerationStatus(StrEnum):
     FAILED = "failed"
     CANCELLED = "cancelled"
 
+    @property
+    def is_terminal(self) -> bool:
+        return self in {self.SUCCEEDED, self.FAILED, self.CANCELLED}
+
 
 class TextBlock(BaseModel):
     """The first and currently only user-visible content block."""

@@ -39,7 +39,7 @@
 当前 `chunk_search` 只执行：
 
 ```text
-route.topic
+用户原始 query
   -> query embedding
   -> pgvector HNSW Top K
   -> 相邻 utterance 扩展
@@ -52,7 +52,7 @@ route.topic
 
 ```mermaid
 flowchart LR
-    A["route.topic 或 rewrite_query"] --> B["统一查询文本标准化"]
+    A["原始 query 或 rewrite_query"] --> B["统一查询文本标准化"]
     B --> C["向量召回 Top N"]
     B --> D["关键词召回 Top N"]
     C --> E["RRF 融合与 chunk 去重"]

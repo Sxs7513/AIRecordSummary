@@ -277,3 +277,4 @@ class PluginRegistry:
 5. 进行端到端回归：上传、流水线、失败重试、播放器定位、搜索、流式问答和删除录音。
 
 验收：Next.js 不再包含业务 API、数据库访问和任务调度代码；所有业务请求均由 Python API 提供，前端功能与迁移前保持一致。
+> 已被 [Redis + Kafka 架构改造](./redis-kafka-architecture-refactor.md) 取代。本文保留为历史背景；其中 PostgreSQL Pipeline runtime、Outbox 与轮询调度不再是目标架构。

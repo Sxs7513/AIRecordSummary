@@ -1,21 +1,23 @@
 from __future__ import annotations
 
-import gc
 import logging
-from collections.abc import Sequence
+from collections.abc import Mapping
 from dataclasses import dataclass
-from importlib import import_module
+from datetime import datetime
 from time import perf_counter
-from typing import Any, Protocol, cast
+from typing import Any, cast
 from uuid import UUID
 
 from sqlalchemy import Engine, text
 
-from l1_foundation.infrastructure.huggingface import resolve_local_snapshot
 from l1_foundation.settings import Settings
+from l1_foundation.worker import SyncWorkerClient
+from l2_core.audio_processing.worker_tasks import EmbeddingEncodeTaskResult, embedding_encode_command
+from l2_core.rag.checkpoint import render_evidence_text
 from l2_core.rag.contracts import Evidence, EvidenceChunk, EvidenceFacts, EvidenceRecording, ResolvedFilters
 from l2_core.rag.normalization import normalize_search_text
 from l2_core.rag.observability import log_event
+from l2_core.rag.worker_tasks import RerankCandidateInput, RerankResult, rerank_command
 
 MAX_SCOPE_RECORDINGS = 50
 MAX_SCOPE_UTTERANCES = 1_000
@@ -33,40 +35,100 @@ class RetrievalCandidate:
     fused_score: float = 0.0
 
 
-class EmbeddingModel(Protocol):
-    def encode(self, texts: Sequence[str], **kwargs: object) -> object: ...
-
-
-class SentenceTransformersModule(Protocol):
-    def SentenceTransformer(self, model_name_or_path: str, **kwargs: object) -> EmbeddingModel: ...
-
-
 class RagRetriever:
-    def __init__(self, engine: Engine, settings: Settings) -> None:
+    def __init__(self, engine: Engine, settings: Settings, worker_client: SyncWorkerClient) -> None:
         self._engine = engine
         self._settings = settings
-        self._model: EmbeddingModel | None = None
+        self._worker_client = worker_client
 
     def release(self) -> None:
-        had_model = self._model is not None
-        self._model = None
-        gc.collect()
-        try:
-            torch = cast(Any, import_module("torch"))
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            if torch.backends.mps.is_available():
-                torch.mps.empty_cache()
-        except (ImportError, RuntimeError, AttributeError) as error:
-            logger.warning("rag embedding model released, but device cache cleanup failed: %s", error)
-        else:
-            if not had_model:
-                return
-            logger.info("rag embedding model and device cache released")
+        return
+
+    def hydrate_checkpoint_state(self, state: dict[str, Any]) -> dict[str, Any]:
+        """Restore omitted candidate/evidence text from the authoritative recording tables."""
+
+        hydrated = cast(dict[str, Any], {**state})
+        candidates = [dict(item) for item in cast(list[dict[str, Any]], state.get("retrieval_candidates", []))]
+        chunk_ids = [str(item["chunk_id"]) for item in candidates if item.get("chunk_id") is not None]
+        candidate_text: dict[str, str] = {}
+        if chunk_ids:
+            with self._engine.connect() as connection:
+                self._set_statement_timeout(connection)
+                rows = connection.execute(
+                    text("select id, text from recording_search_chunks where id = any(cast(:ids as uuid[]))"),
+                    {"ids": chunk_ids},
+                ).mappings()
+                candidate_text = {str(row["id"]): str(row["text"]) for row in rows}
+        for candidate in candidates:
+            candidate["text"] = candidate_text.get(str(candidate.get("chunk_id")), "")
+        hydrated["retrieval_candidates"] = candidates
+
+        text_cache: dict[tuple[str, int, int], str] = {}
+        for field in ("evidence", "answer_evidence"):
+            hydrated[field] = self._hydrate_checkpoint_evidence(
+                cast(list[dict[str, Any]], state.get(field, [])),
+                text_cache,
+            )
+        strategy = state.get("strategy_result")
+        if isinstance(strategy, dict):
+            hydrated_strategy = dict(strategy)
+            evidence = self._hydrate_checkpoint_evidence(
+                cast(list[dict[str, Any]], strategy.get("evidence", [])),
+                text_cache,
+            )
+            hydrated_strategy["evidence"] = evidence
+            hydrated_strategy["answer_context"] = render_evidence_text([Evidence.model_validate(item) for item in evidence])
+            hydrated["strategy_result"] = hydrated_strategy
+        return hydrated
+
+    def _hydrate_checkpoint_evidence(
+        self,
+        values: list[dict[str, Any]],
+        cache: dict[tuple[str, int, int], str],
+    ) -> list[dict[str, Any]]:
+        result: list[dict[str, Any]] = []
+        for value in values:
+            item = dict(value)
+            recording = cast(dict[str, Any], item["recording"])
+            chunk = dict(cast(dict[str, Any], item["chunk"]))
+            key = (str(recording["id"]), int(chunk["start_ms"]), int(chunk["end_ms"]))
+            if key not in cache:
+                with self._engine.connect() as connection:
+                    self._set_statement_timeout(connection)
+                    utterances = (
+                        connection.execute(
+                            text(
+                                """
+                                select coalesce(profiles.display_name, mappings.display_name, utterances.speaker_label) as speaker_label,
+                                       utterances.text
+                                from utterance_segments utterances
+                                left join recording_speaker_mappings mappings
+                                  on mappings.recording_id = utterances.recording_id
+                                 and mappings.speaker_cluster_id = utterances.speaker_cluster_id
+                                left join speaker_profiles profiles on profiles.id = mappings.speaker_profile_id
+                                where utterances.recording_id = :recording_id
+                                  and utterances.end_ms >= :start_ms and utterances.start_ms <= :end_ms
+                                order by utterances.utterance_index
+                                """
+                            ),
+                            {"recording_id": key[0], "start_ms": key[1], "end_ms": key[2]},
+                        )
+                        .mappings()
+                        .all()
+                    )
+                    cache[key] = "\n".join(f"{row['speaker_label'] or 'Unknown Speaker'}: {row['text']}" for row in utterances)
+            chunk["text"] = cache[key] or "该录音暂无连续发言文本。"
+            item["chunk"] = chunk
+            result.append(item)
+        return result
 
     @property
     def hybrid_search_enabled(self) -> bool:
         return self._settings.rag_hybrid_search_enabled
+
+    @property
+    def rerank_enabled(self) -> bool:
+        return self._settings.rag_rerank_enabled
 
     def resolve_recording_scope(self, filters: ResolvedFilters, limit: int | None, rank: int | None) -> list[UUID]:
         """Resolve all recording-level filters once, before either chunk branch runs."""
@@ -80,11 +142,9 @@ class RagRetriever:
             values["offset"] = max(0, min(9, rank - 1)) if rank else 0
             pagination = " limit :limit offset :offset"
         with self._engine.connect() as connection:
+            self._set_statement_timeout(connection)
             rows = connection.execute(
-                text(
-                    f"select recordings.id from recordings where {' and '.join(clauses)} "
-                    f"order by recordings.created_at desc{pagination}"
-                ),
+                text(f"select recordings.id from recordings where {' and '.join(clauses)} order by recordings.created_at desc{pagination}"),
                 values,
             ).scalars()
             return [cast(UUID, row) for row in rows]
@@ -95,10 +155,10 @@ class RagRetriever:
         return self.resolve_recording_scope(filters, limit, rank)
 
     def generate_query_embedding(self, topic: str) -> list[float]:
-        try:
-            return self._embed(topic)
-        finally:
-            self.release()
+        result = self._worker_client.execute(embedding_encode_command([topic]), result_type=EmbeddingEncodeTaskResult)
+        if len(result.vectors) != 1:
+            raise RuntimeError("Embedding Worker returned an invalid query vector count")
+        return result.vectors[0]
 
     def retrieve_vector_candidates(
         self,
@@ -124,16 +184,18 @@ class RagRetriever:
         )
         self._append_chunk_filters(clauses, values, filters)
         with self._engine.connect() as connection:
+            self._set_statement_timeout(connection)
             return [
                 dict(row)
                 for row in (
-                connection.execute(
-                    text(
-                        f"""
+                    connection.execute(
+                        text(
+                            f"""
                     select chunks.id as chunk_id, chunks.recording_id, chunks.text, chunks.start_ms, chunks.end_ms,
                            chunks.speaker_labels, chunks.is_target_person, chunks.source_utterance_segment_ids,
+                           chunks.metadata,
                            recordings.title, recordings.file_name,
-                           recordings.location, recordings.duration_seconds,
+                           recordings.location, recordings.duration_seconds, recordings.created_at,
                            1 - (chunks.embedding <=> cast(:embedding as halfvec)) as score
                     from recording_search_chunks chunks
                     join recordings on recordings.id = chunks.recording_id
@@ -142,11 +204,11 @@ class RagRetriever:
                     order by chunks.embedding <=> cast(:embedding as halfvec)
                     limit :limit
                     """
-                    ),
-                    values,
-                )
-                .mappings()
-                .all()
+                        ),
+                        values,
+                    )
+                    .mappings()
+                    .all()
                 )
             ]
 
@@ -163,9 +225,13 @@ class RagRetriever:
             "query": query,
             "limit": limit or self._settings.rag_lexical_candidate_limit,
         }
-        clauses = ["recordings.status = 'completed'", "word_similarity(:query, chunks.normalized_text) > 0"]
+        clauses = [
+            "recordings.status = 'completed'",
+            "(position(:query in chunks.normalized_text) > 0 or word_similarity(:query, chunks.normalized_text) > 0)",
+        ]
         self._append_chunk_filters(clauses, values, filters)
         with self._engine.connect() as connection:
+            self._set_statement_timeout(connection)
             return [
                 dict(row)
                 for row in (
@@ -175,13 +241,19 @@ class RagRetriever:
                             select chunks.id as chunk_id, chunks.recording_id, chunks.text,
                                    chunks.start_ms, chunks.end_ms, chunks.speaker_labels,
                                    chunks.is_target_person, chunks.source_utterance_segment_ids,
+                                   chunks.metadata,
                                    recordings.title, recordings.file_name,
-                                   recordings.location, recordings.duration_seconds,
-                                   word_similarity(:query, chunks.normalized_text) as score
+                                   recordings.location, recordings.duration_seconds, recordings.created_at,
+                                   (position(:query in chunks.normalized_text) > 0) as exact_match,
+                                   case
+                                     when position(:query in chunks.normalized_text) > 0 then 1.0
+                                     else word_similarity(:query, chunks.normalized_text)
+                                   end as score
                             from recording_search_chunks chunks
                             join recordings on recordings.id = chunks.recording_id
                             where {" and ".join(clauses)}
-                            order by :query <<-> chunks.normalized_text
+                            order by (position(:query in chunks.normalized_text) > 0) desc,
+                                     :query <<-> chunks.normalized_text
                             limit :limit
                             """
                         ),
@@ -198,24 +270,33 @@ class RagRetriever:
         lexical_rows: list[dict[str, object]],
         limit: int,
     ) -> list[dict[str, object]]:
+        return self.fuse_candidate_lists([vector_rows], [lexical_rows], limit)
+
+    def fuse_candidate_lists(
+        self,
+        vector_lists: list[list[dict[str, object]]],
+        lexical_lists: list[list[dict[str, object]]],
+        limit: int,
+    ) -> list[dict[str, object]]:
+        """Fuse each retrieval query's ranked list with RRF before applying Top-N."""
+
         candidates: dict[UUID, RetrievalCandidate] = {}
-        for rank, row in enumerate(vector_rows, start=1):
-            chunk_id = cast(UUID, row["chunk_id"])
-            candidates[chunk_id] = RetrievalCandidate(
-                row=row,
-                vector_rank=rank,
-                vector_score=float(cast(float, row["score"])),
-            )
-        for rank, row in enumerate(lexical_rows, start=1):
-            chunk_id = cast(UUID, row["chunk_id"])
-            candidate = candidates.setdefault(chunk_id, RetrievalCandidate(row=row))
-            candidate.lexical_rank = rank
-            candidate.lexical_score = float(cast(float, row["score"]))
-        for candidate in candidates.values():
-            if candidate.vector_rank is not None:
-                candidate.fused_score += self._settings.rag_vector_weight / (self._settings.rag_rrf_k + candidate.vector_rank)
-            if candidate.lexical_rank is not None:
-                candidate.fused_score += self._settings.rag_lexical_weight / (self._settings.rag_rrf_k + candidate.lexical_rank)
+        for rows in vector_lists:
+            for rank, row in enumerate(rows, start=1):
+                chunk_id = cast(UUID, row["chunk_id"])
+                candidate = candidates.setdefault(chunk_id, RetrievalCandidate(row=row))
+                candidate.vector_rank = min(candidate.vector_rank, rank) if candidate.vector_rank is not None else rank
+                score = float(cast(float, row["score"]))
+                candidate.vector_score = max(candidate.vector_score, score) if candidate.vector_score is not None else score
+                candidate.fused_score += self._settings.rag_vector_weight / (self._settings.rag_rrf_k + rank)
+        for rows in lexical_lists:
+            for rank, row in enumerate(rows, start=1):
+                chunk_id = cast(UUID, row["chunk_id"])
+                candidate = candidates.setdefault(chunk_id, RetrievalCandidate(row=row))
+                candidate.lexical_rank = min(candidate.lexical_rank, rank) if candidate.lexical_rank is not None else rank
+                score = float(cast(float, row["score"]))
+                candidate.lexical_score = max(candidate.lexical_score, score) if candidate.lexical_score is not None else score
+                candidate.fused_score += self._settings.rag_lexical_weight / (self._settings.rag_rrf_k + rank)
         ordered = sorted(
             candidates.values(),
             key=lambda item: (
@@ -240,9 +321,40 @@ class RagRetriever:
 
     def expand_candidates(self, rows: list[dict[str, object]]) -> list[Evidence]:
         with self._engine.connect() as connection:
+            self._set_statement_timeout(connection)
             expanded = self._expand_chunk_contexts(connection, rows)
         merged = self._merge_overlapping_contexts(expanded)
         return [self._chunk_evidence(index, row) for index, row in enumerate(merged, start=1)]
+
+    def rerank_evidence(self, query: str, evidence: list[Evidence]) -> tuple[list[Evidence], RerankResult | None]:
+        if not self._settings.rag_rerank_enabled or not evidence:
+            return evidence, None
+        candidates = evidence[: self._settings.rag_rerank_candidate_limit]
+        result = self._worker_client.execute(
+            rerank_command(
+                query,
+                [RerankCandidateInput(candidate_id=str(item.chunk.id), text=item.chunk.retrieval_text()) for item in candidates],
+                self._settings.rag_rerank_max_total_tokens,
+            ),
+            result_type=RerankResult,
+        )
+        if not result.scores:
+            return [item.model_copy(update={"index": index}) for index, item in enumerate(evidence[: self._settings.rag_rerank_output_limit], start=1)], result
+        evidence_by_id = {str(item.chunk.id): item for item in candidates}
+        score_by_id = {item.candidate_id: item.score for item in result.scores}
+        ordered = [evidence_by_id[item.candidate_id] for item in sorted(result.scores, key=lambda score: (-score.score, score.candidate_id))]
+        scored_ids = set(score_by_id)
+        ordered.extend(item for item in candidates if str(item.chunk.id) not in scored_ids)
+        ordered.extend(evidence[len(candidates) :])
+        return [
+            item.model_copy(
+                update={
+                    "index": index,
+                    "score": score_by_id.get(str(item.chunk.id), item.score),
+                }
+            )
+            for index, item in enumerate(ordered[: self._settings.rag_rerank_output_limit], start=1)
+        ], result
 
     @staticmethod
     def _merge_overlapping_contexts(rows: list[dict[str, object]]) -> list[dict[str, object]]:
@@ -308,11 +420,7 @@ class RagRetriever:
         run_id: str = "standalone",
     ) -> list[Evidence]:
         if not self._settings.rag_hybrid_search_enabled:
-            embedding = self.generate_query_embedding(topic)
-            rows = self.retrieve_vector_candidates(embedding, filters, limit)
-            for row in rows:
-                row["match_type"] = "vector"
-            return self.expand_candidates(rows)
+            return self.expand_candidates(self.retrieve_candidates(topic, filters, limit))
 
         started = perf_counter()
         vector_rows: list[dict[str, object]] = []
@@ -364,6 +472,13 @@ class RagRetriever:
             elapsed_ms=round((perf_counter() - started) * 1_000, 2),
         )
         return evidence
+
+    def retrieve_candidates(self, topic: str, filters: ResolvedFilters, limit: int) -> list[dict[str, object]]:
+        embedding = self.generate_query_embedding(topic)
+        rows = self.retrieve_vector_candidates(embedding, filters, limit)
+        for row in rows:
+            row["match_type"] = "vector"
+        return rows
 
     def _expand_chunk_contexts(self, connection: Any, rows: list[dict[str, object]]) -> list[dict[str, object]]:
         window = self._settings.rag_chunk_context_window_utterances
@@ -418,9 +533,7 @@ class RagRetriever:
             row["text"] = "\n".join(f"{item['speaker_label'] or 'Unknown Speaker'}: {item['text']}" for item in chunk_utterances)
             row["start_ms"] = chunk_utterances[0]["start_ms"]
             row["end_ms"] = chunk_utterances[-1]["end_ms"]
-            row["speaker_labels"] = list(
-                dict.fromkeys(str(item["speaker_label"]) for item in chunk_utterances if item["speaker_label"])
-            )
+            row["speaker_labels"] = list(dict.fromkeys(str(item["speaker_label"]) for item in chunk_utterances if item["speaker_label"]))
             row["is_target_person"] = any(bool(item["is_target_person"]) for item in chunk_utterances)
             row["matched_speaker_profile_ids"] = list(
                 dict.fromkeys(item["speaker_profile_id"] for item in chunk_utterances if item["speaker_profile_id"] is not None)
@@ -434,10 +547,12 @@ class RagRetriever:
         values["limit"] = 1 if rank else max(1, min(MAX_SCOPE_RECORDINGS, limit or MAX_SCOPE_RECORDINGS))
         values["offset"] = max(0, min(9, rank - 1)) if rank else 0
         with self._engine.connect() as connection:
+            self._set_statement_timeout(connection)
             recordings = (
                 connection.execute(
                     text(
-                        f"""select recordings.id, recordings.title, recordings.file_name, recordings.location, recordings.duration_seconds
+                        f"""select recordings.id, recordings.title, recordings.file_name, recordings.location,
+                                  recordings.duration_seconds, recordings.created_at
                     from recordings where {" and ".join(clauses)} order by recordings.created_at desc limit :limit offset :offset"""
                     ),
                     values,
@@ -500,9 +615,71 @@ class RagRetriever:
         for row in utterance_rows:
             utterances_by_recording[cast(UUID, row["recording_id"])].append(row)
         return [
-            self._scope_evidence(index, recording, utterances_by_recording[cast(UUID, recording["id"])])
-            for index, recording in enumerate(recordings, start=1)
+            self._scope_evidence(index, recording, utterances_by_recording[cast(UUID, recording["id"])]) for index, recording in enumerate(recordings, start=1)
         ]
+
+    def retrieve_metadata(
+        self,
+        filters: ResolvedFilters,
+        limit: int | None,
+        rank: int | None,
+    ) -> list[dict[str, object]]:
+        """Load only the trusted recording metadata exposed to metadata_lookup."""
+
+        values: dict[str, object] = {}
+        clauses = ["recordings.status = 'completed'"]
+        self._append_recording_filters(clauses, values, filters)
+        values["limit"] = 1 if rank else max(1, min(MAX_SCOPE_RECORDINGS, limit or MAX_SCOPE_RECORDINGS))
+        values["offset"] = max(0, min(9, rank - 1)) if rank else 0
+        with self._engine.connect() as connection:
+            self._set_statement_timeout(connection)
+            rows = (
+                connection.execute(
+                    text(
+                        f"""
+                    select recordings.id, recordings.file_name, recordings.location,
+                           recordings.duration_seconds, recordings.created_at,
+                           coalesce(speakers.stats, '[]'::jsonb) as speakers
+                    from recordings
+                    left join lateral (
+                        select jsonb_agg(
+                                   jsonb_build_object(
+                                       'name', speaker_name,
+                                       'speaking_duration_seconds', speaking_duration_seconds
+                                   ) order by speaking_duration_seconds desc, speaker_name
+                               ) filter (where speaker_name is not null and btrim(speaker_name) <> '') as stats
+                        from (
+                            select coalesce(profiles.display_name, mappings.display_name, utterances.speaker_label) as speaker_name,
+                                   round(sum(greatest(0, utterances.end_ms - utterances.start_ms)) / 1000.0, 3)
+                                       as speaking_duration_seconds
+                            from utterance_segments utterances
+                            left join recording_speaker_mappings mappings
+                              on mappings.recording_id = utterances.recording_id
+                             and mappings.speaker_cluster_id = utterances.speaker_cluster_id
+                            left join speaker_profiles profiles on profiles.id = mappings.speaker_profile_id
+                            where utterances.recording_id = recordings.id
+                            group by coalesce(profiles.display_name, mappings.display_name, utterances.speaker_label)
+                        ) recording_speakers
+                    ) speakers on true
+                    where {" and ".join(clauses)}
+                    order by recordings.created_at desc
+                    limit :limit offset :offset
+                    """
+                    ),
+                    values,
+                )
+                .mappings()
+                .all()
+            )
+            return [dict(row) for row in rows]
+
+    def _set_statement_timeout(self, connection: Any) -> None:
+        if not hasattr(connection, "dialect"):
+            return
+        connection.execute(
+            text("select set_config('statement_timeout', :timeout, true)"),
+            {"timeout": f"{getattr(self._settings, 'rag_sql_statement_timeout_ms', 15_000)}ms"},
+        )
 
     @staticmethod
     def _scope_evidence(index: int, recording: object, utterance_rows: list[object]) -> Evidence:
@@ -524,6 +701,7 @@ class RagRetriever:
                 file_name=str(recording_data["file_name"]),
                 location=cast(str | None, recording_data["location"]),
                 duration_seconds=cast(int | None, recording_data["duration_seconds"]),
+                created_at=cast(datetime, recording_data["created_at"]),
             ),
             chunk=EvidenceChunk(
                 id=recording_id,
@@ -533,9 +711,7 @@ class RagRetriever:
                 speaker_labels=speaker_labels,
                 is_target_person=any(bool(item["is_target_person"]) for item in utterances),
                 matched_speaker_profiles=list(
-                    dict.fromkeys(
-                        cast(UUID, item["speaker_profile_id"]) for item in utterances if item["speaker_profile_id"] is not None
-                    )
+                    dict.fromkeys(cast(UUID, item["speaker_profile_id"]) for item in utterances if item["speaker_profile_id"] is not None)
                 ),
             ),
             score=1.0,
@@ -546,27 +722,22 @@ class RagRetriever:
                 utterance_count=utterance_count,
                 transcript_truncated=utterance_count > len(utterances) or len(untruncated_body) > MAX_SCOPE_CHARS,
             ),
-            url=f"/recordings/{recording_id}?t={start_ms}",
+            url=f"/recordings/{recording_id}?t={start_ms}&end={end_ms}",
         )
-
-    def _embed(self, query: str) -> list[float]:
-        encoded = self._load_model().encode([query], normalize_embeddings=True, convert_to_numpy=True, show_progress_bar=False)
-        values = getattr(encoded, "tolist", lambda: None)()
-        if not isinstance(values, list) or not values or not isinstance(values[0], list):
-            raise RuntimeError("Embedding model returned an invalid query vector")
-        return [float(cast(float | int | str, item)) for item in cast(list[object], values[0])]
-
-    def _load_model(self) -> EmbeddingModel:
-        if self._model is not None:
-            return self._model
-        model_path = resolve_local_snapshot(self._settings.embedding_model, self._settings.resolved_embedding_model_cache_dir)
-        module = cast(SentenceTransformersModule, import_module("sentence_transformers"))
-        self._model = module.SentenceTransformer(str(model_path), local_files_only=True, trust_remote_code=True)
-        return self._model
 
     @staticmethod
     def _chunk_evidence(index: int, row: object) -> Evidence:
         data = cast(dict[str, object], row)
+        raw_metadata = data.get("metadata")
+        metadata: dict[str, object] = (
+            {key: value for key, value in cast(Mapping[object, object], raw_metadata).items() if isinstance(key, str)}
+            if isinstance(raw_metadata, Mapping)
+            else {}
+        )
+        raw_terms = metadata.get("terms")
+        terms = [term for term in cast(list[object], raw_terms) if isinstance(term, str)] if isinstance(raw_terms, list) else []
+        topic = metadata.get("topic")
+        search_context = metadata.get("search_context")
         return Evidence(
             index=index,
             recording=EvidenceRecording(
@@ -575,6 +746,7 @@ class RagRetriever:
                 file_name=str(data["file_name"]),
                 location=cast(str | None, data["location"]),
                 duration_seconds=cast(int | None, data["duration_seconds"]),
+                created_at=cast(datetime, data["created_at"]),
             ),
             chunk=EvidenceChunk(
                 id=cast(UUID, data["chunk_id"]),
@@ -584,10 +756,13 @@ class RagRetriever:
                 speaker_labels=cast(list[str], data["speaker_labels"] or []),
                 is_target_person=bool(data["is_target_person"]),
                 matched_speaker_profiles=cast(list[UUID], data.get("matched_speaker_profile_ids") or []),
+                topic=topic if isinstance(topic, str) and topic else None,
+                terms=terms,
+                search_context=search_context if isinstance(search_context, str) and search_context else None,
             ),
             score=float(cast(float, data["score"])),
             match_type=cast(Any, data.get("match_type", "vector")),
-            url=f"/recordings/{data['recording_id']}?t={data['start_ms']}",
+            url=f"/recordings/{data['recording_id']}?t={data['start_ms']}&end={data['end_ms']}",
         )
 
     @staticmethod
@@ -642,6 +817,9 @@ class RagRetriever:
             clauses.append(f"{field} = any(cast(:recording_ids as uuid[]))")
         if filters.recording_scope_resolved:
             return
+        if filters.file_names:
+            values["file_names"] = filters.file_names
+            clauses.append("recordings.file_name = any(cast(:file_names as text[]))")
         if filters.locations:
             values["locations"] = [f"%{item}%" for item in filters.locations]
             clauses.append("recordings.location ilike any(cast(:locations as text[]))")

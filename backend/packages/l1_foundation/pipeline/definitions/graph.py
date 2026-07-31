@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from l1_foundation.pipeline.contracts import ResourceQueue, RetryPolicy
+from l1_foundation.pipeline.contracts import RetryPolicy
 
 
 @dataclass(frozen=True, slots=True)
@@ -20,7 +20,6 @@ class PipelineNode:
     name: str
     stage_name: str
     stage_version: str
-    resource_queue: ResourceQueue
     retry_policy: RetryPolicy
     depends_on: tuple[str, ...] = ()
     required: bool = True

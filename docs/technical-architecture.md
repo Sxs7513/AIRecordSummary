@@ -1,5 +1,7 @@
 # AI 录音检索产品技术架构设计文档
 
+> 架构演进说明：任务调度、实时状态和流式生成的最新目标架构参见 [`redis-kafka-architecture-refactor.md`](./redis-kafka-architecture-refactor.md)。该方案采用 Kafka-first：Kafka 保存任务与过程事实，Redis 保存活跃状态与实时流，PostgreSQL 保存最终业务结果与查询投影；相关结论优先于本文早期 MVP 队列描述。
+
 ## 1. 文档目标
 
 本文档用于定义产品第一阶段的技术架构、核心模块、关键数据流、主要技术选型方向和后续扩展预留点。
