@@ -41,6 +41,7 @@ class StructuredFact(BaseModel):
 class StrategyResult(BaseModel):
     status: Literal["ready", "not_found", "needs_clarification"]
     answer_context: str = ""
+    corrected_answer_context: str | None = None
     evidence: list[Evidence] = Field(default_factory=_evidence_list)
     facts: list[StructuredFact] = Field(default_factory=_fact_list)
     sources: list[dict[str, object]] = Field(default_factory=_source_list)

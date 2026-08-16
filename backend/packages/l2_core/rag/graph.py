@@ -4,7 +4,7 @@ import asyncio
 import json
 import logging
 from collections.abc import Callable, Mapping
-from typing import Any, Literal, cast
+from typing import Any, Literal, Protocol, cast
 from uuid import UUID
 
 from langchain_core.messages import BaseMessage
@@ -26,6 +26,15 @@ from l1_foundation.observability import (
     start_span,
 )
 from l1_foundation.observability.context import current_span
+from l2_core.rag.adjudication.agent import EvidenceAdjudicationAgent
+from l2_core.rag.adjudication.contracts import (
+    AdjudicationConfirmationBlock,
+    ClaimConfirmationDecision,
+    CorrectionRiskAssessment,
+    EvidenceOverlay,
+)
+from l2_core.rag.adjudication.prompts import AuditPromptVariant, correction_risk_prompt
+from l2_core.rag.adjudication.web_research import GroundedSearchClient
 from l2_core.rag.citations import normalize_answer_citations
 from l2_core.rag.contracts import (
     AnswerPlan,
@@ -61,7 +70,27 @@ from l2_core.rag.streaming import ThinkTagFilter
 from l2_core.rag.token_budget import RagTokenBudgetMiddleware
 from l2_core.rag.workflows.chunk_evidence import ChunkEvidencePipeline
 
+AnswerVariant = Literal["original", "corrected"]
+
+
+class AggregateAnswerStream(Protocol):
+    def start_aggregate_message(self) -> None: ...
+
+    def aggregate_text(self, variant: str, value: str) -> None: ...
+
+    def complete_aggregate_variant(
+        self,
+        variant: str,
+        text: str,
+        sources: list[dict[str, object]],
+    ) -> None: ...
+
+    def fail_aggregate_variant(self, variant: str, error: str) -> None: ...
+
 logger = logging.getLogger("rag")
+MAX_ADJUDICATION_CASES = 2
+MAX_ADJUDICATION_ITERATIONS = 4
+MAX_ADJUDICATION_SEARCHES = 3
 
 
 class RagGraph:
@@ -79,6 +108,13 @@ class RagGraph:
         route_model_profile: Literal["default", "rag"] = "default",
         node_model_profile: Literal["default", "rag"] = "default",
         query_term_expansion_enabled: bool = False,
+        asr_adjudication_enabled: bool = False,
+        asr_adjudication_web_search_enabled: bool = False,
+        asr_adjudication_auto_resolve_confidence: float = 0.95,
+        asr_adjudication_audit_prompt_variant: AuditPromptVariant = "relation_rules",
+        asr_adjudication_audit_model: str | None = None,
+        asr_adjudication_audit_min_request_interval_seconds: float | None = None,
+        grounded_search_client: GroundedSearchClient | None = None,
     ) -> None:
         self._retriever = retriever
         self._model_client = model_client
@@ -88,7 +124,27 @@ class RagGraph:
         self._route_model_profile: Literal["default", "rag"] = route_model_profile
         self._node_model_profile: Literal["default", "rag"] = node_model_profile
         self._query_term_expansion_enabled = query_term_expansion_enabled
+        self._asr_adjudication_enabled = asr_adjudication_enabled
+        self._asr_adjudication_web_search_enabled = asr_adjudication_web_search_enabled and grounded_search_client is not None
         self._token_budget = RagTokenBudgetMiddleware(max_total_tokens)
+        self._adjudication_agent = EvidenceAdjudicationAgent(
+            model_client=model_client,
+            online_provider=online_provider,
+            context_size=context_size,
+            token_budget=self._token_budget,
+            grounded_search_client=grounded_search_client,
+            web_search_enabled=self._asr_adjudication_web_search_enabled,
+            auto_resolve_confidence=asr_adjudication_auto_resolve_confidence,
+            max_cases=MAX_ADJUDICATION_CASES,
+            max_iterations=MAX_ADJUDICATION_ITERATIONS,
+            max_searches=MAX_ADJUDICATION_SEARCHES,
+            audit_prompt_variant=asr_adjudication_audit_prompt_variant,
+            audit_model=asr_adjudication_audit_model,
+            audit_min_request_interval_seconds=asr_adjudication_audit_min_request_interval_seconds,
+            node_started=self._node_started,
+            node_completed=self._node_completed,
+            event_logger=log_event,
+        )
         self._chunk_evidence = ChunkEvidencePipeline(
             retriever,
             node_started=self._node_started,
@@ -102,9 +158,10 @@ class RagGraph:
                     chunk_evidence_pipeline=self._chunk_evidence,
                     expand_retrieval_terms=self._expand_retrieval_terms,
                     grade=self._grade,
-                    plan=self._plan,
-                    validate_plan=self._validate_plan,
-                    select_planned_evidence=self._select_planned_evidence,
+                    classify_query_correction_risk=self._classify_query_correction_risk,
+                    adjudication_agent=self._adjudication_agent.start,
+                    apply_user_adjudication_decision=self._apply_user_adjudication_decision,
+                    adjudication_enabled=asr_adjudication_enabled,
                     after_grade=self._after_grade,
                     transition=self._transition,
                     rerank_enabled=bool(getattr(retriever, "rerank_enabled", False)),
@@ -122,12 +179,6 @@ class RagGraph:
                     node_started=self._node_started,
                     node_completed=self._node_completed,
                     operation_completed=self._operation_completed,
-                    decide_plan=self._decide_plan,
-                    plan=self._plan,
-                    validate_plan=self._validate_plan,
-                    select_direct_evidence=self._select_direct_evidence,
-                    select_planned_evidence=self._select_planned_evidence,
-                    after_plan_decision=self._after_plan_decision,
                     render_evidence=self._evidence_text,
                 ),
             )
@@ -174,8 +225,11 @@ class RagGraph:
         run_id: UUID | None = None,
         hook: RagExecutionHook | None = None,
         existing_answer: str | None = None,
+        existing_original_answer: str | None = None,
+        aggregate_stream: AggregateAnswerStream | None = None,
         restored_state: RagGraphState | None = None,
-    ) -> tuple[str, list[dict[str, object]], bool, str | None]:
+        adjudication_user_decision: ClaimConfirmationDecision | None = None,
+    ) -> tuple[str, list[dict[str, object]], bool, str | None, AdjudicationConfirmationBlock | None]:
         with rag_execution_hook_scope(hook):
             return await self._run(
                 query,
@@ -186,7 +240,10 @@ class RagGraph:
                 history,
                 run_id,
                 existing_answer,
+                existing_original_answer,
+                aggregate_stream,
                 restored_state,
+                adjudication_user_decision,
             )
 
     async def _run(
@@ -199,8 +256,11 @@ class RagGraph:
         history: list[RagHistoryMessage] | None = None,
         run_id: UUID | None = None,
         existing_answer: str | None = None,
+        existing_original_answer: str | None = None,
+        aggregate_stream: AggregateAnswerStream | None = None,
         restored_state: RagGraphState | None = None,
-    ) -> tuple[str, list[dict[str, object]], bool, str | None]:
+        adjudication_user_decision: ClaimConfirmationDecision | None = None,
+    ) -> tuple[str, list[dict[str, object]], bool, str | None, AdjudicationConfirmationBlock | None]:
         trace_id = str(run_id) if run_id is not None else "standalone"
         graph_started = started_at()
         log_event(
@@ -223,7 +283,10 @@ class RagGraph:
                     history=history or [],
                     limit=limit,
                     scope_recording_ids=[str(item) for item in scope_recording_ids],
+                    adjudication_user_decision=adjudication_user_decision,
                 )
+            elif adjudication_user_decision is not None:
+                initial_state["adjudication_user_decision"] = adjudication_user_decision
             result = await self._graph.ainvoke(initial_state)
         except asyncio.CancelledError:
             finish_span(current_span(), "cancelled", error_type="CancelledError")
@@ -267,7 +330,7 @@ class RagGraph:
                 reason=state["route_error"],
                 elapsed_ms=elapsed_ms(graph_started),
             )
-            return message, [], True, state["route_error"]
+            return message, [], True, state["route_error"], None
         strategy_result = cast(StrategyResult | None, state["strategy_result"])
         if strategy_result is None:
             raise RuntimeError("RAG graph completed without a strategy result")
@@ -282,43 +345,125 @@ class RagGraph:
                 evidence_count=len(evidence),
                 elapsed_ms=elapsed_ms(graph_started),
             )
-            return "没有在录音中找到足够依据。", [], True, strategy_result.message
-        if state["planning_required"] and plan is None:
-            raise RuntimeError("RAG answer planning was required but no valid plan was produced")
+            return "没有在录音中找到足够依据。", [], True, strategy_result.message, None
+        adjudication = state["adjudication_agent_state"]
+        if adjudication is not None and adjudication.pending_confirmation is not None:
+            return "", strategy_result.sources, False, None, adjudication.pending_confirmation
         on_phase("generating", "正在生成回答", 75)
         answer_started = self._node_started(state, "answer")
+        corrected_direct_answer = strategy_result.corrected_answer_context is not None
         log_event(
             "answer_mode_selected",
             trace_id,
-            mode="planned" if plan is not None else "direct",
+            mode="direct" if corrected_direct_answer or plan is None else "planned",
             strategy_id=state["route"].strategy_id if state["route"] is not None else None,
             retrieved_evidence_count=len(state["evidence"]),
             answer_evidence_count=len(strategy_result.sources),
             answer_evidence_text=self._evidence_log_entries(strategy_result.evidence),
         )
+        active_aggregate_stream = aggregate_stream if strategy_result.corrected_answer_context is not None else None
+        dual_answer = active_aggregate_stream is not None
+        primary_answer_context = strategy_result.corrected_answer_context or strategy_result.answer_context
+        # if corrected_direct_answer:
+        #     logger.info(
+        #         "TEMP corrected answer evidence run_id=%s text=%s",
+        #         trace_id,
+        #         primary_answer_context,
+        #     )
         prompt, values = answer_prompt(
             state["query"],
-            plan.model_dump_json() if plan is not None else None,
-            strategy_result.answer_context,
+            None if corrected_direct_answer else (plan.model_dump_json() if plan is not None else None),
+            primary_answer_context,
             self._history_text(state["history"]),
             state["grade"].verdict if state["grade"] is not None else None,
             existing_answer,
         )
         messages = prompt.invoke(values).to_messages()
-        first_token_logged = False
+        original_messages: object | None = None
+        if dual_answer:
+            original_prompt, original_values = answer_prompt(
+                state["query"],
+                plan.model_dump_json() if plan is not None else None,
+                strategy_result.answer_context,
+                self._history_text(state["history"]),
+                state["grade"].verdict if state["grade"] is not None else None,
+                existing_original_answer,
+            )
+            original_messages = original_prompt.invoke(original_values).to_messages()
+            active_aggregate_stream.start_aggregate_message()
+        first_token_logged: set[AnswerVariant] = set()
 
-        def trace_delta(delta: str) -> None:
-            nonlocal first_token_logged
-            if not first_token_logged:
-                first_token_logged = True
-                log_event("answer_first_token", trace_id, elapsed_ms=elapsed_ms(answer_started))
-            on_delta(delta)
+        def trace_delta(variant: AnswerVariant, delta: str) -> None:
+            if variant not in first_token_logged:
+                first_token_logged.add(variant)
+                log_event(
+                    "answer_first_token",
+                    trace_id,
+                    variant=variant,
+                    elapsed_ms=elapsed_ms(answer_started),
+                )
+            if active_aggregate_stream is not None:
+                active_aggregate_stream.aggregate_text(variant, delta)
+            else:
+                on_delta(delta)
 
-        traced_delta = rag_execution_middleware.wrap_delta(trace_delta)
+        corrected_delta = rag_execution_middleware.wrap_delta(lambda delta: trace_delta("corrected", delta))
 
         answer_provider = LlmProvider.LOCAL if state["route"] is not None and state["route"].strategy_id == "metadata_lookup" else self._online_provider
+        original_answer: str | None = None
+        original_result: LlmGenerateResult | None = None
         try:
-            answer, answer_result = await self._generate_streaming_answer(state, messages, 2048, traced_delta, provider=answer_provider)
+            if dual_answer:
+                if original_messages is None:
+                    raise RuntimeError("Dual answer generation requires original messages")
+                original_delta = rag_execution_middleware.wrap_delta(lambda delta: trace_delta("original", delta))
+                generated = await asyncio.gather(
+                    self._generate_streaming_answer(
+                        state,
+                        original_messages,
+                        2048,
+                        original_delta,
+                        provider=answer_provider,
+                    ),
+                    self._generate_streaming_answer(
+                        state,
+                        messages,
+                        2048,
+                        corrected_delta,
+                        provider=answer_provider,
+                    ),
+                    return_exceptions=True,
+                )
+                original_generated, corrected_generated = generated
+                if isinstance(original_generated, BaseException):
+                    active_aggregate_stream.fail_aggregate_variant(
+                        "original",
+                        str(original_generated) or type(original_generated).__name__,
+                    )
+                    log_event(
+                        "answer_variant_failed",
+                        trace_id,
+                        level=logging.WARNING,
+                        variant="original",
+                        error_type=type(original_generated).__name__,
+                    )
+                else:
+                    original_answer, original_result = original_generated
+                if isinstance(corrected_generated, BaseException):
+                    active_aggregate_stream.fail_aggregate_variant(
+                        "corrected",
+                        str(corrected_generated) or type(corrected_generated).__name__,
+                    )
+                    raise corrected_generated
+                answer, answer_result = corrected_generated
+            else:
+                answer, answer_result = await self._generate_streaming_answer(
+                    state,
+                    messages,
+                    2048,
+                    corrected_delta,
+                    provider=answer_provider,
+                )
         except asyncio.CancelledError:
             finish_span(current_span(), "cancelled", error_type="CancelledError")
             log_event(
@@ -370,6 +515,14 @@ class RagGraph:
         if not answer:
             raise RuntimeError("RAG answer model returned an empty streamed answer")
         complete_answer = f"{existing_answer or ''}{answer}"
+        correction_notices = (
+            [f"将“{item.original_expression}”修正为“{item.resolved_expression}”" for item in adjudication.overlays]
+            if adjudication is not None
+            else []
+        )
+        missing_notices = [notice for notice in correction_notices if notice not in complete_answer]
+        if missing_notices:
+            complete_answer = f"转写纠正：{'；'.join(missing_notices)}。\n\n{complete_answer}"
         normalized_citations = normalize_answer_citations(complete_answer, strategy_result.sources)
         answer = normalized_citations.text
         sources = normalized_citations.sources
@@ -381,16 +534,44 @@ class RagGraph:
                 invalid_indexes=list(normalized_citations.invalid_indexes),
             )
         state["token_usage"] += self._token_budget.actual_usage(answer_result)
+        if dual_answer:
+            active_aggregate_stream.complete_aggregate_variant("corrected", answer, sources)
+            if original_answer is not None and original_result is not None:
+                complete_original_answer = f"{existing_original_answer or ''}{original_answer}"
+                original_source_candidates = [
+                    {key: value for key, value in source.items() if key != "adjudication"}
+                    for source in strategy_result.sources
+                ]
+                normalized_original = normalize_answer_citations(
+                    complete_original_answer,
+                    original_source_candidates,
+                )
+                original_answer = normalized_original.text
+                active_aggregate_stream.complete_aggregate_variant(
+                    "original",
+                    original_answer,
+                    normalized_original.sources,
+                )
+                state["token_usage"] += self._token_budget.actual_usage(original_result)
+                if normalized_original.invalid_indexes:
+                    log_event(
+                        "answer_invalid_citations_removed",
+                        trace_id,
+                        level=logging.WARNING,
+                        variant="original",
+                        invalid_indexes=list(normalized_original.invalid_indexes),
+                    )
         self._node_completed(
             state,
             "answer",
             answer_started,
             answer_chars=len(answer),
             evidence_count=len(sources),
-            mode="planned" if plan is not None else "direct",
+            mode="direct" if corrected_direct_answer or plan is None else "planned",
             total_tokens=state["token_usage"],
             model_execution="local" if answer_provider == LlmProvider.LOCAL else "online",
             provider=answer_provider.value,
+            dual_answer=dual_answer,
         )
         log_event(
             "graph_completed",
@@ -399,9 +580,10 @@ class RagGraph:
             evidence_count=len(sources),
             retrieved_evidence_count=len(state["evidence"]),
             planning_required=state["planning_required"],
+            dual_answer=dual_answer,
             elapsed_ms=elapsed_ms(graph_started),
         )
-        return answer, sources, False, strategy_result.message
+        return answer, sources, False, strategy_result.message, None
 
     async def run_retrieval(
         self,
@@ -467,6 +649,9 @@ class RagGraph:
             grade=None,
             planning_required=False,
             answer_plan=None,
+            query_correction_risk=False,
+            adjudication_agent_state=None,
+            adjudication_user_decision=None,
             token_usage=0,
             strategy_result=None,
         )
@@ -514,7 +699,10 @@ class RagGraph:
     def _node_model_execution(node: str) -> Literal["local", "online", "none"]:
         """Execution location for nodes with a fixed model dependency."""
 
-        if node == "route":
+        if node in {
+            "route",
+            "classify_query_correction_risk",
+        }:
             return "online"
         if node in {"retrieve", "rerank"}:
             return "local"
@@ -719,6 +907,129 @@ class RagGraph:
             "token_usage": self._token_budget.actual_usage(result),
         }
 
+    async def _classify_query_correction_risk(self, state: RagGraphState) -> dict[str, object]:
+        node_started = self._node_started(state, "classify_query_correction_risk")
+        if not self._asr_adjudication_enabled or state["execution_mode"] != "answer":
+            self._node_completed(
+                state,
+                "classify_query_correction_risk",
+                node_started,
+                enabled=False,
+                has_risk=False,
+            )
+            return {"query_correction_risk": False, "adjudication_agent_state": None}
+        prompt, values = correction_risk_prompt(state["query"])
+        messages = prompt.invoke(values).to_messages()
+        try:
+            result = await self._complete(
+                state,
+                "classify_query_correction_risk",
+                messages,
+                max_tokens=80,
+                json_schema=CorrectionRiskAssessment.model_json_schema(),
+                provider=self._online_provider,
+            )
+            assessment = CorrectionRiskAssessment.model_validate_json(result.text)
+        except Exception as error:
+            log_event(
+                "node_warning",
+                state.get("run_id", "standalone"),
+                level=logging.WARNING,
+                node="classify_query_correction_risk",
+                reason="classification_fallback",
+                error_type=type(error).__name__,
+            )
+            self._node_completed(
+                state,
+                "classify_query_correction_risk",
+                node_started,
+                enabled=True,
+                has_risk=False,
+                fallback=True,
+            )
+            return {"query_correction_risk": False}
+        self._node_completed(
+            state,
+            "classify_query_correction_risk",
+            node_started,
+            enabled=True,
+            has_risk=assessment.has_risk,
+            fallback=False,
+        )
+        return {
+            "query_correction_risk": assessment.has_risk,
+            "token_usage": self._token_budget.actual_usage(result),
+        }
+
+    async def _apply_user_adjudication_decision(self, state: RagGraphState) -> dict[str, object]:
+        node_started = self._node_started(state, "apply_user_adjudication_decision")
+        adjudication = state["adjudication_agent_state"]
+        user_decision = state["adjudication_user_decision"]
+        if adjudication is None or adjudication.pending_confirmation is None or user_decision is None:
+            self._node_completed(
+                state,
+                "apply_user_adjudication_decision",
+                node_started,
+                applied=False,
+                pending=adjudication is not None and adjudication.pending_confirmation is not None,
+            )
+            return {}
+        pending = adjudication.pending_confirmation
+        if user_decision.request_id != pending.request_id:
+            raise ValueError("Adjudication decision does not match the pending request")
+        pending_by_id = {item.id: item for item in pending.items}
+        decisions_by_id = {item.item_id: item for item in user_decision.decisions}
+        if set(decisions_by_id) != set(pending_by_id):
+            raise ValueError("Adjudication decision must resolve every pending item exactly once")
+        overlays = list(adjudication.overlays)
+        accepted = 0
+        kept = 0
+        unresolved = 0
+        for item_id, item_decision in decisions_by_id.items():
+            pending_item = pending_by_id[item_id]
+            if item_decision.action == "accept_candidate":
+                candidate = next(
+                    (candidate for candidate in pending_item.candidates if candidate.id == item_decision.candidate_id),
+                    None,
+                )
+                if candidate is None:
+                    raise ValueError("Adjudication candidate does not belong to the pending item")
+                overlays.append(
+                    EvidenceOverlay(
+                        proposal_id=candidate.id,
+                        evidence_index=pending_item.evidence_index,
+                        chunk_id=str(pending_item.chunk_id),
+                        original_expression=pending_item.original_expression,
+                        resolved_expression=candidate.expression,
+                        target_spans=pending_item.target_spans,
+                        status="user_confirmed",
+                        confidence=candidate.confidence,
+                        source_urls=candidate.source_urls,
+                    )
+                )
+                accepted += 1
+            elif item_decision.action == "keep_original":
+                kept += 1
+            else:
+                unresolved += 1
+        updated = adjudication.model_copy(
+            update={
+                "overlays": overlays,
+                "pending_confirmation": None,
+                "applied_user_decision": user_decision,
+            }
+        )
+        self._node_completed(
+            state,
+            "apply_user_adjudication_decision",
+            node_started,
+            applied=True,
+            accepted=accepted,
+            kept=kept,
+            unresolved=unresolved,
+        )
+        return {"adjudication_agent_state": updated}
+
     @staticmethod
     def _is_protected_lexical_query(value: str) -> bool:
         return value.strip() not in {"最近", "今天", "昨天", "这次", "这条", "那个", "这个", "是否", "是不是", "有没有"}
@@ -914,6 +1225,7 @@ class RagGraph:
             max_tokens=500,
             json_schema=EvidenceGrade.model_json_schema(),
             provider=provider,
+            enable_thinking=True
         )
         raw = result.text
         logger.debug("rag grade raw output: %s", raw)
@@ -991,14 +1303,6 @@ class RagGraph:
             }
             for item in evidence
         ]
-
-    @staticmethod
-    def _after_grade(state: RagGraphState) -> Literal["plan", "done"]:
-        grade = state["grade"]
-        target: Literal["plan", "done"] = "plan" if grade is not None and grade.verdict != "abstain" else "done"
-        reason = grade.reason if grade is not None else "missing_grade"
-        RagGraph._transition(state, "grade", target, reason)
-        return target
 
     @staticmethod
     async def _decide_plan(state: RagGraphState) -> dict[str, object]:
@@ -1129,35 +1433,24 @@ class RagGraph:
         return {"answer_plan": plan}
 
     @staticmethod
-    async def _select_direct_evidence(state: RagGraphState) -> dict[str, object]:
-        node_started = RagGraph._node_started(state, "select_direct_evidence")
-        evidence = list(state["evidence"])
-        RagGraph._node_completed(
-            state,
-            "select_direct_evidence",
-            node_started,
-            retrieved_evidence_count=len(evidence),
-            selected_evidence_count=len(evidence),
-        )
-        return {"answer_evidence": evidence}
-
-    @staticmethod
     async def _select_planned_evidence(state: RagGraphState) -> dict[str, object]:
         node_started = RagGraph._node_started(state, "select_planned_evidence")
         plan = state["answer_plan"]
         if plan is None:
             raise RuntimeError("Planned evidence selection requires a validated answer plan")
-        selected_indexes = {index for item in plan.items for index in item.evidence_indexes}
-        evidence = [item for item in state["evidence"] if item.index in selected_indexes]
+        planned_indexes = {index for item in plan.items for index in item.evidence_indexes}
+        evidence = list(state["evidence"])
         if not evidence:
-            raise RuntimeError("Validated answer plan selected no evidence")
+            raise RuntimeError("Planned answer requires evidence")
         RagGraph._node_completed(
             state,
             "select_planned_evidence",
             node_started,
             retrieved_evidence_count=len(state["evidence"]),
             selected_evidence_count=len(evidence),
-            selected_indexes=sorted(selected_indexes),
+            selected_indexes=[item.index for item in evidence],
+            planned_indexes=sorted(planned_indexes),
+            plan_prunes_evidence=False,
         )
         return {"answer_evidence": evidence}
 
@@ -1235,6 +1528,7 @@ class RagGraph:
         *,
         provider: LlmProvider,
         local_model_profile: Literal["default", "rag"] | None = None,
+        enable_thinking: bool = False
     ) -> LlmGenerateResult:
         self._token_budget.before_model(state.get("token_usage", 0), node)
         options = CompletionOptions(
@@ -1242,10 +1536,11 @@ class RagGraph:
             response_format=ResponseFormat(
                 type=ResponseFormatType.JSON_SCHEMA,
                 json_schema=json_schema,
-                strict=False,
+                strict=True,
             )
             if json_schema is not None
             else ResponseFormat(),
+            enbale_thinking=enable_thinking,
         )
         result = await self._model_client.execute(
             build_llm_generate_command(
@@ -1307,3 +1602,12 @@ class RagGraph:
             content = message.content if isinstance(message.content, str) else str(message.content)
             output.append(ChatMessage(role, content))
         return output
+    @staticmethod
+    def _after_grade(state: RagGraphState) -> Literal["adjudicate", "finalize"]:
+        grade = state["grade"]
+        target: Literal["adjudicate", "finalize"] = (
+            "adjudicate" if grade is not None and grade.verdict != "abstain" else "finalize"
+        )
+        reason = grade.reason if grade is not None else "missing_grade"
+        RagGraph._transition(state, "grade", target, reason)
+        return target

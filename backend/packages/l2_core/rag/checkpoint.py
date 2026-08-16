@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, time
 from enum import Enum
@@ -13,6 +13,7 @@ from uuid import UUID
 from pydantic import BaseModel
 
 from l1_foundation.streaming import SyncRedisStreamStore
+from l2_core.rag.adjudication.contracts import AdjudicationAgentState, ClaimConfirmationDecision
 from l2_core.rag.contracts import (
     AnswerPlan,
     Evidence,
@@ -24,7 +25,11 @@ from l2_core.rag.contracts import (
 )
 from l2_core.rag.strategies.base import StrategyResult
 
-WORKFLOW_VERSION = "rag-v4"
+WORKFLOW_VERSION = "rag-v11"
+
+
+def _string_set() -> set[str]:
+    return set()
 
 
 def rag_input_hash(query: str, limit: int, scope_recording_ids: list[UUID]) -> str:
@@ -97,9 +102,11 @@ class RagCheckpointSession:
     generation_id: UUID
     source_generation_id: UUID | None
     input_hash: str
-    hydrate_state: Any
+    hydrate_state: Callable[[dict[str, Any]], dict[str, Any]]
+    rerun_nodes: set[str] = field(default_factory=_string_set)
+    repeatable_nodes: set[str] = field(default_factory=_string_set)
 
-    _completed_nodes: set[str] = field(default_factory=set, init=False)
+    _completed_nodes: set[str] = field(default_factory=_string_set, init=False)
 
     def prepare(self) -> RagGraphState | None:
         """Load and hydrate the latest source state once before graph execution."""
@@ -108,7 +115,11 @@ class RagCheckpointSession:
         checkpoints = self.store.load_all(self.source_generation_id, self.input_hash)
         if not checkpoints:
             return None
-        self._completed_nodes = {node for _, node, _ in checkpoints}
+        self._completed_nodes = {
+            node
+            for _, node, _ in checkpoints
+            if node not in self.rerun_nodes and node not in self.repeatable_nodes
+        }
         for _, node, state in checkpoints:
             self.store.save(self.generation_id, node, self.input_hash, cast(RagGraphState, state))
         latest_state = checkpoints[-1][2]
@@ -122,7 +133,8 @@ class RagCheckpointSession:
 
     def save(self, node: str, state: RagGraphState) -> None:
         self.store.save(self.generation_id, node, self.input_hash, state)
-        self._completed_nodes.add(node)
+        if node not in self.repeatable_nodes:
+            self._completed_nodes.add(node)
 
 
 def completed_state(current: RagGraphState, output: Mapping[str, object]) -> RagGraphState:
@@ -138,17 +150,21 @@ def _serialize_state_without_evidence_text(state: RagGraphState) -> dict[str, An
         candidate.pop("text", None)
     for state_field in ("evidence", "answer_evidence"):
         _strip_evidence_text(cast(list[dict[str, Any]], serialized.get(state_field, [])))
-    strategy = serialized.get("strategy_result")
-    if isinstance(strategy, dict):
+    raw_strategy = serialized.get("strategy_result")
+    if isinstance(raw_strategy, dict):
+        strategy = cast(dict[str, Any], raw_strategy)
         strategy["answer_context"] = ""
+        if strategy.get("corrected_answer_context") is not None:
+            strategy["corrected_answer_context"] = ""
         _strip_evidence_text(cast(list[dict[str, Any]], strategy.get("evidence", [])))
     return serialized
 
 
 def _strip_evidence_text(items: list[dict[str, Any]]) -> None:
     for item in items:
-        chunk = item.get("chunk")
-        if isinstance(chunk, dict):
+        raw_chunk = item.get("chunk")
+        if isinstance(raw_chunk, dict):
+            chunk = cast(dict[str, Any], raw_chunk)
             chunk.pop("text", None)
 
 
@@ -156,9 +172,10 @@ def _json_value(value: object) -> object:
     if isinstance(value, BaseModel):
         return value.model_dump(mode="json")
     if isinstance(value, Mapping):
-        return {str(key): _json_value(item) for key, item in value.items()}
+        mapping = cast(Mapping[object, object], value)
+        return {str(key): _json_value(item) for key, item in mapping.items()}
     if isinstance(value, list | tuple):
-        return [_json_value(item) for item in value]
+        return [_json_value(item) for item in cast(list[object] | tuple[object, ...], value)]
     if isinstance(value, datetime | date | time):
         return value.isoformat()
     if isinstance(value, UUID | Path):
@@ -177,6 +194,16 @@ def _deserialize_state(value: dict[str, Any]) -> RagGraphState:
     state["answer_evidence"] = [Evidence.model_validate(item) for item in state.get("answer_evidence", [])]
     state["grade"] = EvidenceGrade.model_validate(state["grade"]) if state.get("grade") is not None else None
     state["answer_plan"] = AnswerPlan.model_validate(state["answer_plan"]) if state.get("answer_plan") is not None else None
+    state["adjudication_agent_state"] = (
+        AdjudicationAgentState.model_validate(state["adjudication_agent_state"])
+        if state.get("adjudication_agent_state") is not None
+        else None
+    )
+    state["adjudication_user_decision"] = (
+        ClaimConfirmationDecision.model_validate(state["adjudication_user_decision"])
+        if state.get("adjudication_user_decision") is not None
+        else None
+    )
     state["strategy_result"] = StrategyResult.model_validate(state["strategy_result"]) if state.get("strategy_result") is not None else None
     return cast(RagGraphState, state)
 

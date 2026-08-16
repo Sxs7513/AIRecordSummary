@@ -8,7 +8,6 @@ from uuid import UUID
 from sqlalchemy import Engine, RowMapping, text
 
 from l2_core.generation.contracts import (
-    ContentBlock,
     CreateGenerationCommand,
     GenerationAccessScope,
     GenerationKind,
@@ -16,6 +15,7 @@ from l2_core.generation.contracts import (
     GenerationPriority,
     GenerationSnapshot,
     GenerationStatus,
+    parse_content_block,
 )
 
 
@@ -129,7 +129,7 @@ class GenerationEventStore:
             status=GenerationStatus(cast(str, row["status"])),
             phase=None,
             progress_percent=None,
-            blocks=[ContentBlock.model_validate(item) for item in cast(list[dict[str, Any]], raw_blocks)],
+            blocks=[parse_content_block(item) for item in cast(list[dict[str, Any]], raw_blocks)],
             sources=[item for item in sources if isinstance(item, dict)],
             output=output,
             last_sequence=0,

@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Protocol
+from typing import Literal, Protocol
 
 
 class LlmProvider(StrEnum):
@@ -16,12 +16,34 @@ class ChatRole(StrEnum):
     SYSTEM = "system"
     USER = "user"
     ASSISTANT = "assistant"
+    TOOL = "tool"
+
+
+@dataclass(frozen=True, slots=True)
+class ToolDefinition:
+    name: str
+    description: str
+    parameters: Mapping[str, object]
+
+
+@dataclass(frozen=True, slots=True)
+class ToolCall:
+    id: str
+    name: str
+    arguments: Mapping[str, object]
+    # Gemini 3 attaches this opaque value to a function call.  It must be
+    # replayed verbatim with the corresponding call before sending its result.
+    thought_signature: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class ChatMessage:
     role: ChatRole
-    content: str
+    content: str = ""
+    tool_calls: tuple[ToolCall, ...] = ()
+    tool_call_id: str | None = None
+    name: str | None = None
+    thought_signature: str | None = None
 
 
 class ResponseFormatType(StrEnum):
@@ -48,12 +70,23 @@ class CompletionOptions:
     max_tokens: int
     temperature: float = 0.0
     response_format: ResponseFormat = ResponseFormat()
+    tools: tuple[ToolDefinition, ...] = ()
+    tool_choice: Literal["auto", "required", "none"] = "auto"
+    model: str | None = None
+    min_request_interval_seconds: float | None = None
+    enbale_thinking: bool = False
 
     def __post_init__(self) -> None:
         if self.max_tokens < 1:
             raise ValueError("max_tokens must be positive")
+        if self.model is not None and not self.model.strip():
+            raise ValueError("model override must not be blank")
+        if self.min_request_interval_seconds is not None and self.min_request_interval_seconds < 0:
+            raise ValueError("min_request_interval_seconds must not be negative")
         if not 0 <= self.temperature <= 2:
             raise ValueError("temperature must be between 0 and 2")
+        if self.tool_choice == "required" and not self.tools:
+            raise ValueError("tool_choice=required requires at least one tool")
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,6 +98,7 @@ class LlmCompletion:
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
     request_id: str | None = None
+    tool_calls: tuple[ToolCall, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,6 +117,7 @@ class ProviderCapabilities:
     streaming: bool
     json_object: bool
     strict_json_schema: bool
+    tool_calling: bool = False
 
 
 class LanguageModel(Protocol):

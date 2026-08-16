@@ -99,12 +99,48 @@ def test_summary_defaults_to_large_context_without_rolling() -> None:
     assert settings.topic_detection_provider == "gemini"
     assert settings.recording_summary_provider == "gemini"
     assert settings.rag_answer_provider == "gemini"
+    assert settings.rag_asr_adjudication_search_provider == "gemini"
+    assert settings.rag_asr_adjudication_audit_prompt_variant == "relation_rules"
+    assert settings.rag_asr_adjudication_audit_model is None
+    assert settings.rag_asr_adjudication_audit_min_request_interval_seconds == 15
+    assert settings.rag_asr_adjudication_search_model == "gemini-2.5-flash-lite"
+    assert settings.rag_asr_adjudication_chrome_aio_timeout_seconds == 45
+    assert settings.rag_asr_adjudication_chrome_aio_poll_interval_seconds == 1
     assert settings.gemini_model == "gemini-3.5-flash-lite"
+    assert settings.gemini_min_request_interval_seconds == 5
     assert settings.llm_correction_max_output_tokens == 65_536
     assert settings.text_correction_context_units == 1
     assert settings.local_llm_model_repo == "Qwen/Qwen2.5-7B-Instruct-GGUF"
     assert settings.recording_summary_context_size == 262_144
     assert settings.recording_summary_rolling_enabled is False
+
+
+def test_adjudication_audit_prompt_variant_can_select_free_discovery() -> None:
+    settings = Settings(
+        _env_file=None,
+        **settings_payload(RAG_ASR_ADJUDICATION_AUDIT_PROMPT_VARIANT="free_discovery"),
+    )
+
+    assert settings.rag_asr_adjudication_audit_prompt_variant == "free_discovery"
+
+    with pytest.raises(ValidationError):
+        Settings(
+            _env_file=None,
+            **settings_payload(RAG_ASR_ADJUDICATION_AUDIT_PROMPT_VARIANT="unknown"),
+        )
+
+
+def test_adjudication_audit_model_can_be_overridden() -> None:
+    settings = Settings(
+        _env_file=None,
+        **settings_payload(
+            RAG_ASR_ADJUDICATION_AUDIT_MODEL="gemini-3.6-flash",
+            RAG_ASR_ADJUDICATION_AUDIT_MIN_REQUEST_INTERVAL_SECONDS=12,
+        ),
+    )
+
+    assert settings.rag_asr_adjudication_audit_model == "gemini-3.6-flash"
+    assert settings.rag_asr_adjudication_audit_min_request_interval_seconds == 12
 
 
 def test_default_llm_provider_can_select_zhipu_for_every_llm_use() -> None:

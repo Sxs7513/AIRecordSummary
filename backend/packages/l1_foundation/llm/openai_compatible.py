@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Iterator, Mapping, Sequence
+from threading import Lock
 from time import monotonic, sleep
 from typing import cast
 
@@ -17,11 +18,45 @@ from l1_foundation.llm.contracts import (
     LlmStreamEvent,
     ProviderCapabilities,
     ResponseFormatType,
+    ToolCall,
 )
 from l1_foundation.llm.errors import LlmConfigurationError, LlmResponseError, UnsupportedResponseFormatError
 
 logger = logging.getLogger("llm")
 RATE_LIMIT_STATUS_CODE = 429
+REQUEST_LOG_STRING_LIMIT = 50
+RESPONSE_LOG_STRING_LIMIT = 200
+
+
+class SynchronousRequestRateLimiter:
+    """Reserve request start slots across model instances in one worker process."""
+
+    def __init__(self) -> None:
+        self._lock = Lock()
+        self._next_request_at: dict[tuple[LlmProvider, str], float] = {}
+
+    def wait(self, provider: LlmProvider, model: str, interval_seconds: float) -> None:
+        if interval_seconds <= 0:
+            return
+        key = (provider, model)
+        with self._lock:
+            now = monotonic()
+            request_at = max(now, self._next_request_at.get(key, now))
+            self._next_request_at[key] = request_at + interval_seconds
+        delay_seconds = request_at - now
+        if delay_seconds <= 0:
+            return
+        logger.info(
+            "Online LLM：等待请求时间槽 provider=%s model=%s delay_seconds=%g interval_seconds=%g",
+            provider.value,
+            model,
+            delay_seconds,
+            interval_seconds,
+        )
+        sleep(delay_seconds)
+
+
+_SHARED_REQUEST_RATE_LIMITER = SynchronousRequestRateLimiter()
 
 
 class OpenAiCompatibleLanguageModel(LanguageModel):
@@ -44,6 +79,8 @@ class OpenAiCompatibleLanguageModel(LanguageModel):
         stream_include_usage: bool = False,
         rate_limit_max_attempts: int = 1,
         rate_limit_retry_seconds: float = 0,
+        min_request_interval_seconds: float = 0,
+        request_rate_limiter: SynchronousRequestRateLimiter | None = None,
     ) -> None:
         if not api_key.strip():
             raise LlmConfigurationError(f"{api_key_name} is required when provider={provider.value}")
@@ -53,6 +90,8 @@ class OpenAiCompatibleLanguageModel(LanguageModel):
             raise LlmConfigurationError("rate_limit_max_attempts must be positive")
         if rate_limit_retry_seconds < 0:
             raise LlmConfigurationError("rate_limit_retry_seconds must not be negative")
+        if min_request_interval_seconds < 0:
+            raise LlmConfigurationError("min_request_interval_seconds must not be negative")
         self._provider = provider
         self._provider_label = provider_label
         self._model = model.strip()
@@ -66,6 +105,8 @@ class OpenAiCompatibleLanguageModel(LanguageModel):
         self._stream_include_usage = stream_include_usage
         self._rate_limit_max_attempts = rate_limit_max_attempts
         self._rate_limit_retry_seconds = rate_limit_retry_seconds
+        self._min_request_interval_seconds = min_request_interval_seconds
+        self._request_rate_limiter = request_rate_limiter or _SHARED_REQUEST_RATE_LIMITER
         self._client: httpx.Client | None = None
 
     @property
@@ -78,35 +119,41 @@ class OpenAiCompatibleLanguageModel(LanguageModel):
 
     @property
     def capabilities(self) -> ProviderCapabilities:
-        return ProviderCapabilities(streaming=True, json_object=True, strict_json_schema=self._strict_json_schema)
+        return ProviderCapabilities(streaming=True, json_object=True, strict_json_schema=self._strict_json_schema, tool_calling=True)
 
     def complete(self, messages: Sequence[ChatMessage], options: CompletionOptions) -> LlmCompletion:
         started_at = monotonic()
+        request_model = options.model or self.model_name
         logger.info(
             "Online LLM：开始请求 provider=%s model=%s stream=false",
             self.provider.value,
-            self.model_name,
+            request_model,
         )
         try:
-            response = self._post_chat_completions(self._payload(messages, options, stream=False))
+            response = self._post_chat_completions(
+                self._payload(messages, options, stream=False),
+                self._request_interval_seconds(options),
+            )
             self._raise_for_status(response)
             data = self._json_mapping(response)
-            text, finish_reason = self._message_text(data)
+            self._log_response_payload(data, stream=False)
+            text, tool_calls, finish_reason = self._message_content(data)
             usage = self._mapping(data.get("usage"))
             completion = LlmCompletion(
                 text=text.strip(),
                 provider=self.provider,
-                model=str(data.get("model") or self.model_name),
+                model=str(data.get("model") or request_model),
                 finish_reason=finish_reason,
                 prompt_tokens=self._integer(usage.get("prompt_tokens")),
                 completion_tokens=self._integer(usage.get("completion_tokens")),
                 request_id=self._request_id(data),
+                tool_calls=tool_calls,
             )
         except Exception:
             logger.info(
                 "Online LLM：请求失败 provider=%s model=%s stream=false elapsed_ms=%d",
                 self.provider.value,
-                self.model_name,
+                request_model,
                 self._elapsed_ms(started_at),
                 exc_info=True,
             )
@@ -128,14 +175,17 @@ class OpenAiCompatibleLanguageModel(LanguageModel):
         prompt_tokens: int | None = None
         completion_tokens: int | None = None
         request_id: str | None = None
-        response_model = self.model_name
+        response_model = options.model or self.model_name
         logger.info(
             "Online LLM：开始请求 provider=%s model=%s stream=true",
             self.provider.value,
-            self.model_name,
+            response_model,
         )
         try:
-            for line in self._stream_chat_completion_lines(self._payload(messages, options, stream=True)):
+            for line in self._stream_chat_completion_lines(
+                self._payload(messages, options, stream=True),
+                self._request_interval_seconds(options),
+            ):
                 if not line.startswith("data:"):
                     continue
                 value = line.removeprefix("data:").strip()
@@ -148,6 +198,7 @@ class OpenAiCompatibleLanguageModel(LanguageModel):
                 if not isinstance(data, Mapping):
                     raise LlmResponseError(f"{self._provider_label} returned a non-object SSE event")
                 event = cast(Mapping[str, object], data)
+                self._log_response_payload(event, stream=True)
                 usage = self._mapping(event.get("usage"))
                 choices = event.get("choices")
                 if isinstance(choices, list) and choices:
@@ -181,7 +232,7 @@ class OpenAiCompatibleLanguageModel(LanguageModel):
             logger.info(
                 "Online LLM：请求失败 provider=%s model=%s stream=true elapsed_ms=%d events=%d",
                 self.provider.value,
-                self.model_name,
+                response_model,
                 self._elapsed_ms(started_at),
                 event_count,
                 exc_info=True,
@@ -218,16 +269,30 @@ class OpenAiCompatibleLanguageModel(LanguageModel):
             )
         return self._client
 
-    def _post_chat_completions(self, payload: Mapping[str, object]) -> httpx.Response:
+    def _post_chat_completions(
+        self,
+        payload: Mapping[str, object],
+        min_request_interval_seconds: float,
+    ) -> httpx.Response:
+        self._log_request_payload(payload, stream=False)
+        request_model = str(payload.get("model") or self.model_name)
         for attempt in range(1, self._rate_limit_max_attempts + 1):
+            self._wait_for_request_slot(request_model, min_request_interval_seconds)
             response = self._get_client().post("/chat/completions", json=payload)
             if not self._should_retry_rate_limit(response, attempt):
                 return response
-            self._wait_before_rate_limit_retry(attempt)
+            self._wait_before_rate_limit_retry(attempt, request_model)
         raise AssertionError("rate-limit retry loop must return a response")
 
-    def _stream_chat_completion_lines(self, payload: Mapping[str, object]) -> Iterator[str]:
+    def _stream_chat_completion_lines(
+        self,
+        payload: Mapping[str, object],
+        min_request_interval_seconds: float,
+    ) -> Iterator[str]:
+        self._log_request_payload(payload, stream=True)
+        request_model = str(payload.get("model") or self.model_name)
         for attempt in range(1, self._rate_limit_max_attempts + 1):
+            self._wait_for_request_slot(request_model, min_request_interval_seconds)
             should_retry = False
             with self._get_client().stream("POST", "/chat/completions", json=payload) as response:
                 if response.status_code == RATE_LIMIT_STATUS_CODE:
@@ -237,29 +302,37 @@ class OpenAiCompatibleLanguageModel(LanguageModel):
                     self._raise_for_status(response)
                     yield from response.iter_lines()
                     return
-            self._wait_before_rate_limit_retry(attempt)
+            self._wait_before_rate_limit_retry(attempt, request_model)
         raise AssertionError("rate-limit retry loop must return a response")
 
     def _should_retry_rate_limit(self, response: httpx.Response, attempt: int) -> bool:
         return response.status_code == RATE_LIMIT_STATUS_CODE and attempt < self._rate_limit_max_attempts
 
-    def _wait_before_rate_limit_retry(self, attempt: int) -> None:
+    def _wait_before_rate_limit_retry(self, attempt: int, request_model: str) -> None:
         logger.info(
             "Online LLM：请求被限流，等待重试 provider=%s model=%s attempt=%d/%d retry_in_seconds=%g",
             self.provider.value,
-            self.model_name,
+            request_model,
             attempt,
             self._rate_limit_max_attempts,
             self._rate_limit_retry_seconds,
         )
         sleep(self._rate_limit_retry_seconds)
 
+    def _request_interval_seconds(self, options: CompletionOptions) -> float:
+        if options.min_request_interval_seconds is not None:
+            return options.min_request_interval_seconds
+        return self._min_request_interval_seconds
+
+    def _wait_for_request_slot(self, request_model: str, interval_seconds: float) -> None:
+        self._request_rate_limiter.wait(self.provider, request_model, interval_seconds)
+
     def _payload(self, messages: Sequence[ChatMessage], options: CompletionOptions, *, stream: bool) -> dict[str, object]:
         if options.temperature > self._max_temperature:
             raise LlmConfigurationError(f"{self._provider_label} temperature must be between 0 and {self._max_temperature:g}")
         payload: dict[str, object] = {
-            "model": self._model,
-            "messages": [{"role": item.role.value, "content": item.content} for item in messages],
+            "model": options.model or self._model,
+            "messages": [self._message_payload(item) for item in messages],
             "max_tokens": options.max_tokens,
             "stream": stream,
         }
@@ -269,17 +342,31 @@ class OpenAiCompatibleLanguageModel(LanguageModel):
             payload["reasoning_effort"] = self._reasoning_effort
         if stream and self._stream_include_usage:
             payload["stream_options"] = {"include_usage": True}
+        if options.tools:
+            payload["tools"] = [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": tool.name,
+                        "description": tool.description,
+                        "parameters": dict(tool.parameters),
+                    },
+                }
+                for tool in options.tools
+            ]
+            payload["tool_choice"] = options.tool_choice
         response_format = options.response_format
         if response_format.type == ResponseFormatType.JSON_OBJECT:
             payload["response_format"] = {"type": "json_object"}
         elif response_format.type == ResponseFormatType.JSON_SCHEMA:
-            if self._strict_json_schema:
+            if self._strict_json_schema and response_format.strict:
+                schema = self._json_schema_for_provider(response_format.json_schema or {})
                 payload["response_format"] = {
                     "type": "json_schema",
                     "json_schema": {
                         "name": "response",
                         "strict": response_format.strict,
-                        "schema": response_format.json_schema,
+                        "schema": schema,
                     },
                 }
             else:
@@ -294,6 +381,11 @@ class OpenAiCompatibleLanguageModel(LanguageModel):
                 message_list.insert(0, {"role": "system", "content": schema_instruction})
         return payload
 
+    def _json_schema_for_provider(self, schema: Mapping[str, object]) -> Mapping[str, object]:
+        """Translate standard JSON Schema into the provider dialect when needed."""
+
+        return schema
+
     def _raise_for_status(self, response: httpx.Response) -> None:
         try:
             response.raise_for_status()
@@ -305,6 +397,51 @@ class OpenAiCompatibleLanguageModel(LanguageModel):
                 body = f"<response body unavailable: {type(body_error).__name__}>"
             raise LlmResponseError(f"{self._provider_label} API returned HTTP {response.status_code}: {body}") from error
 
+    def _log_request_payload(self, payload: Mapping[str, object], *, stream: bool) -> None:
+        """Log request shape for provider debugging without exposing full prompt data."""
+
+        logger.info(
+            "Online LLM：请求体摘要 provider=%s model=%s stream=%s payload=%s",
+            self.provider.value,
+            str(payload.get("model") or self.model_name),
+            str(stream).lower(),
+            json.dumps(
+                self._truncated_for_log(payload, string_limit=REQUEST_LOG_STRING_LIMIT),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+        )
+
+    def _log_response_payload(self, payload: Mapping[str, object], *, stream: bool) -> None:
+        """Log provider response fields while bounding every string value."""
+
+        logger.info(
+            "Online LLM：响应体摘要 provider=%s model=%s stream=%s payload=%s",
+            self.provider.value,
+            str(payload.get("model") or self.model_name),
+            str(stream).lower(),
+            json.dumps(
+                self._truncated_for_log(payload, string_limit=RESPONSE_LOG_STRING_LIMIT),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+        )
+
+    @classmethod
+    def _truncated_for_log(cls, value: object, *, string_limit: int) -> object:
+        if isinstance(value, Mapping):
+            mapping = cast(Mapping[object, object], value)
+            return {
+                str(key): cls._truncated_for_log(item, string_limit=string_limit)
+                for key, item in mapping.items()
+            }
+        if isinstance(value, list | tuple):
+            sequence = cast(list[object] | tuple[object, ...], value)
+            return [cls._truncated_for_log(item, string_limit=string_limit) for item in sequence]
+        if isinstance(value, str) and len(value) > string_limit:
+            return f"{value[:string_limit]}…<truncated,len={len(value)}>"
+        return value
+
     def _json_mapping(self, response: httpx.Response) -> Mapping[str, object]:
         try:
             data = cast(object, response.json())
@@ -314,13 +451,95 @@ class OpenAiCompatibleLanguageModel(LanguageModel):
             raise LlmResponseError(f"{self._provider_label} returned a non-object response")
         return cast(Mapping[str, object], data)
 
-    def _message_text(self, data: Mapping[str, object]) -> tuple[str, str | None]:
+    def _message_content(self, data: Mapping[str, object]) -> tuple[str, tuple[ToolCall, ...], str | None]:
         choice = self._first_choice(data)
         message = self._mapping(choice.get("message"))
         text = message.get("content")
-        if not isinstance(text, str) or not text:
+        content = text if isinstance(text, str) else ""
+        tool_calls = self._parse_tool_calls(
+            message.get("tool_calls"),
+            fallback_thought_signature=self._thought_signature(message),
+        )
+        if not content and not tool_calls:
             raise LlmResponseError(f"{self._provider_label} returned an empty completion")
-        return text, self._optional_string(choice.get("finish_reason"))
+        return content, tool_calls, self._optional_string(choice.get("finish_reason"))
+
+    @classmethod
+    def _message_payload(cls, message: ChatMessage) -> dict[str, object]:
+        payload: dict[str, object] = {"role": message.role.value, "content": message.content}
+        if message.tool_calls:
+            payload["tool_calls"] = [
+                cls._tool_call_payload(call)
+                for call in message.tool_calls
+            ]
+        if message.tool_call_id is not None:
+            payload["tool_call_id"] = message.tool_call_id
+        if message.name is not None:
+            payload["name"] = message.name
+        return payload
+
+    def _parse_tool_calls(
+        self,
+        value: object,
+        *,
+        fallback_thought_signature: str | None = None,
+    ) -> tuple[ToolCall, ...]:
+        if not isinstance(value, list):
+            return ()
+        result: list[ToolCall] = []
+        for item in cast(list[object], value):
+            if not isinstance(item, Mapping):
+                raise LlmResponseError(f"{self._provider_label} returned an invalid tool call")
+            call = cast(Mapping[str, object], item)
+            function = self._mapping(call.get("function"))
+            call_id = call.get("id")
+            name = function.get("name")
+            raw_arguments = function.get("arguments")
+            if not isinstance(call_id, str) or not isinstance(name, str) or not isinstance(raw_arguments, str):
+                raise LlmResponseError(f"{self._provider_label} returned an incomplete tool call")
+            try:
+                arguments = cast(object, json.loads(raw_arguments))
+            except json.JSONDecodeError as error:
+                raise LlmResponseError(f"{self._provider_label} returned invalid tool call arguments") from error
+            if not isinstance(arguments, Mapping):
+                raise LlmResponseError(f"{self._provider_label} returned non-object tool call arguments")
+            # Gemini's OpenAI-compatible responses normally put the signature
+            # on the first tool call. Accept the message-level form too: it
+            # has appeared in compatibility responses and the signature still
+            # belongs to the first functionCall when replayed.
+            signature = self._thought_signature(call)
+            if not result and signature is None:
+                signature = fallback_thought_signature
+            result.append(
+                ToolCall(
+                    id=call_id,
+                    name=name,
+                    arguments=cast(Mapping[str, object], arguments),
+                    thought_signature=signature,
+                )
+            )
+        return tuple(result)
+
+    @staticmethod
+    def _tool_call_payload(call: ToolCall) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "id": call.id,
+            "type": "function",
+            "function": {
+                "name": call.name,
+                "arguments": json.dumps(call.arguments, ensure_ascii=False, separators=(",", ":")),
+            },
+        }
+        if call.thought_signature is not None:
+            payload["extra_content"] = {"google": {"thought_signature": call.thought_signature}}
+        return payload
+
+    @classmethod
+    def _thought_signature(cls, call: Mapping[str, object]) -> str | None:
+        extra_content = cls._mapping(call.get("extra_content"))
+        google = cls._mapping(extra_content.get("google"))
+        signature = google.get("thought_signature")
+        return signature if isinstance(signature, str) else None
 
     def _delta_text(self, data: Mapping[str, object]) -> tuple[str, str | None]:
         choice = self._first_choice(data)

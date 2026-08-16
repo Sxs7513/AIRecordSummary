@@ -32,3 +32,23 @@ export const restartGeneration = (
     body: JSON.stringify({ client_request_id: crypto.randomUUID(), mode }),
   },
 );
+
+export type AdjudicationItemDecision = {
+  item_id: string;
+  action: "accept_candidate" | "keep_original" | "unresolved";
+  candidate_id?: string;
+};
+
+export const submitAdjudicationDecision = (
+  conversationId: string,
+  generationRunId: string,
+  requestId: string,
+  decisions: AdjudicationItemDecision[],
+) => request<ConversationTurn>(
+  `/api/conversations/${encodeURIComponent(conversationId)}/generations/${encodeURIComponent(generationRunId)}/adjudication-decisions`,
+  {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ request_id: requestId, client_request_id: crypto.randomUUID(), decisions }),
+  },
+);

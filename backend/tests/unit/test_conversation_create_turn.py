@@ -9,7 +9,7 @@ from sqlalchemy import Engine
 
 from l2_core.auth.contracts import CurrentUser
 from l2_core.conversations.service import ConversationService
-from l2_core.generation.contracts import ContentBlock
+from l2_core.generation.contracts import TextBlock
 from l2_core.generation.service import GenerationService
 
 
@@ -78,7 +78,7 @@ def test_create_turn_reuses_existing_turn_with_three_queries() -> None:
     returned_user, returned_assistant, history = service.create_turn(
         user,
         conversation_id,
-        [ContentBlock(value="原问题")],
+        [TextBlock(value="原问题")],
         client_message_id,
         8,
     )
@@ -165,7 +165,7 @@ def test_create_initial_turn_reuses_client_creation_id() -> None:
     returned_conversation, returned_user, returned_assistant, history, created = service.create_initial_turn(
         user,
         client_creation_id,
-        [ContentBlock(value="原问题")],
+        [TextBlock(value="原问题")],
         client_message_id,
         8,
     )

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from time import perf_counter
@@ -13,8 +13,10 @@ from sqlalchemy import Engine, text
 from l1_foundation.settings import Settings
 from l1_foundation.worker import SyncWorkerClient
 from l2_core.audio_processing.worker_tasks import EmbeddingEncodeTaskResult, embedding_encode_command
+from l2_core.rag.adjudication.contracts import AdjudicationAgentState
 from l2_core.rag.checkpoint import render_evidence_text
 from l2_core.rag.contracts import Evidence, EvidenceChunk, EvidenceFacts, EvidenceRecording, ResolvedFilters
+from l2_core.rag.evidence_overlays import apply_evidence_overlays, render_correction_notices
 from l2_core.rag.normalization import normalize_search_text
 from l2_core.rag.observability import log_event
 from l2_core.rag.worker_tasks import RerankCandidateInput, RerankResult, rerank_command
@@ -47,7 +49,7 @@ class RagRetriever:
     def hydrate_checkpoint_state(self, state: dict[str, Any]) -> dict[str, Any]:
         """Restore omitted candidate/evidence text from the authoritative recording tables."""
 
-        hydrated = cast(dict[str, Any], {**state})
+        hydrated: dict[str, Any] = {**state}
         candidates = [dict(item) for item in cast(list[dict[str, Any]], state.get("retrieval_candidates", []))]
         chunk_ids = [str(item["chunk_id"]) for item in candidates if item.get("chunk_id") is not None]
         candidate_text: dict[str, str] = {}
@@ -69,15 +71,26 @@ class RagRetriever:
                 cast(list[dict[str, Any]], state.get(field, [])),
                 text_cache,
             )
-        strategy = state.get("strategy_result")
-        if isinstance(strategy, dict):
+        raw_strategy = state.get("strategy_result")
+        if isinstance(raw_strategy, dict):
+            strategy = cast(dict[str, Any], raw_strategy)
             hydrated_strategy = dict(strategy)
             evidence = self._hydrate_checkpoint_evidence(
                 cast(list[dict[str, Any]], strategy.get("evidence", [])),
                 text_cache,
             )
             hydrated_strategy["evidence"] = evidence
-            hydrated_strategy["answer_context"] = render_evidence_text([Evidence.model_validate(item) for item in evidence])
+            validated_evidence = [Evidence.model_validate(item) for item in evidence]
+            hydrated_strategy["answer_context"] = render_evidence_text(validated_evidence)
+            if strategy.get("corrected_answer_context") is not None:
+                raw_adjudication = state.get("adjudication_agent_state")
+                if raw_adjudication is None:
+                    raise ValueError("Corrected answer checkpoint is missing adjudication state")
+                adjudication = AdjudicationAgentState.model_validate(raw_adjudication)
+                corrected_evidence = apply_evidence_overlays(validated_evidence, adjudication.overlays)
+                hydrated_strategy["corrected_answer_context"] = (
+                    f"{render_evidence_text(corrected_evidence)}\n\n{render_correction_notices(adjudication.overlays)}"
+                )
             hydrated["strategy_result"] = hydrated_strategy
         return hydrated
 
@@ -155,10 +168,15 @@ class RagRetriever:
         return self.resolve_recording_scope(filters, limit, rank)
 
     def generate_query_embedding(self, topic: str) -> list[float]:
-        result = self._worker_client.execute(embedding_encode_command([topic]), result_type=EmbeddingEncodeTaskResult)
-        if len(result.vectors) != 1:
+        return self.generate_query_embeddings([topic])[0]
+
+    def generate_query_embeddings(self, topics: Sequence[str]) -> list[list[float]]:
+        if not topics:
+            return []
+        result = self._worker_client.execute(embedding_encode_command(topics), result_type=EmbeddingEncodeTaskResult)
+        if len(result.vectors) != len(topics):
             raise RuntimeError("Embedding Worker returned an invalid query vector count")
-        return result.vectors[0]
+        return result.vectors
 
     def retrieve_vector_candidates(
         self,

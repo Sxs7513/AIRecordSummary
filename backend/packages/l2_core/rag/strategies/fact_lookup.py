@@ -6,6 +6,7 @@ from typing import Any, Literal, cast
 from langgraph.graph import END, START, StateGraph
 
 from l2_core.rag.contracts import RagGraphState
+from l2_core.rag.evidence_overlays import apply_evidence_overlays, render_correction_notices
 from l2_core.rag.execution_middleware import rag_execution_middleware
 from l2_core.rag.strategies.base import StrategyResult
 from l2_core.rag.workflows.chunk_evidence import ChunkEvidencePipeline
@@ -23,9 +24,10 @@ class FactLookupStrategy:
         *,
         expand_retrieval_terms: Node,
         grade: Node,
-        plan: Node,
-        validate_plan: Node,
-        select_planned_evidence: Node,
+        classify_query_correction_risk: Node,
+        adjudication_agent: Node,
+        apply_user_adjudication_decision: Node,
+        adjudication_enabled: bool,
         after_grade: Callable[[RagGraphState], str],
         transition: Callable[[RagGraphState, str, str, str], None],
         rerank_enabled: bool,
@@ -37,6 +39,15 @@ class FactLookupStrategy:
         self._transition = transition
         self._rerank_enabled = rerank_enabled
         builder = cast(Any, StateGraph(RagGraphState))
+        if adjudication_enabled:
+            builder.add_node(
+                "classify_query_correction_risk",
+                rag_execution_middleware.wrap_node(
+                    classify_query_correction_risk,
+                    graph_name=self.id,
+                    node_name="classify_query_correction_risk",
+                ),
+            )
         if query_term_expansion_enabled:
             builder.add_node(
                 "expand_retrieval_terms",
@@ -55,43 +66,54 @@ class FactLookupStrategy:
             rag_execution_middleware.wrap_node(grade, graph_name=self.id, node_name="grade"),
         )
         builder.add_node(
-            "plan",
-            rag_execution_middleware.wrap_node(plan, graph_name=self.id, node_name="plan"),
-        )
-        builder.add_node(
-            "validate_plan",
-            rag_execution_middleware.wrap_node(validate_plan, graph_name=self.id, node_name="validate_plan"),
-        )
-        builder.add_node(
-            "select_planned_evidence",
-            rag_execution_middleware.wrap_node(
-                select_planned_evidence,
-                graph_name=self.id,
-                node_name="select_planned_evidence",
-            ),
-        )
-        builder.add_node(
             "finalize",
             rag_execution_middleware.wrap_node(self._finalize, graph_name=self.id, node_name="finalize"),
         )
+        if adjudication_enabled:
+            builder.add_node(
+                "adjudication_agent",
+                rag_execution_middleware.wrap_node(
+                    adjudication_agent,
+                    graph_name=self.id,
+                    node_name="adjudication_agent",
+                ),
+            )
+            builder.add_node(
+                "apply_user_adjudication_decision",
+                rag_execution_middleware.wrap_node(
+                    apply_user_adjudication_decision,
+                    graph_name=self.id,
+                    node_name="apply_user_adjudication_decision",
+                ),
+            )
         if query_term_expansion_enabled:
-            builder.add_edge(START, "expand_retrieval_terms")
+            if adjudication_enabled:
+                builder.add_edge(START, "classify_query_correction_risk")
+                builder.add_edge("classify_query_correction_risk", "expand_retrieval_terms")
+            else:
+                builder.add_edge(START, "expand_retrieval_terms")
             builder.add_edge("expand_retrieval_terms", "chunk_evidence")
         else:
-            builder.add_edge(START, "chunk_evidence")
+            if adjudication_enabled:
+                builder.add_edge(START, "classify_query_correction_risk")
+                builder.add_edge("classify_query_correction_risk", "chunk_evidence")
+            else:
+                builder.add_edge(START, "chunk_evidence")
         builder.add_conditional_edges(
             "chunk_evidence",
             self._after_acquire,
             {"grade": "grade", "finalize": "finalize"},
         )
-        builder.add_conditional_edges(
-            "grade",
-            after_grade,
-            {"plan": "plan", "done": "finalize"},
-        )
-        builder.add_edge("plan", "validate_plan")
-        builder.add_edge("validate_plan", "select_planned_evidence")
-        builder.add_edge("select_planned_evidence", "finalize")
+        if adjudication_enabled:
+            builder.add_conditional_edges(
+                "grade",
+                after_grade,
+                {"adjudicate": "adjudication_agent", "finalize": "finalize"},
+            )
+            builder.add_edge("adjudication_agent", "apply_user_adjudication_decision")
+            builder.add_edge("apply_user_adjudication_decision", "finalize")
+        else:
+            builder.add_edge("grade", "finalize")
         builder.add_edge("finalize", END)
         self._graph: Any = builder.compile()
 
@@ -114,6 +136,8 @@ class FactLookupStrategy:
             "grade": result["grade"],
             "planning_required": result["planning_required"],
             "answer_plan": result["answer_plan"],
+            "query_correction_risk": result["query_correction_risk"],
+            "adjudication_agent_state": result["adjudication_agent_state"],
             "token_usage": max(0, result.get("token_usage", 0) - initial_tokens),
             "strategy_result": result["strategy_result"],
         }
@@ -141,14 +165,31 @@ class FactLookupStrategy:
         return target
 
     async def _finalize(self, state: RagGraphState) -> dict[str, object]:
-        answer_evidence = state["answer_evidence"] or (state["evidence"] if state["execution_mode"] == "retrieval" else [])
+        answer_evidence = state["answer_evidence"] or state["evidence"]
         grade = state["grade"]
         ready = bool(answer_evidence) and (state["execution_mode"] == "retrieval" or (grade is not None and grade.verdict != "abstain"))
+        answer_context = self._render_evidence(answer_evidence) if ready else ""
+        corrected_answer_context: str | None = None
+        sources = [item.source_payload() for item in answer_evidence]
+        adjudication = state["adjudication_agent_state"]
+        if ready and adjudication is not None and adjudication.overlays:
+            overlays_by_index: dict[int, list[dict[str, object]]] = {}
+            for overlay in adjudication.overlays:
+                overlays_by_index.setdefault(overlay.evidence_index, []).append(overlay.model_dump(mode="json"))
+            corrected_evidence = apply_evidence_overlays(answer_evidence, adjudication.overlays)
+            corrected_answer_context = (
+                f"{self._render_evidence(corrected_evidence)}\n\n{render_correction_notices(adjudication.overlays)}"
+            )
+            for source in sources:
+                index = source.get("index")
+                if isinstance(index, int) and index in overlays_by_index:
+                    source["adjudication"] = overlays_by_index[index]
         strategy_result = StrategyResult(
             status="ready" if ready else "not_found",
-            answer_context=self._render_evidence(answer_evidence) if ready else "",
+            answer_context=answer_context,
+            corrected_answer_context=corrected_answer_context,
             evidence=answer_evidence,
-            sources=[item.source_payload() for item in answer_evidence],
+            sources=sources,
             message=state["message"] or (grade.reason if grade is not None and grade.verdict == "abstain" else None),
         )
         return {

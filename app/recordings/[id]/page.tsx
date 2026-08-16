@@ -46,7 +46,7 @@ export default async function RecordingDetailPage({
   searchParams
 }: {
   params: Promise<{ id: string }>;
-  searchParams: Promise<{ t?: string; end?: string }>;
+  searchParams: Promise<{ t?: string; end?: string; highlight?: string }>;
 }) {
   const { id } = await params;
   const search = await searchParams;
@@ -64,6 +64,7 @@ export default async function RecordingDetailPage({
   const highlightRange = seekMs === null
     ? null
     : { startMs: seekMs, endMs: Math.max(seekMs, requestedEndMs ?? seekMs) };
+  const highlightText = search.highlight?.trim() || null;
   const speakers = Array.from(
     [...detail.speakerDiarizationSegments, ...detail.utteranceSegments, ...detail.transcriptionSegments]
       .reduce((byCluster, segment) => {
@@ -183,7 +184,7 @@ export default async function RecordingDetailPage({
       <details className="panel collapsible-panel" style={{ marginTop: 16 }} open>
         <summary>文字记录</summary>
         <div className="collapsible-body">
-          <UtteranceList segments={detail.utteranceSegments} tokens={detail.transcriptionTokens} speakerProfiles={detail.speakerProfiles} highlightRange={highlightRange} />
+          <UtteranceList segments={detail.utteranceSegments} tokens={detail.transcriptionTokens} speakerProfiles={detail.speakerProfiles} highlightRange={highlightRange} highlightText={highlightText} />
         </div>
       </details>
 

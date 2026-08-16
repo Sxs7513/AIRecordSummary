@@ -1,5 +1,5 @@
-"""Durable, resumable streaming infrastructure shared by all LLM generations."""
+"""Durable, resumable streaming infrastructure shared by all LLM generations.
 
-from l2_core.generation.service import GenerationService
-
-__all__ = ["GenerationService"]
+Import concrete contracts and services from their defining modules so importing a
+lightweight contract never initializes the service dependency graph.
+"""

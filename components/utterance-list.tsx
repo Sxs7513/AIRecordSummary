@@ -30,12 +30,28 @@ function timedTokenAt(tokens: TranscriptionToken[], currentMs: number): Transcri
   return null;
 }
 
-function tokenContent(text: string, active: boolean) {
-  return Array.from(text).map((character, index) => (
-    /[\p{P}\s]/u.test(character)
-      ? <Fragment key={index}>{character}</Fragment>
-      : <span className={active ? "token-character active" : "token-character"} key={index}>{character}</span>
-  ));
+function highlightOffsets(text: string, phrase: string | null): Set<number> {
+  if (!phrase) return new Set();
+  const characters = Array.from(text);
+  const phraseCharacters = Array.from(phrase);
+  const offsets = new Set<number>();
+  if (phraseCharacters.length === 0 || phraseCharacters.length > characters.length) return offsets;
+  for (let index = 0; index <= characters.length - phraseCharacters.length; index += 1) {
+    if (!phraseCharacters.every((character, phraseIndex) => characters[index + phraseIndex] === character)) continue;
+    for (let phraseIndex = 0; phraseIndex < phraseCharacters.length; phraseIndex += 1) offsets.add(index + phraseIndex);
+  }
+  return offsets;
+}
+
+function tokenContent(text: string, active: boolean, highlightedOffsets: Set<number>, offset: number) {
+  return Array.from(text).map((character, index) => {
+    const highlighted = highlightedOffsets.has(offset + index);
+    if (/[\p{P}\s]/u.test(character)) {
+      return highlighted ? <mark className="expression-highlight" key={index}>{character}</mark> : <Fragment key={index}>{character}</Fragment>;
+    }
+    const className = ["token-character", active ? "active" : "", highlighted ? "expression-highlight" : ""].filter(Boolean).join(" ");
+    return <span className={className} key={index}>{character}</span>;
+  });
 }
 
 function tokenOverlapMs(token: TranscriptionToken, segment: UtteranceSegment): number {
@@ -74,14 +90,19 @@ function assignTokensToSegments(segments: UtteranceSegment[], tokens: Transcript
   return assigned;
 }
 
-export function UtteranceList({ segments, tokens = [], speakerProfiles, highlightRange }: { segments: UtteranceSegment[]; tokens?: TranscriptionToken[]; speakerProfiles: SpeakerProfile[]; highlightRange: HighlightRange | null }) {
+export function UtteranceList({ segments, tokens = [], speakerProfiles, highlightRange, highlightText = null }: { segments: UtteranceSegment[]; tokens?: TranscriptionToken[]; speakerProfiles: SpeakerProfile[]; highlightRange: HighlightRange | null; highlightText?: string | null }) {
   const [activeTokenId, setActiveTokenId] = useState<string | null>(null);
   const sortedTokens = useMemo(() => [...tokens].sort((left, right) => left.startMs - right.startMs || left.endMs - right.endMs), [tokens]);
   const tokensBySegmentId = useMemo(() => assignTokensToSegments(segments, sortedTokens), [segments, sortedTokens]);
+  const expressionFound = useMemo(() => Boolean(highlightText) && segments.some((segment) => {
+    const inRange = highlightRange === null || (segment.startMs <= highlightRange.endMs && segment.endMs >= highlightRange.startMs);
+    return inRange && highlightOffsets(segment.text, highlightText).size > 0;
+  }), [highlightRange, highlightText, segments]);
 
   useEffect(() => {
+    document.querySelector(".expression-highlight")?.scrollIntoView({ block: "center", behavior: "smooth" });
     document.querySelector(".segment.highlight")?.scrollIntoView({ block: "center", behavior: "smooth" });
-  }, [highlightRange?.startMs, highlightRange?.endMs]);
+  }, [highlightRange?.startMs, highlightRange?.endMs, highlightText]);
 
   useEffect(() => {
     const updateActiveToken = (event: Event) => {
@@ -101,9 +122,11 @@ export function UtteranceList({ segments, tokens = [], speakerProfiles, highligh
         const highlighted = highlightRange !== null
           && segment.startMs <= highlightRange.endMs
           && segment.endMs >= highlightRange.startMs;
+        const expressionOffsets = highlighted ? highlightOffsets(segment.text, highlightText) : new Set<number>();
+        const showRangeHighlight = highlighted && (!highlightText || !expressionFound);
         return (
           <article
-            className={`segment utterance-segment ${segment.isTargetPerson ? "target" : ""} ${highlighted ? "highlight" : ""}`}
+            className={`segment utterance-segment ${segment.isTargetPerson ? "target" : ""} ${showRangeHighlight ? "highlight" : ""}`}
             id={`utterance-${segment.id}`}
             key={segment.id}
           >
@@ -123,8 +146,12 @@ export function UtteranceList({ segments, tokens = [], speakerProfiles, highligh
             <div>{(() => {
               const segmentTokens = tokensBySegmentId.get(segment.id) ?? [];
               const reconstructedText = segmentTokens.map((token) => token.text).join("");
-              return segmentTokens.length > 0 && reconstructedText === segment.text
-                ? segmentTokens.map((token) => (
+              if (segmentTokens.length > 0 && reconstructedText === segment.text) {
+                let offset = 0;
+                return segmentTokens.map((token) => {
+                  const tokenOffset = offset;
+                  offset += Array.from(token.text).length;
+                  return (
                     <button
                       key={token.id}
                       type="button"
@@ -135,10 +162,12 @@ export function UtteranceList({ segments, tokens = [], speakerProfiles, highligh
                         );
                       }}
                     >
-                      {tokenContent(token.text, token.id === activeTokenId)}
+                      {tokenContent(token.text, token.id === activeTokenId, expressionOffsets, tokenOffset)}
                     </button>
-                  ))
-                : segment.text;
+                  );
+                });
+              }
+              return tokenContent(segment.text, false, expressionOffsets, 0);
             })()}</div>
           </article>
         );

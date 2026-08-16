@@ -55,6 +55,10 @@ class _Conversations:
     def sync_generation(self, generation_run_id: UUID) -> None:
         self.synced.append(generation_run_id)
 
+    def mark_streaming(self, generation_run_id: UUID) -> None:
+        del generation_run_id
+        return
+
 
 def test_generation_cancel_handler_marks_generation_and_propagates_compute_scope() -> None:
     generation_id = uuid4()

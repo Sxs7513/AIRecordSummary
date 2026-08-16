@@ -19,6 +19,7 @@ import type {
   ObservabilityStatus
 } from "@/app/sdk/observability/types";
 import { MarkdownContent } from "@/components/markdown-content";
+import { selectContentBlocksText } from "@/app/sdk/generation/selectors";
 
 const number = new Intl.NumberFormat("zh-CN");
 
@@ -254,7 +255,7 @@ export function RagObservabilityDashboard() {
             {conversationSnapshot ? (
               <div className="observability-conversation-messages">
                 {conversationSnapshot.messages.map((message) => {
-                  const text = message.content_blocks.map((block) => block.value).join("");
+                  const text = selectContentBlocksText(message.content_blocks);
                   return (
                     <article className={`chat-message ${message.role}`} key={message.id}>
                       <div className="message-bubble">

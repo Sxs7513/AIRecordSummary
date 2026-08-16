@@ -18,7 +18,7 @@ from l1_foundation.llm.contracts import (
     ProviderCapabilities,
     ResponseFormatType,
 )
-from l1_foundation.llm.errors import LlmResponseError
+from l1_foundation.llm.errors import LlmConfigurationError, LlmResponseError
 
 logger = logging.getLogger("llm")
 STOP_TOKENS = ["</s>", "<|im_end|>"]
@@ -78,7 +78,7 @@ class LocalLlamaLanguageModel(LanguageModel):
 
     def complete(self, messages: Sequence[ChatMessage], options: CompletionOptions) -> LlmCompletion:
         invoke_options = self._invoke_options(options, stream=False)
-        prompt = self._chat_prompt(messages)
+        prompt = self._chat_prompt(messages, options)
         try:
             response = self._load_model()(prompt, **invoke_options)
         except Exception:
@@ -104,7 +104,7 @@ class LocalLlamaLanguageModel(LanguageModel):
 
     def stream(self, messages: Sequence[ChatMessage], options: CompletionOptions) -> Iterator[LlmStreamEvent]:
         invoke_options = self._invoke_options(options, stream=True)
-        prompt = self._chat_prompt(messages)
+        prompt = self._chat_prompt(messages, options)
         prompt_tokens = self._token_count(prompt, add_bos=True)
         emitted = False
         try:
@@ -187,6 +187,8 @@ class LocalLlamaLanguageModel(LanguageModel):
             logger.info("Local LLM：模型已释放 model=%s", self.model_name)
 
     def _invoke_options(self, options: CompletionOptions, *, stream: bool) -> dict[str, object]:
+        if options.model is not None and options.model != self.model_name:
+            raise LlmConfigurationError("local LLM does not support per-request model overrides")
         values: dict[str, object] = {
             "max_tokens": options.max_tokens,
             "temperature": options.temperature,
@@ -257,11 +259,12 @@ class LocalLlamaLanguageModel(LanguageModel):
         except (ImportError, AttributeError) as error:
             raise RuntimeError("llama-cpp-python is required for the local LLM provider") from error
 
-    def _chat_prompt(self, messages: Sequence[ChatMessage]) -> str:
+    def _chat_prompt(self, messages: Sequence[ChatMessage], options: CompletionOptions) -> str:
         model = self._load_model()
         metadata_value = cast(object, getattr(model, "metadata", None))
         metadata: Mapping[str, object] = cast(Mapping[str, object], metadata_value) if isinstance(metadata_value, Mapping) else dict[str, object]()
         template: object | None = metadata.get("tokenizer.chat_template")
+        enable_thinking = options.enbale_thinking
         if isinstance(template, str) and template:
             try:
                 formatter_module = import_module("llama_cpp.llama_chat_format")
@@ -278,7 +281,7 @@ class LocalLlamaLanguageModel(LanguageModel):
                     stop_token_ids=[eos_token_id] if eos_token_id != -1 else None,
                 )
                 payload = [{"role": item.role.value, "content": item.content} for item in messages]
-                return str(formatter(messages=payload, enable_thinking=False).prompt)
+                return str(formatter(messages=payload, enable_thinking=enable_thinking).prompt)
             except Exception:
                 logger.info("Local LLM chat template unavailable; falling back to ChatML", exc_info=True)
         return "".join(f"<|im_start|>{message.role.value}\n{message.content.strip()}\n<|im_end|>\n" for message in messages) + "<|im_start|>assistant\n"

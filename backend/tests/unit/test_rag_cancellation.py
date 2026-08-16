@@ -8,7 +8,11 @@ from uuid import uuid4
 
 import pytest
 
-from l2_core.rag.checkpoint import RagCheckpointSession, RagCheckpointStore, _serialize_state_without_evidence_text
+from l2_core.rag.checkpoint import (
+    RagCheckpointSession,
+    RagCheckpointStore,
+    _serialize_state_without_evidence_text,  # pyright: ignore[reportPrivateUsage]
+)
 from l2_core.rag.contracts import Evidence, EvidenceChunk, EvidenceRecording, RagGraphState
 from l2_core.rag.execution_middleware import (
     RagExecutionCancelled,
@@ -126,6 +130,88 @@ def test_checkpoint_node_identity_includes_graph_name() -> None:
 
     assert calls == 1
     assert saved_nodes == ["first_graph-shared", "second_graph-shared"]
+
+
+def test_checkpoint_session_reruns_only_selected_completed_nodes() -> None:
+    source_generation_id = uuid4()
+    generation_id = uuid4()
+    cached = cast(RagGraphState, {"run_id": "old", "token_usage": 0, "message": "cached"})
+
+    class Store:
+        def load_all(self, _source_generation_id: object, _input_hash: str) -> list[tuple[str, str, object]]:
+            return [
+                ("2026-08-13T10:00:00+00:00", "graph-retrieve", cached),
+                ("2026-08-13T10:01:00+00:00", "graph-finalize", cached),
+            ]
+
+        def save(self, _generation_id: object, _node: str, _input_hash: str, _state: object) -> None:
+            pass
+
+    calls: list[str] = []
+
+    async def retrieve(_state: RagGraphState) -> dict[str, str]:
+        calls.append("retrieve")
+        return {"message": "retrieved"}
+
+    async def finalize(_state: RagGraphState) -> dict[str, str]:
+        calls.append("finalize")
+        return {"message": "finalized"}
+
+    session = RagCheckpointSession(
+        store=cast(RagCheckpointStore, Store()),
+        generation_id=generation_id,
+        source_generation_id=source_generation_id,
+        input_hash="input",
+        hydrate_state=lambda state: state,
+        rerun_nodes={"graph-finalize"},
+    )
+    restored = session.prepare()
+    assert restored is not None
+
+    with rag_checkpoint_scope(session):
+        assert asyncio.run(rag_execution_middleware.wrap_node(retrieve, graph_name="graph", node_name="retrieve")(restored)) == {}
+        assert asyncio.run(rag_execution_middleware.wrap_node(finalize, graph_name="graph", node_name="finalize")(restored)) == {
+            "message": "finalized"
+        }
+
+    assert calls == ["finalize"]
+
+
+def test_checkpoint_repeatable_node_can_run_multiple_agent_iterations() -> None:
+    generation_id = uuid4()
+    saved_nodes: list[str] = []
+
+    class Store:
+        def load_all(self, _source_generation_id: object, _input_hash: str) -> list[tuple[str, str, object]]:
+            return []
+
+        def save(self, _generation_id: object, node: str, _input_hash: str, _state: object) -> None:
+            saved_nodes.append(node)
+
+    calls = 0
+
+    async def inspect(_state: RagGraphState) -> dict[str, int]:
+        nonlocal calls
+        calls += 1
+        return {"token_usage": 1}
+
+    session = RagCheckpointSession(
+        store=cast(RagCheckpointStore, Store()),
+        generation_id=generation_id,
+        source_generation_id=None,
+        input_hash="input",
+        hydrate_state=lambda state: state,
+        repeatable_nodes={"graph-inspect"},
+    )
+    wrapped = rag_execution_middleware.wrap_node(inspect, graph_name="graph", node_name="inspect")
+    state = cast(RagGraphState, {"token_usage": 0})
+
+    with rag_checkpoint_scope(session):
+        assert asyncio.run(wrapped(state)) == {"token_usage": 1}
+        assert asyncio.run(wrapped(state)) == {"token_usage": 1}
+
+    assert calls == 2
+    assert saved_nodes == ["graph-inspect", "graph-inspect"]
 
 
 def test_checkpoint_state_omits_candidate_and_evidence_text() -> None:

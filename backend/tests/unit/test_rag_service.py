@@ -74,6 +74,10 @@ class _Retriever:
     def release(self) -> None:
         self.released = True
 
+    @staticmethod
+    def hydrate_checkpoint_state(state: dict[str, Any]) -> dict[str, Any]:
+        return state
+
 
 def test_token_budget_exceeded_is_returned_as_a_user_facing_generation_error() -> None:
     sink = _Sink()

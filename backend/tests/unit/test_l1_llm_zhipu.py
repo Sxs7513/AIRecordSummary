@@ -6,6 +6,7 @@ from typing import cast
 import httpx
 import pytest
 
+import l1_foundation.llm.openai_compatible as openai_compatible_module
 from l1_foundation.llm import (
     ChatMessage,
     ChatRole,
@@ -62,6 +63,28 @@ def test_zhipu_provider_supports_sse_streaming() -> None:
     assert events[-1].finish_reason == "stop"
 
 
+def test_zhipu_has_no_default_request_interval(monkeypatch: pytest.MonkeyPatch) -> None:
+    waits: list[float] = []
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "model": "glm-test",
+                "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+            },
+        )
+
+    monkeypatch.setattr(openai_compatible_module, "sleep", waits.append)
+    model = _model(httpx.MockTransport(handler))
+    messages = [ChatMessage(ChatRole.USER, "request")]
+
+    model.complete(messages, CompletionOptions(max_tokens=20))
+    model.complete(messages, CompletionOptions(max_tokens=20))
+
+    assert waits == []
+
+
 def test_zhipu_rejects_strict_json_schema() -> None:
     model = _model(httpx.MockTransport(lambda _request: httpx.Response(500)))
 
@@ -87,4 +110,3 @@ def _model(transport: httpx.MockTransport) -> ZhipuLanguageModel:
         headers={"Authorization": "Bearer test-key"},
     )
     return model
-

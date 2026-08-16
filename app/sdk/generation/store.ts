@@ -1,7 +1,7 @@
 "use client";
 
 import { create } from "zustand";
-import type { ContentBlock, ConnectionStatus, GenerationError, GenerationEvent, GenerationPhase, GenerationStatus, GenerationViewState } from "./types";
+import type { AggreMessageBlock, ContentBlock, ConnectionStatus, GenerationError, GenerationEvent, GenerationPhase, GenerationStatus, GenerationViewState, SubMessage } from "./types";
 
 type GenerationStore = {
   runs: Record<string, GenerationViewState>;
@@ -43,7 +43,11 @@ export function reduceGenerationEvent(current: GenerationViewState | undefined, 
     };
   }
   if (event.type === "content.delta") {
-    return { ...state, blocks: [...state.blocks, ...asBlocks(event.data.blocks)], lastSequence: event.seq };
+    return {
+      ...state,
+      blocks: mergeBlocks(state.blocks, asBlocks(event.data.blocks), event.data.operation === "replace" ? "replace" : "append"),
+      lastSequence: event.seq
+    };
   }
   if (event.type === "run.status") {
     return { ...state, status: asStatus(event.data.status), lastSequence: event.seq };
@@ -100,9 +104,65 @@ export const useGenerationStore = create<GenerationStore>((set) => ({
 
 function asBlocks(value: unknown): ContentBlock[] {
   if (!Array.isArray(value)) return [];
-  return value.filter((item): item is ContentBlock =>
-    typeof item === "object" && item !== null && (item as { type?: unknown }).type === "text" && typeof (item as { value?: unknown }).value === "string"
-  );
+  return value.filter((item): item is ContentBlock => {
+    if (typeof item !== "object" || item === null) return false;
+    const block = item as Record<string, unknown>;
+    if (block.type === "text") return typeof block.value === "string";
+    if (block.type === "AGGRE_MSG") {
+      return typeof block.id === "string"
+        && asRecord(block.sub_message) !== null
+        && asRecord(asRecord(block.sub_message)?.message_group) !== null
+        && Array.isArray(asRecord(block.sub_message)?.sub_message_list);
+    }
+    if (block.type !== "adjudication_confirmation") return false;
+    return typeof block.request_id === "string"
+      && typeof block.source_generation_id === "string"
+      && Array.isArray(block.items);
+  });
+}
+
+function mergeBlocks(current: ContentBlock[], incoming: ContentBlock[], operation: "append" | "replace"): ContentBlock[] {
+  let blocks = current;
+  for (const block of incoming) {
+    if (block.type !== "AGGRE_MSG") {
+      blocks = [...blocks, block];
+      continue;
+    }
+    const index = blocks.findIndex((item) => item.type === "AGGRE_MSG" && item.id === block.id);
+    if (index < 0) {
+      blocks = [...blocks, block];
+      continue;
+    }
+    const existing = blocks[index] as AggreMessageBlock;
+    const merged = mergeAggregateBlock(existing, block, operation);
+    blocks = blocks.map((item, itemIndex) => itemIndex === index ? merged : item);
+  }
+  return blocks;
+}
+
+function mergeAggregateBlock(current: AggreMessageBlock, patch: AggreMessageBlock, operation: "append" | "replace"): AggreMessageBlock {
+  const updates = new Map(patch.sub_message.sub_message_list.map((item) => [item.id, item]));
+  const merged: SubMessage[] = current.sub_message.sub_message_list.map((item) => {
+    const update = updates.get(item.id);
+    if (!update) return item;
+    if (operation === "replace") return update;
+    return {
+      ...item,
+      ...update,
+      blocks: [...item.blocks, ...update.blocks],
+      sources: update.sources.length > 0 ? update.sources : item.sources,
+    };
+  });
+  for (const update of patch.sub_message.sub_message_list) {
+    if (!merged.some((item) => item.id === update.id)) merged.push(update);
+  }
+  return {
+    ...current,
+    sub_message: {
+      message_group: patch.sub_message.message_group,
+      sub_message_list: merged,
+    },
+  };
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {

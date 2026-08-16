@@ -161,14 +161,20 @@ class ChunkEvidencePipeline:
             protected_lexical_queries=sorted(protected_searches),
         )
 
-        async def vector_search(search_query: str) -> list[dict[str, object]]:
-            embedding = await asyncio.to_thread(self._retriever.generate_query_embedding, search_query)
+        async def vector_search(embedding: list[float]) -> list[dict[str, object]]:
             return await asyncio.to_thread(self._retriever.retrieve_vector_candidates, embedding, filters)
+
+        async def vector_searches() -> list[list[dict[str, object]] | BaseException]:
+            try:
+                embeddings = await asyncio.to_thread(self._retriever.generate_query_embeddings, vector_queries)
+            except Exception as error:
+                return [error for _ in vector_queries]
+            return await asyncio.gather(*(vector_search(item) for item in embeddings), return_exceptions=True)
 
         vector_started = started_at()
         lexical_started = started_at()
         vector_results, lexical_results = await asyncio.gather(
-            asyncio.gather(*(vector_search(item) for item in vector_queries), return_exceptions=True),
+            vector_searches(),
             asyncio.gather(
                 *(asyncio.to_thread(self._retriever.retrieve_lexical_candidates, item, filters) for item in lexical_searches),
                 return_exceptions=True,

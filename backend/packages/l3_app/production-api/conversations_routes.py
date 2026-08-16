@@ -8,9 +8,9 @@ from uuid import UUID
 from fastapi import APIRouter, Header, HTTPException, Query, Request, Response, status
 from fastapi.responses import StreamingResponse
 from generations_routes import (
-    _resume_after,
-    _snapshot_event,
-    _stream_events,
+    _resume_after,  # pyright: ignore[reportPrivateUsage]
+    _snapshot_event,  # pyright: ignore[reportPrivateUsage]
+    _stream_events,  # pyright: ignore[reportPrivateUsage]
     encode_sse,
 )
 from pydantic import BaseModel, Field
@@ -20,6 +20,7 @@ from l2_core.access.conversations import ConversationAccessDeniedError
 from l2_core.conversations.contracts import Conversation, ConversationBusyError, ConversationMessage, ConversationMessagePage, ConversationNotFoundError
 from l2_core.generation.contracts import GenerationEvent, GenerationSnapshot, TextBlock
 from l2_core.generation.service import GenerationService
+from l2_core.rag.adjudication.contracts import ClaimConfirmationDecision
 from l2_core.rag.queue import GenerationCommandPublisher, RagGenerationWorkItem
 from l2_core.rag.service import RagService
 from production_dependencies import (
@@ -55,6 +56,10 @@ class ConversationTurnResponse(BaseModel):
     user_message: ConversationMessage
     assistant_message: ConversationMessage
     generation_run_id: UUID
+
+
+class AdjudicationDecisionRequest(ClaimConfirmationDecision):
+    pass
 
 
 def _rag_service(request: Request) -> RagService:
@@ -228,6 +233,63 @@ async def resume_conversation_generation(
                     history=history,
                     conversation_message_id=assistant_message.id,
                     resume_from_generation_id=generation_run_id if payload.mode == "resume" else None,
+                    generation=command,
+                )
+            )
+        except Exception as error:
+            service.fail_generation_submission(assistant_message.generation_run_id, str(error) or type(error).__name__)
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Generation queue unavailable") from error
+        return ConversationTurnResponse(
+            user_message=user_message,
+            assistant_message=assistant_message,
+            generation_run_id=assistant_message.generation_run_id,
+        )
+    except ConversationAccessDeniedError as error:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Conversation access denied") from error
+    except ConversationNotFoundError as error:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation generation not found") from error
+    except ValueError as error:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
+
+
+@router.post(
+    "/{conversation_id}/generations/{generation_run_id}/adjudication-decisions",
+    response_model=ConversationTurnResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def submit_adjudication_decision(
+    conversation_id: UUID,
+    generation_run_id: UUID,
+    payload: AdjudicationDecisionRequest,
+    request: Request,
+    service: ConversationServiceDependency,
+    user: CurrentUserDependency,
+) -> ConversationTurnResponse:
+    try:
+        decision = ClaimConfirmationDecision.model_validate(payload.model_dump())
+        user_message, assistant_message, history = service.submit_adjudication_decision(
+            user,
+            conversation_id,
+            generation_run_id,
+            decision,
+        )
+        if assistant_message.generation_run_id is None:
+            raise RuntimeError("Assistant message is missing its adjudication generation run")
+        command = service.generation_command(assistant_message.generation_run_id)
+        query = str(command.input["query"])
+        limit = int(command.input.get("limit", 10))
+        try:
+            await _generation_publisher(request).submit_rag(
+                RagGenerationWorkItem(
+                    run_id=assistant_message.generation_run_id,
+                    workspace_id=user.current_workspace_id,
+                    query=query,
+                    limit=limit,
+                    scope_recording_ids=_rag_service(request).accessible_recording_ids(user),
+                    history=history,
+                    conversation_message_id=assistant_message.id,
+                    resume_from_generation_id=generation_run_id,
+                    adjudication_user_decision=decision,
                     generation=command,
                 )
             )

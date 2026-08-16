@@ -12,6 +12,7 @@ from l2_core.audio_processing.stages.summary.regeneration import RecordingSummar
 from l2_core.generation.contracts import CreateGenerationCommand, GenerationSnapshot, GenerationStatus
 from l2_core.generation.service import GenerationService
 from l2_core.generation.store import GenerationEventStore
+from l2_core.rag.adjudication.contracts import ClaimConfirmationDecision
 from l2_core.rag.contracts import RagHistoryMessage
 from l2_core.rag.queue import GenerationCancelWorkItem, RagGenerationWorkItem, SummaryGenerationWorkItem
 
@@ -35,6 +36,7 @@ class RagGenerationExecutor(Protocol):
         scope_recording_ids: list[UUID] | None = None,
         history: list[RagHistoryMessage] | None = None,
         resume_from_generation_id: UUID | None = None,
+        adjudication_user_decision: ClaimConfirmationDecision | None = None,
     ) -> None: ...
 
 
@@ -93,6 +95,7 @@ class GenerationCommandHandler:
                 item.scope_recording_ids,
                 item.history,
                 item.resume_from_generation_id,
+                item.adjudication_user_decision,
             )
 
     async def _handle_summary(self, event: EventEnvelope) -> None:

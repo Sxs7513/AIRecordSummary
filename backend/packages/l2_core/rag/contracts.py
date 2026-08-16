@@ -8,6 +8,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from l2_core.rag.adjudication.contracts import AdjudicationAgentState, ClaimConfirmationDecision
 from l2_core.rag.search_document import build_retrieval_text
 
 RouteStatus = Literal["resolved", "ambiguous", "unresolved"]
@@ -236,5 +237,8 @@ class RagGraphState(TypedDict):
     grade: EvidenceGrade | None
     planning_required: bool
     answer_plan: AnswerPlan | None
+    query_correction_risk: bool
+    adjudication_agent_state: AdjudicationAgentState | None
+    adjudication_user_decision: ClaimConfirmationDecision | None
     token_usage: Annotated[int, add]
     strategy_result: object | None

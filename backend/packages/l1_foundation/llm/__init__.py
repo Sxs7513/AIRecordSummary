@@ -9,6 +9,8 @@ from l1_foundation.llm.contracts import (
     ProviderCapabilities,
     ResponseFormat,
     ResponseFormatType,
+    ToolCall,
+    ToolDefinition,
 )
 from l1_foundation.llm.errors import LlmConfigurationError, LlmError, LlmResponseError, UnsupportedResponseFormatError
 from l1_foundation.llm.factory import create_language_model, create_language_model_from_settings
@@ -44,6 +46,8 @@ __all__ = [
     "ProviderCapabilities",
     "ResponseFormat",
     "ResponseFormatType",
+    "ToolCall",
+    "ToolDefinition",
     "UnsupportedResponseFormatError",
     "LlmGenerateInput",
     "LlmGenerateResult",

@@ -5,7 +5,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from inspect import signature
 from time import monotonic
-from typing import cast
+from typing import Literal, cast
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -19,6 +19,8 @@ from l1_foundation.llm.contracts import (
     LlmProvider,
     ResponseFormat,
     ResponseFormatType,
+    ToolCall,
+    ToolDefinition,
 )
 from l1_foundation.task_runtime.resources import ResourceQueue
 from l1_foundation.worker.contracts import ComputeCommand, WorkerExecutionContext
@@ -26,11 +28,39 @@ from l1_foundation.worker.contracts import ComputeCommand, WorkerExecutionContex
 logger = logging.getLogger("llm")
 
 
+def _worker_tool_calls() -> list[WorkerToolCall]:
+    return []
+
+
+def _worker_tool_definitions() -> list[WorkerToolDefinition]:
+    return []
+
+
+class WorkerToolCall(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    id: str
+    name: str
+    arguments: dict[str, object]
+    thought_signature: str | None = None
+
+
+class WorkerToolDefinition(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    name: str
+    description: str
+    parameters: dict[str, object]
+
+
 class WorkerChatMessage(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     role: ChatRole
-    content: str
+    content: str = ""
+    tool_calls: list[WorkerToolCall] = Field(default_factory=_worker_tool_calls)
+    tool_call_id: str | None = None
+    name: str | None = None
 
 
 class WorkerResponseFormat(BaseModel):
@@ -51,8 +81,12 @@ class WorkerCompletionOptions(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     max_tokens: int = Field(gt=0)
+    model: str | None = Field(default=None, min_length=1)
+    min_request_interval_seconds: float | None = Field(default=None, ge=0)
     temperature: float = Field(ge=0, le=2)
     response_format: WorkerResponseFormat
+    tools: list[WorkerToolDefinition] = Field(default_factory=_worker_tool_definitions)
+    tool_choice: Literal["auto", "required", "none"] = "auto"
 
 
 class LlmGenerateInput(BaseModel):
@@ -76,6 +110,7 @@ class LlmGenerateResult(BaseModel):
     prompt_tokens: int | None = Field(default=None, ge=0)
     completion_tokens: int | None = Field(default=None, ge=0)
     request_id: str | None = None
+    tool_calls: list[WorkerToolCall] = Field(default_factory=_worker_tool_calls)
 
 
 class LlmGenerateBatchItemInput(BaseModel):
@@ -132,15 +167,43 @@ def build_llm_generate_command(
         wait_for_subscriber=stream,
         input=LlmGenerateInput(
             provider=provider,
-            messages=[WorkerChatMessage(role=message.role, content=message.content) for message in messages],
+            messages=[
+                WorkerChatMessage(
+                    role=message.role,
+                    content=message.content,
+                    tool_calls=[
+                        WorkerToolCall(
+                            id=call.id,
+                            name=call.name,
+                            arguments=dict(call.arguments),
+                            thought_signature=call.thought_signature,
+                        )
+                        for call in message.tool_calls
+                    ],
+                    tool_call_id=message.tool_call_id,
+                    name=message.name,
+                )
+                for message in messages
+            ],
             options=WorkerCompletionOptions(
                 max_tokens=options.max_tokens,
+                model=options.model,
+                min_request_interval_seconds=options.min_request_interval_seconds,
                 temperature=options.temperature,
                 response_format=WorkerResponseFormat(
                     type=options.response_format.type,
                     json_schema=dict(schema) if isinstance(schema, Mapping) else None,
                     strict=options.response_format.strict,
                 ),
+                tools=[
+                    WorkerToolDefinition(
+                        name=tool.name,
+                        description=tool.description,
+                        parameters=dict(tool.parameters),
+                    )
+                    for tool in options.tools
+                ],
+                tool_choice=options.tool_choice,
             ),
             context_size=context_size,
             stream=stream,
@@ -212,9 +275,37 @@ class LlmWorkerHandler:
             str(value.stream).lower(),
         )
         try:
-            messages = [ChatMessage(role=message.role, content=message.content) for message in value.messages]
+            messages = [
+                ChatMessage(
+                    role=message.role,
+                    content=message.content,
+                    tool_calls=tuple(
+                        ToolCall(
+                            id=call.id,
+                            name=call.name,
+                            arguments=call.arguments,
+                            thought_signature=call.thought_signature,
+                        )
+                        for call in message.tool_calls
+                    ),
+                    tool_call_id=message.tool_call_id,
+                    name=message.name,
+                )
+                for message in value.messages
+            ]
             options = self._options(value)
-            result = self._stream(model, messages, options, context, emit_deltas=value.stream)
+            # Plain text uses the interruptible stream path even when callers
+            # do not surface deltas. Structured responses must honor
+            # stream=False: Gemini 3.1 rejects streamed JSON Schema requests.
+            use_stream = (
+                not options.tools
+                and (value.stream or options.response_format.type == ResponseFormatType.TEXT)
+            )
+            result = (
+                self._stream(model, messages, options, context, emit_deltas=value.stream)
+                if use_stream
+                else self._result(model.complete(messages, options))
+            )
         except Exception:
             logger.info(
                 "LLM Worker 请求失败 provider=%s model=%s stream=%s elapsed_ms=%d",
@@ -261,12 +352,19 @@ class LlmWorkerHandler:
         response_format = value.options.response_format
         return CompletionOptions(
             max_tokens=value.options.max_tokens,
+            model=value.options.model,
+            min_request_interval_seconds=value.options.min_request_interval_seconds,
             temperature=value.options.temperature,
             response_format=ResponseFormat(
                 type=response_format.type,
                 json_schema=response_format.json_schema,
                 strict=response_format.strict,
             ),
+            tools=tuple(
+                ToolDefinition(name=tool.name, description=tool.description, parameters=tool.parameters)
+                for tool in value.options.tools
+            ),
+            tool_choice=value.options.tool_choice,
         )
 
     @staticmethod
@@ -316,6 +414,15 @@ class LlmWorkerHandler:
             prompt_tokens=completion.prompt_tokens,
             completion_tokens=completion.completion_tokens,
             request_id=completion.request_id,
+            tool_calls=[
+                WorkerToolCall(
+                    id=call.id,
+                    name=call.name,
+                    arguments=dict(call.arguments),
+                    thought_signature=call.thought_signature,
+                )
+                for call in completion.tool_calls
+            ],
         )
 
 

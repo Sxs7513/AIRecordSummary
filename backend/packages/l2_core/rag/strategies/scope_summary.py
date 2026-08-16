@@ -24,12 +24,6 @@ class ScopeSummaryStrategy:
         node_started: Callable[[RagGraphState, str], float],
         node_completed: Callable[..., None],
         operation_completed: Callable[..., None],
-        decide_plan: Callable[[RagGraphState], object],
-        plan: Callable[[RagGraphState], object],
-        validate_plan: Callable[[RagGraphState], object],
-        select_direct_evidence: Callable[[RagGraphState], object],
-        select_planned_evidence: Callable[[RagGraphState], object],
-        after_plan_decision: Callable[[RagGraphState], str],
         render_evidence: Callable[[list[Evidence]], str],
     ) -> None:
         self._retriever = retriever
@@ -47,34 +41,6 @@ class ScopeSummaryStrategy:
             rag_execution_middleware.wrap_node(self._prepare, graph_name=self.id, node_name="prepare_scope"),
         )
         builder.add_node(
-            "decide_plan",
-            rag_execution_middleware.wrap_node(decide_plan, graph_name=self.id, node_name="decide_plan"),
-        )
-        builder.add_node(
-            "plan",
-            rag_execution_middleware.wrap_node(plan, graph_name=self.id, node_name="plan"),
-        )
-        builder.add_node(
-            "validate_plan",
-            rag_execution_middleware.wrap_node(validate_plan, graph_name=self.id, node_name="validate_plan"),
-        )
-        builder.add_node(
-            "select_direct_evidence",
-            rag_execution_middleware.wrap_node(
-                select_direct_evidence,
-                graph_name=self.id,
-                node_name="select_direct_evidence",
-            ),
-        )
-        builder.add_node(
-            "select_planned_evidence",
-            rag_execution_middleware.wrap_node(
-                select_planned_evidence,
-                graph_name=self.id,
-                node_name="select_planned_evidence",
-            ),
-        )
-        builder.add_node(
             "finalize",
             rag_execution_middleware.wrap_node(self._finalize, graph_name=self.id, node_name="finalize"),
         )
@@ -84,16 +50,7 @@ class ScopeSummaryStrategy:
             self._after_retrieve,
             {"prepare_scope": "prepare_scope", "finalize": "finalize"},
         )
-        builder.add_edge("prepare_scope", "decide_plan")
-        builder.add_conditional_edges(
-            "decide_plan",
-            after_plan_decision,
-            {"plan": "plan", "select_direct_evidence": "select_direct_evidence"},
-        )
-        builder.add_edge("plan", "validate_plan")
-        builder.add_edge("validate_plan", "select_planned_evidence")
-        builder.add_edge("select_direct_evidence", "finalize")
-        builder.add_edge("select_planned_evidence", "finalize")
+        builder.add_edge("prepare_scope", "finalize")
         builder.add_edge("finalize", END)
         self._graph: Any = builder.compile()
 

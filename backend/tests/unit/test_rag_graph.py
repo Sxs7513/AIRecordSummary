@@ -11,7 +11,7 @@ from uuid import uuid4
 import pytest
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 
-from l1_foundation.llm import LlmGenerateInput, LlmGenerateResult, LlmProvider
+from l1_foundation.llm import LlmGenerateInput, LlmGenerateResult, LlmProvider, ToolCall
 from l1_foundation.observability import (
     InstrumentedModelClient,
     ModelInvocationRecord,
@@ -21,6 +21,8 @@ from l1_foundation.observability import (
     observation_scope,
 )
 from l1_foundation.worker import ComputeCommand
+from l2_core.rag.adjudication.contracts import GroundedResearchFinding, GroundedSource
+from l2_core.rag.adjudication.web_research import GroundedSearchClient
 from l2_core.rag.contracts import (
     AnswerPlan,
     AnswerPlanItem,
@@ -48,13 +50,15 @@ from l2_core.rag.workflows.chunk_evidence import _retain_protected_evidence  # p
 class FakeModel:
     def __init__(self) -> None:
         self.json_schemas: list[Mapping[str, object] | None] = []
+        self.json_schema_strict: list[bool] = []
+        self.message_batches: list[list[str]] = []
         self.model_profiles: list[str] = []
         self.providers: list[LlmProvider] = []
+        self.tool_call_providers: list[LlmProvider] = []
         self._responses = iter(
             [
                 '{"status":"resolved","strategy":"chunk_search","inferred_filters":{}}',
                 '{"verdict":"direct_answer","reason":"enough"}',
-                '{"items":[{"statement":"存在交付风险","evidence_indexes":[1]}]}',
             ]
         )
 
@@ -64,10 +68,13 @@ class FakeModel:
         max_tokens: int,
         temperature: float = 0.0,
         json_schema: Mapping[str, object] | None = None,
-    ) -> str:
+    ) -> str | ToolCall:
         if not hasattr(self, "json_schemas"):
             self.json_schemas = []
         self.json_schemas.append(json_schema)
+        if not hasattr(self, "message_batches"):
+            self.message_batches = []
+        self.message_batches.append([str(message.content) for message in messages])
         return next(self._responses)
 
     async def _stream(self) -> AsyncIterator[str]:
@@ -76,7 +83,7 @@ class FakeModel:
     def stream(self, messages: Sequence[BaseMessage], max_tokens: int, temperature: float = 0.1) -> AsyncIterator[str]:
         return self._stream()
 
-    def set_responses(self, responses: Sequence[str]) -> None:
+    def set_responses(self, responses: Sequence[str | ToolCall]) -> None:
         self._responses = iter(responses)
 
 
@@ -98,13 +105,30 @@ class FakeWorkerClient:
         providers.append(value.provider)
         messages = [_base_message(message.role.value, message.content) for message in value.messages]
         options = value.options
-        text = await self._model.complete(
+        json_schema_strict = cast(list[bool] | None, getattr(self._model, "json_schema_strict", None))
+        if json_schema_strict is None:
+            json_schema_strict = []
+            self._model.json_schema_strict = json_schema_strict
+        json_schema_strict.append(options.response_format.strict)
+        if options.tools:
+            self._model.tool_call_providers.append(value.provider)
+        response = await self._model.complete(
             messages,
             max_tokens=options.max_tokens,
             temperature=options.temperature,
             json_schema=options.response_format.json_schema,
         )
-        return result_type.model_validate({"text": text, "provider": "gemini", "model": "gemini-test"})
+        if isinstance(response, ToolCall):
+            return result_type.model_validate(
+                {
+                    "text": "",
+                    "provider": "gemini",
+                    "model": "gemini-test",
+                    "finish_reason": "tool_calls",
+                    "tool_calls": [{"id": response.id, "name": response.name, "arguments": dict(response.arguments)}],
+                }
+            )
+        return result_type.model_validate({"text": response, "provider": "gemini", "model": "gemini-test"})
 
     async def execute_streaming(
         self,
@@ -137,6 +161,32 @@ def _base_message(role: str, content: str) -> BaseMessage:
     return HumanMessage(content)
 
 
+def _tool(name: str, arguments: dict[str, object], call_id: str = "call-1") -> ToolCall:
+    return ToolCall(id=call_id, name=name, arguments=arguments)
+
+
+def _audit_response(
+    expression: str,
+    *,
+    supporting: int | None = None,
+) -> str:
+    return json.dumps(
+        {
+            "items": [
+                {
+                    "id": "audit-1",
+                    "expression": expression,
+                    "context_quote": expression,
+                    "semantic_role": "影响技术含义的表达",
+                    "supporting_evidence_index": supporting,
+                    "reason": "需要逐项核验",
+                }
+            ]
+        },
+        ensure_ascii=False,
+    )
+
+
 def _graph(
     retriever: object,
     model: FakeModel,
@@ -145,6 +195,9 @@ def _graph(
     route_model_profile: Literal["default", "rag"] = "default",
     node_model_profile: Literal["default", "rag"] = "default",
     query_term_expansion_enabled: bool = False,
+    asr_adjudication_enabled: bool = False,
+    asr_adjudication_web_search_enabled: bool = False,
+    grounded_search_client: GroundedSearchClient | None = None,
 ) -> RagGraph:
     return RagGraph(
         cast(RagRetriever, retriever),
@@ -155,6 +208,9 @@ def _graph(
         route_model_profile=route_model_profile,
         node_model_profile=node_model_profile,
         query_term_expansion_enabled=query_term_expansion_enabled,
+        asr_adjudication_enabled=asr_adjudication_enabled,
+        asr_adjudication_web_search_enabled=asr_adjudication_web_search_enabled,
+        grounded_search_client=grounded_search_client,
     )
 
 
@@ -221,9 +277,7 @@ class MetadataRetriever(FakeRetriever):
 
 def test_query_term_expansion_keeps_the_original_question_and_only_adds_anchors() -> None:
     model = FakeModel()
-    model.set_responses(
-        ['{"content_query":"王总说 API v2 的上线时间定了吗？","terms":["王总","API v2"],"phrases":["上线时间"]}']
-    )
+    model.set_responses(['{"content_query":"王总说 API v2 的上线时间定了吗？","terms":["王总","API v2"],"phrases":["上线时间"]}'])
     graph = _graph(FakeRetriever(), model, query_term_expansion_enabled=True)
     state = RagGraph._initial_state(  # pyright: ignore[reportPrivateUsage]
         "test", "answer", "最近的录音里，王总说 API v2 的上线时间定了吗？", 10, [], None
@@ -270,17 +324,13 @@ def test_extracted_terms_are_each_sent_to_lexical_retrieval() -> None:
     class CapturingHybridRetriever:
         hybrid_search_enabled = True
 
-        def generate_query_embedding(self, _query: str) -> list[float]:
-            return [0.1]
+        def generate_query_embeddings(self, queries: list[str]) -> list[list[float]]:
+            return [[0.1] for _query in queries]
 
-        def retrieve_vector_candidates(
-            self, _embedding: list[float], _filters: ResolvedFilters
-        ) -> list[dict[str, object]]:
+        def retrieve_vector_candidates(self, _embedding: list[float], _filters: ResolvedFilters) -> list[dict[str, object]]:
             return []
 
-        def retrieve_lexical_candidates(
-            self, query: str, _filters: ResolvedFilters
-        ) -> list[dict[str, object]]:
+        def retrieve_lexical_candidates(self, query: str, _filters: ResolvedFilters) -> list[dict[str, object]]:
             lexical_queries.append(query)
             return []
 
@@ -306,6 +356,48 @@ def test_extracted_terms_are_each_sent_to_lexical_retrieval() -> None:
     assert set(lexical_queries) == {"最近是不是有个项目答辩的路演", "项目答辩", "路演"}
 
 
+def test_vector_queries_are_embedded_in_one_worker_batch() -> None:
+    recording_id = uuid4()
+    embedding_batches: list[list[str]] = []
+    searched_embeddings: list[list[float]] = []
+
+    class CapturingHybridRetriever:
+        hybrid_search_enabled = True
+
+        def generate_query_embeddings(self, queries: list[str]) -> list[list[float]]:
+            embedding_batches.append(queries)
+            return [[float(index)] for index, _query in enumerate(queries, start=1)]
+
+        def retrieve_vector_candidates(self, embedding: list[float], _filters: ResolvedFilters) -> list[dict[str, object]]:
+            searched_embeddings.append(embedding)
+            return []
+
+        def retrieve_lexical_candidates(self, _query: str, _filters: ResolvedFilters) -> list[dict[str, object]]:
+            return []
+
+        def fuse_candidate_lists(
+            self,
+            _vector_lists: list[list[dict[str, object]]],
+            _lexical_lists: list[list[dict[str, object]]],
+            _limit: int,
+        ) -> list[dict[str, object]]:
+            return []
+
+    graph = _graph(CapturingHybridRetriever(), FakeModel())
+    asyncio.run(
+        graph._retrieve_candidates(  # pyright: ignore[reportPrivateUsage]
+            "原始问题",
+            ResolvedFilters(recording_scope_resolved=True, recording_ids=[recording_id]),
+            10,
+            str(uuid4()),
+            expanded_query="扩展检索词",
+        )
+    )
+
+    assert embedding_batches == [["原始问题", "扩展检索词"]]
+    assert sorted(searched_embeddings) == [[1.0], [2.0]]
+
+
 def test_exact_lexical_term_hit_is_retained_when_rrf_drops_it() -> None:
     recording_id = uuid4()
     protected_chunk_id = uuid4()
@@ -313,17 +405,13 @@ def test_exact_lexical_term_hit_is_retained_when_rrf_drops_it() -> None:
     class ExactMatchRetriever:
         hybrid_search_enabled = True
 
-        def generate_query_embedding(self, _query: str) -> list[float]:
-            return [0.1]
+        def generate_query_embeddings(self, queries: list[str]) -> list[list[float]]:
+            return [[0.1] for _query in queries]
 
-        def retrieve_vector_candidates(
-            self, _embedding: list[float], _filters: ResolvedFilters
-        ) -> list[dict[str, object]]:
+        def retrieve_vector_candidates(self, _embedding: list[float], _filters: ResolvedFilters) -> list[dict[str, object]]:
             return []
 
-        def retrieve_lexical_candidates(
-            self, query: str, _filters: ResolvedFilters
-        ) -> list[dict[str, object]]:
+        def retrieve_lexical_candidates(self, query: str, _filters: ResolvedFilters) -> list[dict[str, object]]:
             if query != "路演":
                 return []
             return [
@@ -424,7 +512,7 @@ def test_langgraph_routes_retrieves_validates_and_streams_only_final_answer() ->
     deltas: list[str] = []
     phases: list[str] = []
 
-    answer, sources, not_enough_evidence, message = asyncio.run(
+    answer, sources, not_enough_evidence, message, _confirmation = asyncio.run(
         graph.run("交付风险是什么", 10, [uuid4()], lambda name, _label, _progress: phases.append(name), deltas.append)
     )
 
@@ -434,6 +522,7 @@ def test_langgraph_routes_retrieves_validates_and_streams_only_final_answer() ->
     assert not not_enough_evidence
     assert message is None
     assert model.json_schemas[0] == RagRoute.model_json_schema()
+    assert model.json_schema_strict == [True, True]
     recording = cast(dict[str, object], sources[0]["recording"])
     assert recording == {
         "id": str(recording["id"]),
@@ -442,7 +531,7 @@ def test_langgraph_routes_retrieves_validates_and_streams_only_final_answer() ->
         "location": None,
         "durationSeconds": None,
     }
-    assert len(model.json_schemas) == 3
+    assert len(model.json_schemas) == 2
     assert model.model_profiles and set(model.model_profiles) == {"default"}
 
 
@@ -452,7 +541,7 @@ def test_metadata_strategy_skips_chunk_retrieval_and_returns_recording_source() 
     model = FakeModel()
     model.set_responses(['{"status":"resolved","strategy_id":"metadata_lookup","inferred_filters":{}}'])
 
-    answer, sources, not_enough, message = asyncio.run(
+    answer, sources, not_enough, message, _confirmation = asyncio.run(
         _graph(retriever, model).run(
             "这条录音多长？",
             10,
@@ -529,9 +618,7 @@ def test_retrieval_run_hook_captures_independent_rerank_node() -> None:
     class RerankingRetriever(FakeRetriever):
         rerank_enabled = True
 
-        def rerank_evidence(
-            self, query: str, evidence: list[Evidence]
-        ) -> tuple[list[Evidence], RerankResult]:
+        def rerank_evidence(self, query: str, evidence: list[Evidence]) -> tuple[list[Evidence], RerankResult]:
             return evidence, RerankResult(
                 model_name="Qwen/Qwen3-Reranker-0.6B",
                 scores=[],
@@ -598,7 +685,7 @@ def test_local_non_route_rag_nodes_can_switch_back_to_rag_4b() -> None:
     assert model.model_profiles[1:] and set(model.model_profiles[1:]) == {"rag"}
 
 
-def test_planned_answer_prompt_and_sources_only_use_plan_selected_evidence() -> None:
+def test_direct_answer_prompt_keeps_all_evidence_while_final_sources_follow_citations() -> None:
     first_recording_id = uuid4()
     second_recording_id = uuid4()
 
@@ -629,14 +716,13 @@ def test_planned_answer_prompt_and_sources_only_use_plan_selected_evidence() -> 
                 ),
             ]
 
-    class SelectingPlanModel(FakeModel):
+    class DirectEvidenceModel(FakeModel):
         def __init__(self) -> None:
             self.answer_messages: Sequence[BaseMessage] = []
             self._responses = iter(
                 [
                     '{"status":"resolved","strategy":"chunk_search","inferred_filters":{}}',
                     '{"verdict":"direct_answer","reason":"enough"}',
-                    '{"items":[{"statement":"仅回答第二条","evidence_indexes":[2]}]}',
                 ]
             )
 
@@ -652,8 +738,8 @@ def test_planned_answer_prompt_and_sources_only_use_plan_selected_evidence() -> 
             self.answer_messages = messages
             return super().stream(messages, max_tokens, temperature)
 
-    model = SelectingPlanModel()
-    answer, sources, not_enough_evidence, message = asyncio.run(
+    model = DirectEvidenceModel()
+    answer, sources, not_enough_evidence, message, _confirmation = asyncio.run(
         _graph(TwoEvidenceRetriever(), model).run(
             "比较风险",
             10,
@@ -667,14 +753,15 @@ def test_planned_answer_prompt_and_sources_only_use_plan_selected_evidence() -> 
     assert answer == "交付风险是供应延期[1]。"
     assert not not_enough_evidence
     assert message is None
+    # Citation normalization still exposes only the source actually cited by the answer.
     assert len(sources) == 1
     assert sources[0]["index"] == 1
     assert cast(dict[str, object], sources[0]["recording"])["id"] == str(second_recording_id)
     assert "计划选择的独特内容" in answer_prompt_text
-    assert "未选择的独特内容" not in answer_prompt_text
+    assert "未选择的独特内容" in answer_prompt_text
 
 
-def test_structured_logs_cover_every_planned_graph_node_and_transition() -> None:
+def test_structured_logs_cover_the_direct_evidence_graph_path() -> None:
     run_id = uuid4()
     handler = JsonEventHandler()
     rag_logger = logging.getLogger("rag")
@@ -698,62 +785,40 @@ def test_structured_logs_cover_every_planned_graph_node_and_transition() -> None
 
     node_starts = [event["node"] for event in handler.events if event["event"] == "node_started"]
     node_completions = [event["node"] for event in handler.events if event["event"] == "node_completed"]
-    transitions = [
-        (event["source"], event["target"]) for event in handler.events if event["event"] == "graph_transition"
-    ]
+    transitions = [(event["source"], event["target"]) for event in handler.events if event["event"] == "graph_transition"]
 
     assert node_starts == [
         "route",
         "retrieve",
         "expand_context",
         "grade",
-        "plan",
-        "validate_plan",
-        "select_planned_evidence",
         "answer",
     ]
     assert node_completions == node_starts
-    completions_by_node = {
-        cast(str, event["node"]): event
-        for event in handler.events
-        if event["event"] == "node_completed"
-    }
+    completions_by_node = {cast(str, event["node"]): event for event in handler.events if event["event"] == "node_completed"}
     assert {node: event["model_execution"] for node, event in completions_by_node.items()} == {
         "route": "online",
         "retrieve": "local",
         "expand_context": "none",
         "grade": "local",
-        "plan": "local",
-        "validate_plan": "none",
-        "select_planned_evidence": "none",
         "answer": "online",
     }
     assert transitions == [
         ("route", "fact_lookup"),
         ("retrieve", "expand_context"),
         ("expand_context", "grade"),
-        ("grade", "plan"),
     ]
     assert all(event["run_id"] == str(run_id) for event in handler.events)
-    route_completed = next(
-        event for event in handler.events if event["event"] == "node_completed" and event["node"] == "route"
-    )
+    route_completed = next(event for event in handler.events if event["event"] == "node_completed" and event["node"] == "route")
     assert route_completed["query"] == "比较交付风险"
     assert '"strategy":"chunk_search"' in cast(str, route_completed["raw"])
     assert cast(dict[str, object], route_completed["resolved_filters"])["recording_scope_resolved"] is True
-    grade_completed = next(
-        event for event in handler.events if event["event"] == "node_completed" and event["node"] == "grade"
-    )
-    plan_completed = next(
-        event for event in handler.events if event["event"] == "node_completed" and event["node"] == "plan"
-    )
+    grade_completed = next(event for event in handler.events if event["event"] == "node_completed" and event["node"] == "grade")
     assert grade_completed["model_execution"] == "local"
     assert grade_completed["provider"] == "local"
     evidence_refs = cast(list[dict[str, str]], grade_completed["evidence_refs"])
     assert len(evidence_refs) == 1
     assert set(evidence_refs[0]) == {"recording_id", "chunk_id"}
-    assert plan_completed["model_execution"] == "local"
-    assert plan_completed["provider"] == "local"
     answer_mode = next(event for event in handler.events if event["event"] == "answer_mode_selected")
     answer_evidence = cast(list[dict[str, object]], answer_mode["answer_evidence_text"])
     assert answer_evidence[0]["index"] == 1
@@ -767,9 +832,7 @@ def test_enabled_rerank_executes_as_an_independent_langgraph_node() -> None:
     class RerankingRetriever(FakeRetriever):
         rerank_enabled = True
 
-        def rerank_evidence(
-            self, query: str, evidence: list[Evidence]
-        ) -> tuple[list[Evidence], RerankResult]:
+        def rerank_evidence(self, query: str, evidence: list[Evidence]) -> tuple[list[Evidence], RerankResult]:
             assert query == "交付风险是什么"
             return evidence, RerankResult(
                 model_name="Qwen/Qwen3-Reranker-0.6B",
@@ -785,6 +848,7 @@ def test_enabled_rerank_executes_as_an_independent_langgraph_node() -> None:
     rag_logger.setLevel(logging.INFO)
     rag_logger.addHandler(handler)
     try:
+
         async def scenario() -> None:
             with observation_scope(
                 cast(ObservabilityClient, telemetry),
@@ -805,17 +869,12 @@ def test_enabled_rerank_executes_as_an_independent_langgraph_node() -> None:
 
     node_starts = [event["node"] for event in handler.events if event["event"] == "node_started"]
     assert node_starts[:5] == ["route", "retrieve", "expand_context", "rerank", "grade"]
-    rerank_completed = next(
-        event for event in handler.events if event["event"] == "node_completed" and event["node"] == "rerank"
-    )
+    rerank_completed = next(event for event in handler.events if event["event"] == "node_completed" and event["node"] == "rerank")
     assert rerank_completed["input_tokens"] == 42
     reranked_evidence = cast(list[dict[str, object]], rerank_completed["reranked_evidence_text"])
     assert "text" not in reranked_evidence[0]
     assert {"recording_id", "chunk_id", "start_ms", "end_ms"} <= set(reranked_evidence[0])
-    assert any(
-        event["event"] == "graph_transition" and event["source"] == "rerank" and event["target"] == "grade"
-        for event in handler.events
-    )
+    assert any(event["event"] == "graph_transition" and event["source"] == "rerank" and event["target"] == "grade" for event in handler.events)
     assert [record.status for record in telemetry.model_invocations] == ["running", "succeeded"]
     terminal_invocation = telemetry.model_invocations[-1]
     assert terminal_invocation.operation == "rerank"
@@ -825,15 +884,468 @@ def test_enabled_rerank_executes_as_an_independent_langgraph_node() -> None:
     assert terminal_invocation.prompt_tokens == 42
     assert terminal_invocation.completion_tokens == 0
     assert terminal_invocation.usage_source == "local_tokenizer"
-    rerank_span = next(
-        record
-        for record in telemetry.spans
-        if record.operation == "rerank" and record.status == "succeeded"
-    )
+    rerank_span = next(record for record in telemetry.spans if record.operation == "rerank" and record.status == "succeeded")
     assert rerank_span.metadata["model_execution"] == "local"
 
 
-def test_grade_stays_local_while_plan_uses_online_provider_when_its_threshold_is_exceeded() -> None:
+def test_fact_lookup_adjudication_reviews_each_final_evidence_in_isolated_context(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="rag")
+    recording_id = uuid4()
+    first_chunk_id = uuid4()
+    second_chunk_id = uuid4()
+
+    class StableEvidenceRetriever(FakeRetriever):
+        def retrieve_chunks(self, topic: str, filters: object, limit: int, run_id: str = "standalone") -> list[Evidence]:
+            del topic, filters, limit, run_id
+            return [
+                Evidence(
+                    index=1,
+                    recording=EvidenceRecording(id=recording_id, title="接口评审", file_name="review.mp3"),
+                    chunk=EvidenceChunk(id=first_chunk_id, text="RF 的最大时延是 5 秒。", start_ms=1_000, end_ms=2_000),
+                    score=0.95,
+                    match_type="hybrid",
+                    url=f"/recordings/{recording_id}?t=1000",
+                ),
+                Evidence(
+                    index=2,
+                    recording=EvidenceRecording(id=recording_id, title="接口评审", file_name="review.mp3"),
+                    chunk=EvidenceChunk(id=second_chunk_id, text="上下文提到了时钟线、数据线和 ACK。", start_ms=2_000, end_ms=3_000),
+                    score=0.9,
+                    match_type="hybrid",
+                    url=f"/recordings/{recording_id}?t=2000",
+                ),
+            ]
+
+    model = FakeModel()
+    model.set_responses(
+        [
+            '{"status":"resolved","strategy":"chunk_search","inferred_filters":{}}',
+            '{"has_risk":true}',
+            '{"verdict":"direct_answer","reason":"enough"}',
+            _audit_response("RF 的最大时延是 5 秒"),
+            json.dumps(
+                {
+                    "proposals": [
+                        {
+                            "id": "proposal-1",
+                            "audit_item_id": "audit-1",
+                            "evidence_index": 1,
+                            "chunk_id": str(first_chunk_id),
+                            "original_expression": "RF 的最大时延是 5 秒",
+                            "proposed_expression": "I²C 的最大时延是 5 微秒",
+                            "expression_type": "compound",
+                            "search_query": "I2C maximum latency 5 microseconds",
+                            "reason": "上下文讨论总线信号",
+                            "supporting_evidence_index": 2,
+                        }
+                    ]
+                },
+                ensure_ascii=False,
+            ),
+            json.dumps(
+                {
+                    "decisions": [
+                        {
+                            "proposal_id": "proposal-1",
+                            "action": "accept",
+                            "confidence": 0.96,
+                            "candidate_score": 0.96,
+                            "reason": "上下文足以支持",
+                            "reconstruct_focus": "",
+                        }
+                    ]
+                },
+                ensure_ascii=False,
+            ),
+            '{"items":[]}',
+        ]
+    )
+
+    answer, sources, not_enough_evidence, _message, confirmation = asyncio.run(
+        _graph(StableEvidenceRetriever(), model, asr_adjudication_enabled=True).run(
+            "录音中 I²C 的最大时延是多少？",
+            10,
+            [recording_id],
+            lambda _name, _label, _progress: None,
+            lambda _delta: None,
+        )
+    )
+
+    assert answer
+    assert not not_enough_evidence
+    assert sources
+    assert confirmation is None
+    schema_titles = [schema.get("title") for schema in model.json_schemas if schema is not None]
+    assert "CorrectionRiskAssessment" in schema_titles
+    assert "ExpressionAudit" in schema_titles
+    assert "AdjudicationReview" in schema_titles
+    review_inputs = [
+        "\n".join(messages)
+        for schema, messages in zip(model.json_schemas, model.message_batches, strict=True)
+        if schema is not None and schema.get("title") == "AdjudicationReview"
+    ]
+    assert len(review_inputs) == 1
+    assert "RF 的最大时延是 5 秒" in review_inputs[0]
+    assert "时钟线、数据线和 ACK" in review_inputs[0]
+    assert 'Target Evidence：{"evidence_index":1' in review_inputs[0]
+    assert 'Reference Evidence：[{"evidence_index":2' in review_inputs[0]
+    assert '"supporting_evidence_index":2' in caplog.text
+    assert f'"chunk_id":"{second_chunk_id}"' in caplog.text
+
+
+def test_fact_lookup_adjudication_skips_review_when_query_gate_returns_none() -> None:
+    model = FakeModel()
+    model.set_responses(
+        [
+            '{"status":"resolved","strategy":"chunk_search","inferred_filters":{}}',
+            '{"has_risk":false}',
+            '{"verdict":"direct_answer","reason":"enough"}',
+        ]
+    )
+
+    answer, _sources, not_enough_evidence, _message, _confirmation = asyncio.run(
+        _graph(FakeRetriever(), model, asr_adjudication_enabled=True).run(
+            "交付风险是什么？",
+            10,
+            [uuid4()],
+            lambda _name, _label, _progress: None,
+            lambda _delta: None,
+        )
+    )
+
+    assert answer == "交付风险是供应延期[1]。"
+    assert not not_enough_evidence
+    schema_titles = [schema.get("title") for schema in model.json_schemas if schema is not None]
+    assert "CorrectionRiskAssessment" in schema_titles
+    assert "AdjudicationReview" not in schema_titles
+
+
+def test_active_adjudication_reconsiders_candidate_after_web_search_without_confirmation(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="rag")
+    recording_id = uuid4()
+    chunk_id = uuid4()
+
+    class StableRetriever(FakeRetriever):
+        def retrieve_chunks(self, topic: str, filters: object, limit: int, run_id: str = "standalone") -> list[Evidence]:
+            del topic, filters, limit, run_id
+            return [
+                Evidence(
+                    index=1,
+                    recording=EvidenceRecording(id=recording_id, title="接口评审", file_name="review.mp3"),
+                    chunk=EvidenceChunk(id=chunk_id, text="RF 的最大时延是 5 秒。", start_ms=1_000, end_ms=2_000),
+                    score=0.95,
+                    match_type="hybrid",
+                    url=f"/recordings/{recording_id}?t=1000",
+                )
+            ]
+
+    class SearchClient:
+        async def search(self, proposal_id: str, query: str) -> GroundedResearchFinding:
+            return GroundedResearchFinding(
+                proposal_id=proposal_id,
+                query=query,
+                summary="资料支持 I²C，但条件仍需确认。",
+                sources=[GroundedSource(title="Official", url="https://example.com/spec")],
+            )
+
+        async def close(self) -> None:
+            return None
+
+    model = FakeModel()
+    model.set_responses(
+        [
+            '{"status":"resolved","strategy":"chunk_search","inferred_filters":{}}',
+            '{"has_risk":true}',
+            '{"verdict":"direct_answer","reason":"enough"}',
+            _audit_response("RF 的最大时延是 5 秒"),
+            json.dumps(
+                {
+                    "proposals": [
+                        {
+                            "id": "proposal-1",
+                            "audit_item_id": "audit-1",
+                            "evidence_index": 1,
+                            "chunk_id": str(chunk_id),
+                            "original_expression": "RF 的最大时延是 5 秒",
+                            "proposed_expression": "I²C 的最大时延是 5 微秒",
+                            "expression_type": "compound",
+                            "search_query": "I2C maximum latency",
+                            "reason": "上下文指向总线协议",
+                        }
+                    ]
+                },
+                ensure_ascii=False,
+            ),
+            json.dumps(
+                {
+                    "decisions": [
+                        {
+                            "proposal_id": "proposal-1",
+                            "action": "web_search",
+                            "confidence": 0.6,
+                            "candidate_score": 0.7,
+                            "reason": "需要外部证据",
+                            "reconstruct_focus": "",
+                        }
+                    ]
+                },
+                ensure_ascii=False,
+            ),
+            json.dumps(
+                {
+                    "decisions": [
+                        {
+                            "proposal_id": "proposal-1",
+                            "action": "accept",
+                            "confidence": 0.95,
+                            "candidate_score": 0.95,
+                            "reason": "搜索结果与上下文共同支持",
+                            "reconstruct_focus": "",
+                        }
+                    ]
+                },
+                ensure_ascii=False,
+            ),
+        ]
+    )
+
+    answer, sources, not_enough, message, confirmation = asyncio.run(
+        _graph(
+            StableRetriever(),
+            model,
+            asr_adjudication_enabled=True,
+            asr_adjudication_web_search_enabled=True,
+            grounded_search_client=cast(GroundedSearchClient, SearchClient()),
+        ).run(
+            "I²C 的最大时延是多少？",
+            10,
+            [recording_id],
+            lambda _name, _label, _progress: None,
+            lambda _delta: None,
+            run_id=uuid4(),
+        )
+    )
+
+    assert answer
+    assert sources
+    assert not not_enough
+    assert message is None
+    assert confirmation is None
+    assert f'"recording_id":"{recording_id}"' in caplog.text
+    assert f'"chunk_id":"{chunk_id}"' in caplog.text
+    assert '"evidence_index":1' in caplog.text
+    assert '"original_expression":"RF 的最大时延是 5 秒"' in caplog.text
+    assert '"proposed_expression":"I²C 的最大时延是 5 微秒"' in caplog.text
+    assert '"context_quote":"RF 的最大时延是 5 秒"' in caplog.text
+    assert '"search_query":"I2C maximum latency"' in caplog.text
+    assert '"reason":"上下文指向总线协议"' in caplog.text
+    assert "query=I2C maximum latency" in caplog.text
+    assert f"recording_id={recording_id}" in caplog.text
+    assert f"chunk_id={chunk_id}" in caplog.text
+    assert "summary_preview=资料支持 I²C，但条件仍需确认。" in caplog.text
+    assert '"event":"adjudication_agent_started"' in caplog.text
+    assert '"event":"adjudication_agent_next_operation_selected"' in caplog.text
+    assert '"event":"adjudication_agent_operation_started"' in caplog.text
+    assert '"event":"adjudication_agent_operation_completed"' in caplog.text
+    assert '"operation":"audit"' in caplog.text
+    assert '"operation":"initial_reconstruct"' in caplog.text
+    assert '"operation":"candidate_actions"' in caplog.text
+    assert "Evidence Correct Agent Output" in caplog.text
+    assert "operation=candidate_decisions" in caplog.text
+    assert '"action":"web_search"' in caplog.text
+    assert '"action":"accept"' in caplog.text
+    assert '"event":"adjudication_agent_completed"' in caplog.text
+
+
+def test_active_adjudication_auto_overlay_is_disclosed_in_answer_context_and_source(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="rag")
+    recording_id = uuid4()
+    chunk_id = uuid4()
+    searched_queries: list[str] = []
+
+    class StableRetriever(FakeRetriever):
+        def retrieve_chunks(self, topic: str, filters: object, limit: int, run_id: str = "standalone") -> list[Evidence]:
+            del topic, filters, limit, run_id
+            return [
+                Evidence(
+                    index=1,
+                    recording=EvidenceRecording(id=recording_id, title="接口评审", file_name="review.mp3"),
+                    chunk=EvidenceChunk(id=chunk_id, text="RF 的最大时延是 5 秒。", start_ms=1_000, end_ms=2_000),
+                    score=0.95,
+                    match_type="hybrid",
+                    url=f"/recordings/{recording_id}?t=1000",
+                )
+            ]
+
+    class SearchClient:
+        async def search(self, proposal_id: str, query: str) -> GroundedResearchFinding:
+            searched_queries.append(query)
+            return GroundedResearchFinding(
+                proposal_id=proposal_id,
+                query=query,
+                summary="官方规范完整支持该表达。",
+                sources=[GroundedSource(title="Official", url="https://example.com/spec")],
+            )
+
+        async def close(self) -> None:
+            return None
+
+    class CapturingAnswerModel(FakeModel):
+        def __init__(self) -> None:
+            super().__init__()
+            self.answer_messages: Sequence[BaseMessage] = []
+            self.answer_message_batches: list[Sequence[BaseMessage]] = []
+
+        def stream(self, messages: Sequence[BaseMessage], max_tokens: int, temperature: float = 0.1) -> AsyncIterator[str]:
+            self.answer_messages = messages
+            self.answer_message_batches.append(messages)
+            return super().stream(messages, max_tokens, temperature)
+
+    class AggregateStream:
+        def __init__(self) -> None:
+            self.started = False
+            self.deltas: dict[str, list[str]] = {"original": [], "corrected": []}
+            self.completed: dict[str, tuple[str, list[dict[str, object]]]] = {}
+            self.failed: dict[str, str] = {}
+
+        def start_aggregate_message(self) -> None:
+            self.started = True
+
+        def aggregate_text(self, variant: str, value: str) -> None:
+            self.deltas[variant].append(value)
+
+        def complete_aggregate_variant(
+            self,
+            variant: str,
+            text: str,
+            sources: list[dict[str, object]],
+        ) -> None:
+            self.completed[variant] = (text, sources)
+
+        def fail_aggregate_variant(self, variant: str, error: str) -> None:
+            self.failed[variant] = error
+
+    model = CapturingAnswerModel()
+    model.set_responses(
+        [
+            '{"status":"resolved","strategy":"chunk_search","inferred_filters":{}}',
+            '{"has_risk":true}',
+            '{"verdict":"direct_answer","reason":"enough"}',
+            _audit_response("RF 的最大时延是 5 秒"),
+            json.dumps(
+                {
+                    "proposals": [
+                        {
+                            "id": "proposal-1",
+                            "audit_item_id": "audit-1",
+                            "evidence_index": 1,
+                            "chunk_id": str(chunk_id),
+                            "original_expression": "RF 的最大时延是 5 秒",
+                            "proposed_expression": "I²C 的最大时延是 5 微秒",
+                            "expression_type": "compound",
+                            "search_query": "I2C maximum latency",
+                            "reason": "上下文指向总线协议",
+                        }
+                    ]
+                },
+                ensure_ascii=False,
+            ),
+            json.dumps(
+                {
+                    "decisions": [
+                        {
+                            "proposal_id": "proposal-1",
+                            "action": "web_search",
+                            "confidence": 0.6,
+                            "candidate_score": 0.7,
+                            "reason": "需要外部证据",
+                            "reconstruct_focus": "",
+                        }
+                    ]
+                },
+                ensure_ascii=False,
+            ),
+            json.dumps(
+                {
+                    "decisions": [
+                        {
+                            "proposal_id": "proposal-1",
+                            "action": "accept",
+                            "confidence": 0.98,
+                            "candidate_score": 0.98,
+                            "reason": "检索结果高置信度支持",
+                            "reconstruct_focus": "",
+                        }
+                    ]
+                },
+                ensure_ascii=False,
+            ),
+        ]
+    )
+
+    aggregate_stream = AggregateStream()
+    answer, sources, not_enough, _message, confirmation = asyncio.run(
+        _graph(
+            StableRetriever(),
+            model,
+            asr_adjudication_enabled=True,
+            asr_adjudication_web_search_enabled=True,
+            grounded_search_client=cast(GroundedSearchClient, SearchClient()),
+        ).run(
+            "I²C 的最大时延是多少？",
+            10,
+            [recording_id],
+            lambda _name, _label, _progress: None,
+            lambda _delta: None,
+            run_id=uuid4(),
+            aggregate_stream=aggregate_stream,
+        )
+    )
+
+    assert answer
+    assert "将“RF 的最大时延是 5 秒”修正为“I²C 的最大时延是 5 微秒”" in answer
+    assert not not_enough
+    assert confirmation is None
+    assert searched_queries == ["I2C maximum latency"]
+    answer_inputs = ["\n".join(str(message.content) for message in batch) for batch in model.answer_message_batches]
+    answer_input = "\n".join(answer_inputs)
+    assert "将“RF 的最大时延是 5 秒”修正为“I²C 的最大时延是 5 微秒”" in answer_input
+    assert any("录音正文：\nRF 的最大时延是 5 秒。" in item for item in answer_inputs)
+    assert any("录音正文：\nI²C 的最大时延是 5 微秒。" in item for item in answer_inputs)
+    assert any("直接回答" in item and "I²C 的最大时延是 5 微秒" in item for item in answer_inputs)
+    assert "I²C 的最大时延是 5 微秒" in caplog.text
+    assert aggregate_stream.started
+    assert set(aggregate_stream.completed) == {"original", "corrected"}
+    assert not aggregate_stream.failed
+    assert aggregate_stream.deltas["original"]
+    assert aggregate_stream.deltas["corrected"]
+    assert "adjudication" not in aggregate_stream.completed["original"][1][0]
+    assert aggregate_stream.completed["corrected"][1][0]["adjudication"]
+    assert sources[0]["adjudication"]
+    assert sources[0]["adjudication"][0]["target_spans"] == [  # type: ignore[index]
+        {"start_char": 0, "end_char": len("RF 的最大时延是 5 秒")}
+    ]
+    providers_by_schema = {
+        str(schema.get("title")): provider for schema, provider in zip(model.json_schemas, model.providers, strict=False) if schema is not None
+    }
+    assert providers_by_schema["CorrectionRiskAssessment"] == LlmProvider.GEMINI
+    assert providers_by_schema["AdjudicationReview"] == LlmProvider.GEMINI
+    assert providers_by_schema["CandidateDecisionBatch"] == LlmProvider.GEMINI
+    schema_titles = [schema.get("title") for schema in model.json_schemas if schema is not None]
+    assert schema_titles.count("CorrectionRiskAssessment") == 1
+    assert schema_titles.count("ExpressionAudit") == 1
+    assert schema_titles.count("EvidenceGrade") == 1
+    assert schema_titles.count("AnswerPlan") == 0
+    assert not model.tool_call_providers
+
+
+def test_grade_stays_local_when_plan_is_disabled() -> None:
     handler = JsonEventHandler()
     rag_logger = logging.getLogger("rag")
     previous_level = rag_logger.level
@@ -853,18 +1365,12 @@ def test_grade_stays_local_while_plan_uses_online_provider_when_its_threshold_is
         rag_logger.removeHandler(handler)
         rag_logger.setLevel(previous_level)
 
-    completions = {
-        cast(str, event["node"]): event
-        for event in handler.events
-        if event["event"] == "node_completed" and event["node"] in {"grade", "plan"}
-    }
+    completions = {cast(str, event["node"]): event for event in handler.events if event["event"] == "node_completed" and event["node"] == "grade"}
     assert completions["grade"]["model_execution"] == "local"
     assert completions["grade"]["provider"] == "local"
-    assert completions["plan"]["model_execution"] == "online"
-    assert completions["plan"]["provider"] == "gemini"
 
 
-def test_simple_question_also_enters_answer_plan() -> None:
+def test_simple_question_skips_answer_plan() -> None:
     class DirectAnswerModel(FakeModel):
         def __init__(self) -> None:
             self.json_schemas: list[Mapping[str, object] | None] = []
@@ -872,14 +1378,13 @@ def test_simple_question_also_enters_answer_plan() -> None:
                 [
                     '{"status":"resolved","strategy":"chunk_search","inferred_filters":{}}',
                     '{"verdict":"direct_answer","reason":"enough"}',
-                    '{"items":[{"statement":"回答发布日期","evidence_indexes":[1]}]}',
                 ]
             )
 
     model = DirectAnswerModel()
     graph = _graph(FakeRetriever(), model)
 
-    answer, sources, not_enough_evidence, message = asyncio.run(
+    answer, sources, not_enough_evidence, message, _confirmation = asyncio.run(
         graph.run("发布日期是什么", 10, [uuid4()], lambda _name, _label, _progress: None, lambda _delta: None)
     )
 
@@ -887,7 +1392,7 @@ def test_simple_question_also_enters_answer_plan() -> None:
     assert len(sources) == 1
     assert not not_enough_evidence
     assert message is None
-    assert len(model.json_schemas) == 3
+    assert len(model.json_schemas) == 2
 
 
 def test_hybrid_retrieval_uses_lexical_candidates_when_vector_branch_fails() -> None:
@@ -897,7 +1402,7 @@ def test_hybrid_retrieval_uses_lexical_candidates_when_vector_branch_fails() -> 
     class DegradedHybridRetriever:
         hybrid_search_enabled = True
 
-        def generate_query_embedding(self, query: str) -> list[float]:
+        def generate_query_embeddings(self, queries: list[str]) -> list[list[float]]:
             raise RuntimeError("embedding unavailable")
 
         def retrieve_lexical_candidates(self, query: str, filters: ResolvedFilters) -> list[dict[str, object]]:
@@ -981,7 +1486,7 @@ def test_unresolved_route_stops_before_retrieval_and_returns_a_rephrase_message(
     graph = _graph(FakeRetriever(), UnresolvedRouteModel())
     phases: list[str] = []
 
-    answer, sources, not_enough_evidence, message = asyncio.run(
+    answer, sources, not_enough_evidence, message, _confirmation = asyncio.run(
         graph.run("嗯", 10, [], lambda name, _label, _progress: phases.append(name), lambda _delta: None)
     )
 
@@ -1020,15 +1525,18 @@ def test_route_does_not_validate_query_topic() -> None:
 def test_vague_scope_question_stays_unresolved_because_the_query_object_is_missing() -> None:
     class VagueScopeModel(FakeModel):
         def __init__(self) -> None:
-            self._responses = iter(
-                [
-                    '{"status":"unresolved","strategy":null,'
-                    '"inferred_filters":{},"error_code":"unresolved_query"}'
-                ]
-            )
+            self._responses = iter(['{"status":"unresolved","strategy":null,"inferred_filters":{},"error_code":"unresolved_query"}'])
 
     graph = _graph(FakeRetriever(), VagueScopeModel())
-    answer, sources, not_enough_evidence, message = asyncio.run(graph.run("讲了什么", 10, [], lambda _name, _label, _progress: None, lambda _delta: None))
+    answer, sources, not_enough_evidence, message, _confirmation = asyncio.run(
+        graph.run(
+            "讲了什么",
+            10,
+            [],
+            lambda _name, _label, _progress: None,
+            lambda _delta: None,
+        )
+    )
 
     assert answer == ROUTE_UNRESOLVED_MESSAGE
     assert sources == []
@@ -1066,7 +1574,7 @@ def test_ambiguous_recording_scope_stops_before_retrieval() -> None:
 
     graph = _graph(FakeRetriever(), AmbiguousRouteModel())
     phases: list[str] = []
-    answer, sources, not_enough_evidence, message = asyncio.run(
+    answer, sources, not_enough_evidence, message, _confirmation = asyncio.run(
         graph.run("最近的录音讲了什么", 10, [], lambda name, _label, _progress: phases.append(name), lambda _delta: None)
     )
 
@@ -1098,7 +1606,7 @@ def test_grade_contract_rejects_legacy_fields() -> None:
     assert "sufficient" not in EvidenceGrade.model_json_schema()["properties"]
 
 
-def test_qualified_answer_grade_enters_plan() -> None:
+def test_qualified_answer_grade_enters_adjudication_when_enabled() -> None:
     grade = EvidenceGrade(verdict="qualified_answer")
     state = cast(
         RagGraphState,
@@ -1109,7 +1617,7 @@ def test_qualified_answer_grade_enters_plan() -> None:
         },
     )
 
-    assert RagGraph._after_grade(state) == "plan"  # pyright: ignore[reportPrivateUsage]
+    assert RagGraph._after_grade(state) == "adjudicate"  # pyright: ignore[reportPrivateUsage]
 
 
 def test_abstain_grade_does_not_trigger_a_pointless_retrieval_retry() -> None:
@@ -1125,10 +1633,10 @@ def test_abstain_grade_does_not_trigger_a_pointless_retrieval_retry() -> None:
         },
     )
 
-    assert RagGraph._after_grade(state) == "done"  # pyright: ignore[reportPrivateUsage]
+    assert RagGraph._after_grade(state) == "finalize"  # pyright: ignore[reportPrivateUsage]
 
 
-def test_direct_answer_grade_enters_plan() -> None:
+def test_direct_answer_grade_enters_adjudication_when_enabled() -> None:
     state = cast(
         RagGraphState,
         {
@@ -1138,7 +1646,7 @@ def test_direct_answer_grade_enters_plan() -> None:
         },
     )
 
-    assert RagGraph._after_grade(state) == "plan"  # pyright: ignore[reportPrivateUsage]
+    assert RagGraph._after_grade(state) == "adjudicate"  # pyright: ignore[reportPrivateUsage]
 
 
 def test_multiple_scope_recordings_force_plan_even_when_grader_marks_direct() -> None:

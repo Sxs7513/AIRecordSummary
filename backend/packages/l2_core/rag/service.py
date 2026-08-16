@@ -13,8 +13,18 @@ from l1_foundation.streaming import SyncRedisStreamStore
 from l1_foundation.worker import SyncWorkerClient, WorkerClient
 from l2_core.access.recordings import RecordingAccessService
 from l2_core.auth.contracts import CurrentUser
-from l2_core.generation.contracts import CreateGenerationCommand, GenerationAccessScope, GenerationKind, GenerationPriority, GenerationSnapshot
+from l2_core.generation.contracts import (
+    AggreMessageBlock,
+    CreateGenerationCommand,
+    GenerationAccessScope,
+    GenerationKind,
+    GenerationPriority,
+    GenerationSnapshot,
+    TextBlock,
+)
 from l2_core.generation.service import GenerationService
+from l2_core.rag.adjudication.contracts import ClaimConfirmationDecision
+from l2_core.rag.adjudication.web_research import ChromeAiOverviewSearchClient, GeminiGroundedSearchClient, GroundedSearchClient
 from l2_core.rag.checkpoint import RagCheckpointSession, RagCheckpointStore, rag_input_hash
 from l2_core.rag.contracts import RagHistoryMessage
 from l2_core.rag.execution_middleware import RagExecutionCancelled, rag_cancellation_scope, rag_checkpoint_scope, throttled_cancellation_check
@@ -45,6 +55,7 @@ class RagService:
         self._retriever = RagRetriever(engine, settings, sync_worker_client)
         self._checkpoint_store = RagCheckpointStore(redis_store, settings.rag_checkpoint_ttl_seconds)
         self._access = RecordingAccessService(engine)
+        grounded_search_client = self._grounded_search_client(settings)
         self._graph = RagGraph(
             self._retriever,
             InstrumentedModelClient(worker_client),
@@ -55,6 +66,33 @@ class RagService:
             route_model_profile=settings.rag_route_model_profile,
             node_model_profile=settings.rag_node_model_profile,
             query_term_expansion_enabled=settings.rag_query_term_expansion_enabled,
+            asr_adjudication_enabled=settings.rag_asr_adjudication_enabled,
+            asr_adjudication_web_search_enabled=settings.rag_asr_adjudication_web_search_enabled,
+            asr_adjudication_auto_resolve_confidence=settings.rag_asr_adjudication_auto_resolve_confidence,
+            asr_adjudication_audit_prompt_variant=settings.rag_asr_adjudication_audit_prompt_variant,
+            asr_adjudication_audit_model=settings.rag_asr_adjudication_audit_model,
+            asr_adjudication_audit_min_request_interval_seconds=(
+                settings.rag_asr_adjudication_audit_min_request_interval_seconds
+            ),
+            grounded_search_client=grounded_search_client,
+        )
+
+    @staticmethod
+    def _grounded_search_client(settings: Settings) -> GroundedSearchClient | None:
+        if not settings.rag_asr_adjudication_enabled or not settings.rag_asr_adjudication_web_search_enabled:
+            return None
+        if settings.rag_asr_adjudication_search_provider == "chrome_ai_overview":
+            return ChromeAiOverviewSearchClient(
+                timeout_seconds=settings.rag_asr_adjudication_chrome_aio_timeout_seconds,
+                poll_interval_seconds=settings.rag_asr_adjudication_chrome_aio_poll_interval_seconds,
+            )
+        if not settings.gemini_api_key:
+            return None
+        return GeminiGroundedSearchClient(
+            api_key=settings.gemini_api_key,
+            model=settings.rag_asr_adjudication_search_model,
+            base_url=settings.gemini_native_base_url,
+            timeout_seconds=min(settings.gemini_timeout_seconds, 60.0),
         )
 
     def create_answer_generation(
@@ -85,6 +123,7 @@ class RagService:
         scope_recording_ids: list[UUID] | None = None,
         history: list[RagHistoryMessage] | None = None,
         resume_from_generation_id: UUID | None = None,
+        adjudication_user_decision: ClaimConfirmationDecision | None = None,
     ) -> None:
         workflow_started = started_at()
         log_event(
@@ -97,9 +136,15 @@ class RagService:
         )
         sink = generation_service.event_sink(run_id)
         existing_answer = None
+        existing_original_answer = None
         if resume_from_generation_id is not None:
             source = generation_service.get(resume_from_generation_id)
-            existing_answer = "".join(block.value for block in source.blocks) or None
+            existing_answer = "".join(block.value for block in source.blocks if isinstance(block, TextBlock)) or None
+            aggregate = next((block for block in source.blocks if isinstance(block, AggreMessageBlock)), None)
+            if aggregate is not None:
+                variants = {item.variant: "".join(block.value for block in item.blocks) for item in aggregate.sub_message.sub_message_list}
+                existing_answer = variants.get("corrected") or existing_answer
+                existing_original_answer = variants.get("original") or None
         try:
             sink.start()
             if sink.cancel_if_requested():
@@ -116,13 +161,26 @@ class RagService:
                     generation_id=run_id,
                     source_generation_id=resume_from_generation_id,
                     input_hash=rag_input_hash(query, limit, scope_recording_ids or []),
-                    hydrate_state=getattr(self._retriever, "hydrate_checkpoint_state", lambda state: state),
+                    hydrate_state=self._retriever.hydrate_checkpoint_state,
+                    rerun_nodes=(
+                        {
+                            "fact_lookup-apply_user_adjudication_decision",
+                            "fact_lookup-finalize",
+                            "root-strategy_fact_lookup",
+                        }
+                        if adjudication_user_decision is not None
+                        else set()
+                    ),
+                    repeatable_nodes={
+                        "fact_lookup-adjudication_agent_step",
+                        "fact_lookup-adjudication_execute_operation",
+                    },
                 )
                 restored_state = await asyncio.to_thread(checkpoint.prepare)
                 if resume_from_generation_id is not None:
                     await asyncio.to_thread(generation_service.delete_runtime_data, resume_from_generation_id)
                 with rag_cancellation_scope(cancellation_check), rag_checkpoint_scope(checkpoint):
-                    answer, sources, not_enough_evidence, message = await self._graph.run(
+                    answer, sources, not_enough_evidence, message, confirmation = await self._graph.run(
                         query=query,
                         limit=limit,
                         scope_recording_ids=scope_recording_ids or [],
@@ -131,18 +189,45 @@ class RagService:
                         history=history,
                         run_id=run_id,
                         existing_answer=existing_answer,
+                        existing_original_answer=existing_original_answer,
+                        aggregate_stream=sink,
                         restored_state=restored_state,
+                        adjudication_user_decision=adjudication_user_decision,
                     )
             if sink.cancel_if_requested():
                 log_event("generation_rag_cancelled", run_id, stage="after_graph")
                 log_event("workflow_completed", run_id, status="cancelled", stage="after_graph", elapsed_ms=elapsed_ms(workflow_started))
+                return
+            if confirmation is not None:
+                sink.block(confirmation)
+                sink.succeed(
+                    {
+                        "notEnoughEvidence": False,
+                        "message": None,
+                        "interaction": {
+                            "type": confirmation.type,
+                            "request_id": str(confirmation.request_id),
+                            "status": "pending",
+                        },
+                    },
+                    sources,
+                    preserve_checkpoints=True,
+                )
+                log_event(
+                    "workflow_completed",
+                    run_id,
+                    status="succeeded",
+                    interaction=confirmation.type,
+                    confirmation_items=len(confirmation.items),
+                    elapsed_ms=elapsed_ms(workflow_started),
+                )
                 return
             if not_enough_evidence:
                 sink.text(answer)
             sink.succeed(
                 {"notEnoughEvidence": not_enough_evidence, "message": message},
                 sources,
-                final_text=answer,
+                final_text=None if sink.has_aggregate_message else answer,
             )
             log_event(
                 "workflow_completed",

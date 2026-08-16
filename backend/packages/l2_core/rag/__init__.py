@@ -1,5 +1,5 @@
-"""LangChain and LangGraph based recording-library question answering."""
+"""LangChain and LangGraph based recording-library question answering.
 
-from l2_core.rag.service import RagService
-
-__all__ = ["RagService"]
+The package initializer intentionally has no eager service imports because RAG
+contracts are also referenced by generation content-block contracts.
+"""

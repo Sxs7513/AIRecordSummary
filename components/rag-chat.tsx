@@ -6,6 +6,7 @@ import { EvidenceList } from "./evidence-list";
 import type { SearchEvidence } from "@/app/shared/models";
 import { GenerationStreamClient } from "@/app/sdk/generation/client";
 import { useGenerationStore } from "@/app/sdk/generation/store";
+import { selectGenerationText } from "@/app/sdk/generation/selectors";
 
 function AnswerText({
   text,
@@ -55,7 +56,7 @@ export function RagChat() {
     if (runId) client.current?.close(runId);
   }, [runId]);
 
-  const answerText = run?.blocks.map((block) => block.value).join("") ?? "";
+  const answerText = selectGenerationText(run);
   const evidence = asEvidence(run?.sources);
   const loading = run?.status === "queued" || run?.status === "running" || (runId !== null && run === undefined);
 

@@ -121,6 +121,32 @@ Both providers implement streaming, non-streaming, JSON-object, and
 provider-adapted JSON-schema requests. Business output is always validated in
 L2 after generation.
 
+### Local Chrome AI Overview bridge
+
+ASR Evidence adjudication can reuse an already-running, visible macOS Chrome
+instead of calling Gemini Search Grounding:
+
+```text
+RAG_ASR_ADJUDICATION_ENABLED=true
+RAG_ASR_ADJUDICATION_WEB_SEARCH_ENABLED=true
+RAG_ASR_ADJUDICATION_AUDIT_PROMPT_VARIANT=relation_rules
+RAG_ASR_ADJUDICATION_SEARCH_PROVIDER=chrome_ai_overview
+RAG_ASR_ADJUDICATION_CHROME_AIO_TIMEOUT_SECONDS=45
+RAG_ASR_ADJUDICATION_CHROME_AIO_POLL_INTERVAL_SECONDS=1
+```
+
+`RAG_ASR_ADJUDICATION_AUDIT_PROMPT_VARIANT` accepts `relation_rules` (the default detailed relation audit) or
+`free_discovery` (a concise two-pass instruction that first discovers anomalies freely and then maps them to the
+same structured audit schema).
+
+Before starting the generation worker, open Chrome and enable **View >
+Developer > Allow JavaScript from Apple Events**. The bridge uses AppleScript
+to create or reuse one dedicated background Google Search tab. It preserves
+the currently active tab, waits until the largest `[data-streaming-container]`
+text is unchanged for three polls, and returns that text plus up to eight
+linked sources. It never launches or closes Chrome. This provider is currently
+macOS-only and serializes searches through the shared tab.
+
 ## Real-audio processing test
 
 The default test suite never loads audio models. To exercise a short local recording end to end, start the infrastructure and workers, then upload the recording through the API or UI:

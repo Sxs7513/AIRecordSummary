@@ -23,6 +23,7 @@ def create_language_model(
     gemini_model: str | None = None,
     gemini_base_url: str = "https://generativelanguage.googleapis.com/v1beta/openai",
     gemini_timeout_seconds: float = 300.0,
+    gemini_min_request_interval_seconds: float = 5.0,
 ) -> LanguageModel:
     if provider == LlmProvider.LOCAL:
         if local_model_path is None or local_context_size is None:
@@ -41,6 +42,7 @@ def create_language_model(
             model=gemini_model or "",
             base_url=gemini_base_url,
             timeout_seconds=gemini_timeout_seconds,
+            min_request_interval_seconds=gemini_min_request_interval_seconds,
         )
     raise ValueError(f"Unsupported LLM provider: {provider}")
 
@@ -68,4 +70,5 @@ def create_language_model_from_settings(
         gemini_model=settings.gemini_model,
         gemini_base_url=settings.gemini_base_url,
         gemini_timeout_seconds=settings.gemini_timeout_seconds,
+        gemini_min_request_interval_seconds=settings.gemini_min_request_interval_seconds,
     )

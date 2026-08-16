@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, cast
 from uuid import UUID, uuid4
 
 from l1_foundation.streaming import SyncRedisStreamStore
-from l2_core.generation.contracts import ContentBlock, CreateGenerationCommand, GenerationSnapshot, GenerationStatus
+from l2_core.generation.contracts import CreateGenerationCommand, GenerationSnapshot, GenerationStatus, parse_content_block
 
 GENERATION_TERMINAL_DELIVERY_TTL_SECONDS = 300
 
@@ -41,6 +41,7 @@ class GenerationRedisRuntime:
                 return active[0]
         now = datetime.now(UTC)
         resume_blocks = command.input.get("resume_content_blocks", [])
+        serialized_blocks = cast(list[object], resume_blocks) if isinstance(resume_blocks, list) else []
         snapshot = GenerationSnapshot(
             id=run_id or uuid4(),
             kind=command.kind,
@@ -48,7 +49,7 @@ class GenerationRedisRuntime:
             status=GenerationStatus.QUEUED,
             phase=None,
             progress_percent=None,
-            blocks=[ContentBlock.model_validate(item) for item in resume_blocks] if isinstance(resume_blocks, list) else [],
+            blocks=[parse_content_block(item) for item in serialized_blocks],
             output=None,
             last_sequence=0,
             cancel_requested=False,

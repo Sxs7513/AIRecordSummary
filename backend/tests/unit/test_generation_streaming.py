@@ -8,9 +8,22 @@ from generations_routes import encode_sse
 
 from l1_foundation.messaging import EventEnvelope
 from l2_core.audio_processing.stages.summary.stage import SafeTextStream
-from l2_core.generation.contracts import GenerationEvent, GenerationKind, GenerationPriority, GenerationSnapshot, GenerationStatus
+from l2_core.generation.contracts import (
+    AggreMessageBlock,
+    GenerationEvent,
+    GenerationKind,
+    GenerationPriority,
+    GenerationSnapshot,
+    GenerationStatus,
+    TextBlock,
+)
 from l2_core.generation.event_sink import GenerationEventSink
 from l2_core.generation.redis_runtime import GenerationRedisRuntime, redis_stream_sequence
+from l2_core.rag.adjudication.contracts import (
+    AdjudicationConfirmationBlock,
+    AdjudicationConfirmationCandidate,
+    AdjudicationConfirmationItem,
+)
 from l2_core.rag.queue import GenerationCancelWorkItem, GenerationCommandPublisher
 
 
@@ -99,12 +112,75 @@ def test_final_output_replaces_streamed_blocks_with_canonical_text() -> None:
     sink.flush()
     sink.succeed({"message": None}, [{"index": 1}], final_text="最终引用[1]")
 
-    assert [block.value for block in runtime.snapshot.blocks] == ["最终引用[1]"]
+    assert [block.value for block in runtime.snapshot.blocks if isinstance(block, TextBlock)] == ["最终引用[1]"]
     event_type, data = runtime.events[-1]
     assert event_type == "output.final"
     output = data["output"]
     assert isinstance(output, dict)
     assert output["content_blocks"] == [{"type": "text", "value": "最终引用[1]"}]
+
+
+def test_aggregate_message_streams_two_variants_and_persists_one_final_block() -> None:
+    run_id = uuid4()
+    runtime = _SinkRuntime(_snapshot(run_id))
+    sink = GenerationEventSink(run_id, runtime)  # type: ignore[arg-type]
+
+    sink.start_aggregate_message()
+    sink.aggregate_text("original", "原始回答")
+    sink.aggregate_text("corrected", "纠偏回答")
+    sink.flush()
+    sink.complete_aggregate_variant("original", "原始回答", [{"index": 1}])
+    sink.complete_aggregate_variant("corrected", "纠偏回答", [{"index": 2}])
+    sink.succeed({"message": None}, [{"index": 2}])
+
+    assert sink.has_aggregate_message
+    assert len(runtime.snapshot.blocks) == 1
+    aggregate = runtime.snapshot.blocks[0]
+    assert isinstance(aggregate, AggreMessageBlock)
+    by_variant = {item.variant: item for item in aggregate.sub_message.sub_message_list}
+    assert [block.value for block in by_variant["original"].blocks] == ["原始回答"]
+    assert [block.value for block in by_variant["corrected"].blocks] == ["纠偏回答"]
+    assert by_variant["original"].status == "completed"
+    assert by_variant["corrected"].status == "completed"
+    content_events = [data for event_type, data in runtime.events if event_type == "content.delta"]
+    assert [event["operation"] for event in content_events] == ["replace", "append", "append", "replace", "replace"]
+    assert runtime.events[-1][0] == "output.final"
+
+
+def test_confirmation_block_is_streamed_and_succeeds_while_preserving_checkpoints() -> None:
+    run_id = uuid4()
+    runtime = _SinkRuntime(_snapshot(run_id))
+    sink = GenerationEventSink(run_id, runtime)  # type: ignore[arg-type]
+    block = AdjudicationConfirmationBlock(
+        request_id=uuid4(),
+        source_generation_id=run_id,
+        items=[
+            AdjudicationConfirmationItem(
+                id="p1",
+                evidence_index=1,
+                recording_id=uuid4(),
+                chunk_id=uuid4(),
+                start_ms=1_000,
+                end_ms=2_000,
+                original_expression="RF",
+                candidates=[
+                    AdjudicationConfirmationCandidate(
+                        id="p1",
+                        expression="I²C",
+                        confidence=0.8,
+                    )
+                ],
+            )
+        ],
+    )
+
+    sink.block(block)
+    sink.succeed({"interaction": {"type": block.type}}, preserve_checkpoints=True)
+
+    assert runtime.snapshot.status == GenerationStatus.SUCCEEDED
+    assert runtime.snapshot.blocks == [block]
+    assert [event_type for event_type, _data in runtime.events] == ["content.delta", "output.final"]
+    assert runtime.preserve_checkpoints
 
 
 class _GenerationRedisStore:
@@ -126,6 +202,7 @@ class _SinkRuntime:
         self.snapshot = snapshot
         self.events: list[tuple[str, dict[str, object]]] = []
         self.expired = False
+        self.preserve_checkpoints = False
 
     def get_snapshot(self, _run_id: UUID) -> tuple[GenerationSnapshot, str]:
         return self.snapshot, f"{len(self.events)}-0"
@@ -145,8 +222,8 @@ class _SinkRuntime:
         return True
 
     def expire_terminal_generation(self, _run_id: UUID, *, preserve_checkpoints: bool = False) -> None:
-        del preserve_checkpoints
         self.expired = True
+        self.preserve_checkpoints = preserve_checkpoints
 
 
 def _snapshot(run_id: UUID) -> GenerationSnapshot:

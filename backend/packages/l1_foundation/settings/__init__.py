@@ -20,6 +20,8 @@ REPOSITORY_ROOT = _find_repository_root()
 ROOT_ENV_FILE = REPOSITORY_ROOT / ".env"
 ROOT_ENV_LOCAL_FILE = REPOSITORY_ROOT / ".env.local"
 LlmProviderName = Literal["local", "zhipu", "gemini"]
+RagAdjudicationSearchProvider = Literal["gemini", "chrome_ai_overview"]
+RagAdjudicationAuditPromptVariant = Literal["relation_rules", "free_discovery"]
 
 
 class Settings(BaseSettings):
@@ -185,9 +187,56 @@ class Settings(BaseSettings):
     rag_rerank_candidate_limit: int = Field(default=20, gt=0, le=200, validation_alias="RAG_RERANK_CANDIDATE_LIMIT")
     rag_rerank_max_total_tokens: int = Field(default=16_000, gt=0, validation_alias="RAG_RERANK_MAX_TOTAL_TOKENS")
     rag_rerank_inference_batch_size: int = Field(default=1, gt=0, le=32, validation_alias="RAG_RERANK_INFERENCE_BATCH_SIZE")
-    rag_rerank_output_limit: int = Field(default=8, gt=0, le=100, validation_alias="RAG_RERANK_OUTPUT_LIMIT")
+    rag_rerank_output_limit: int = Field(default=20, gt=0, le=100, validation_alias="RAG_RERANK_OUTPUT_LIMIT")
     rag_sql_statement_timeout_ms: int = Field(default=15_000, gt=0, validation_alias="RAG_SQL_STATEMENT_TIMEOUT_MS")
     rag_checkpoint_ttl_seconds: int = Field(default=604_800, gt=0, validation_alias="RAG_CHECKPOINT_TTL_SECONDS")
+    rag_asr_adjudication_enabled: bool = Field(default=False, validation_alias="RAG_ASR_ADJUDICATION_ENABLED")
+    rag_asr_adjudication_web_search_enabled: bool = Field(
+        default=False,
+        validation_alias="RAG_ASR_ADJUDICATION_WEB_SEARCH_ENABLED",
+    )
+    rag_asr_adjudication_auto_resolve_confidence: float = Field(
+        default=0.95,
+        ge=0,
+        le=1,
+        validation_alias="RAG_ASR_ADJUDICATION_AUTO_RESOLVE_CONFIDENCE",
+    )
+    rag_asr_adjudication_audit_prompt_variant: RagAdjudicationAuditPromptVariant = Field(
+        default="relation_rules",
+        validation_alias="RAG_ASR_ADJUDICATION_AUDIT_PROMPT_VARIANT",
+    )
+    rag_asr_adjudication_audit_model: str | None = Field(
+        default=None,
+        min_length=1,
+        validation_alias="RAG_ASR_ADJUDICATION_AUDIT_MODEL",
+    )
+    rag_asr_adjudication_audit_min_request_interval_seconds: float = Field(
+        default=15.0,
+        ge=0,
+        validation_alias="RAG_ASR_ADJUDICATION_AUDIT_MIN_REQUEST_INTERVAL_SECONDS",
+    )
+    rag_asr_adjudication_search_provider: RagAdjudicationSearchProvider = Field(
+        default="gemini",
+        validation_alias="RAG_ASR_ADJUDICATION_SEARCH_PROVIDER",
+    )
+    rag_asr_adjudication_search_model: str = Field(
+        default="gemini-2.5-flash-lite",
+        validation_alias="RAG_ASR_ADJUDICATION_SEARCH_MODEL",
+    )
+    gemini_native_base_url: str = Field(
+        default="https://generativelanguage.googleapis.com/v1beta",
+        validation_alias="GEMINI_NATIVE_BASE_URL",
+    )
+    rag_asr_adjudication_chrome_aio_timeout_seconds: float = Field(
+        default=45.0,
+        gt=0,
+        validation_alias="RAG_ASR_ADJUDICATION_CHROME_AIO_TIMEOUT_SECONDS",
+    )
+    rag_asr_adjudication_chrome_aio_poll_interval_seconds: float = Field(
+        default=1.0,
+        gt=0,
+        validation_alias="RAG_ASR_ADJUDICATION_CHROME_AIO_POLL_INTERVAL_SECONDS",
+    )
     rag_answer_provider: LlmProviderName = Field(
         default="gemini",
         validation_alias=AliasChoices("RAG_ANSWER_PROVIDER", "LLM_DEFAULT_PROVIDER"),
@@ -203,6 +252,11 @@ class Settings(BaseSettings):
         validation_alias="GEMINI_BASE_URL",
     )
     gemini_timeout_seconds: float = Field(default=300.0, gt=0, validation_alias="GEMINI_TIMEOUT_SECONDS")
+    gemini_min_request_interval_seconds: float = Field(
+        default=5.0,
+        ge=0,
+        validation_alias="GEMINI_MIN_REQUEST_INTERVAL_SECONDS",
+    )
     pyannote_auth_token: str | None = Field(default=None, validation_alias="PYANNOTE_AUTH_TOKEN")
     pyannote_model: str = Field(default="pyannote/speaker-diarization-3.1", validation_alias="PYANNOTE_MODEL")
     pyannote_use_local_config: bool = Field(default=True, validation_alias="PYANNOTE_USE_LOCAL_CONFIG")

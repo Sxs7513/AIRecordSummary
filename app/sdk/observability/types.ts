@@ -79,7 +79,7 @@ export type ObservabilityConversationMessage = {
   conversation_id: string;
   role: "user" | "assistant";
   sequence: number;
-  content_blocks: Array<{ type: "text"; value: string }>;
+  content_blocks: ContentBlock[];
   sources: Record<string, unknown>[];
   generation_run_id: string | null;
   status: string;
@@ -100,3 +100,4 @@ export type ObservabilityConversationSnapshot = {
   };
   messages: ObservabilityConversationMessage[];
 };
+import type { ContentBlock } from "@/app/sdk/generation/types";

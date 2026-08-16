@@ -6,6 +6,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from l1_foundation.messaging import KafkaEventProducer, Topics, new_event
 from l2_core.generation.contracts import CreateGenerationCommand
+from l2_core.rag.adjudication.contracts import ClaimConfirmationDecision
 from l2_core.rag.contracts import RagHistoryMessage
 
 
@@ -30,6 +31,7 @@ class RagGenerationWorkItem(BaseModel):
     history: list[RagHistoryMessage] = Field(default_factory=_history_list)
     conversation_message_id: UUID | None = None
     resume_from_generation_id: UUID | None = None
+    adjudication_user_decision: ClaimConfirmationDecision | None = None
     generation: CreateGenerationCommand
 
 
