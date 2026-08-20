@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 
 import { ragEvaluationRequest } from "@/app/sdk/rag-evaluation/client";
@@ -255,6 +256,10 @@ export function RagEvaluationWorkspace() {
         <div>
           <h1>RAG 检索评测</h1>
           <p className="subtle">用人工标注的正确 Chunk，对比 Vector、Lexical、RRF、Expand 和 Rerank 的真实效果。</p>
+          <nav className="rag-eval-tabs">
+            <Link className="active" href="/rag-evaluation">检索评测</Link>
+            <Link href="/rag-evaluation/adjudication">文本裁决评测</Link>
+          </nav>
         </div>
       </header>
 

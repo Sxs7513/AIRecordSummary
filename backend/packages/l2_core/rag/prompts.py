@@ -53,6 +53,7 @@ def route_prompt(query: str, conversation_history: str) -> tuple[ChatPromptTempl
                     "</strategy_rules>\n\n"
                     "<content_query_rules>\n"
                     "strategy_id 为 fact_lookup 时必须输出 content_query。content_query 用于录音正文检索和证据判断，"
+                    "可以根据可靠关联的 conversation_history 显式补全 current_query 中的指代和省略；这种补全不视为增加新事实。"
                     "只移除已经由本次 route 结果表达的录音集合范围条件，包括 time_range、recording_limit、recording_rank、"
                     "recording_ids，以及 inferred_filters 中用于选择录音的完整文件名、地点等条件；保留原问题的回答意图和正文事实命题。"
                     "不得机械删除所有时间、人名或地点：如果它们描述的是录音正文中的事件、动作、结论或待确认事实，而不是选择录音集合，必须保留。"
@@ -127,7 +128,8 @@ def grade_prompt(query: str, evidence_text: str) -> tuple[ChatPromptTemplate, di
                     "</role>\n\n"
                     "<decision>\n"
                     "先从最强证据子集出发，尝试构造一句具体、保守且不误导的候选回答，再选择 verdict：\n"
-                    "- direct_answer：全部决定性约束都有明确证据，无需猜测或保守限定。\n"
+                    "- direct_answer：全部决定性约束都有明确证据，无需猜测或保守限定。若证据直接陈述了问题所求的结论，"
+                    "即使同一录音片段还包含原因、背景或口语冗余，也必须选择此项；不得仅因内容来自录音转写而降为 qualified_answer。\n"
                     "- qualified_answer：能够给出有价值的保守回答，但只支持部分内容，或名称、性质、阶段、范围等仍需限定。\n"
                     "- abstain：无法构造任何具体、相关且不误导的回答；只有关键词或宽泛主题相关也属于此类。\n"
                     "</decision>\n\n"
@@ -190,7 +192,6 @@ def answer_plan_prompt(
     verdict: str = "direct_answer",
 ) -> tuple[ChatPromptTemplate, dict[str, str], PydanticOutputParser[AnswerPlan]]:
     parser = PydanticOutputParser(pydantic_object=AnswerPlan)
-    answer_policy = "证据需要解释才能回答；计划必须区分证据内容和基于证据的解释，不得把解释写成确定事实。" if verdict == "qualified_answer" else ""
     return (
         ChatPromptTemplate.from_messages(
             [
@@ -198,7 +199,6 @@ def answer_plan_prompt(
                     "system",
                     "证据评估已确认现有证据可以回答问题。你只负责制定回答计划，不要再次判断证据是否充分，也不要直接回答用户。"
                     "每个要点必须给出支持它的 evidence_indexes，只能引用证据中已有的编号；"
-                    "{answer_policy}"
                     "回答计划不得增加证据之外的事实。\n{format_instructions}",
                 ),
                 ("human", "问题：{query}\n\n证据：\n{evidence}"),
@@ -207,7 +207,6 @@ def answer_plan_prompt(
         {
             "query": query,
             "evidence": evidence_text,
-            "answer_policy": answer_policy,
             "format_instructions": parser.get_format_instructions(),
         },
         parser,
@@ -218,11 +217,15 @@ def answer_prompt(
     query: str,
     plan: str | None,
     evidence_text: str,
-    history: str,
     verdict: str | None = None,
     existing_answer: str | None = None,
 ) -> tuple[ChatPromptTemplate, dict[str, str]]:
-    answer_policy = "证据需要解释才能回答；必须明确区分证据内容和基于证据的解释，不得把解释写成确定事实。" if verdict == "qualified_answer" else ""
+    answer_style = (
+        "像熟悉录音内容的助手一样回答用户真正想知道的内容，措辞自然、简洁。"
+        "简单问题直接用一句话或一个短段落回答；只有问题包含多个要点或答案较复杂时才使用列表。"
+        "先给结论，再补充对回答有帮助的必要信息，不要复述问题。"
+        "不要说明答案如何得出，也不要使用“证据内容”“推测/分析”“回答计划”等内部标签。"
+    )
     citation_policy = (
         "每个可核实的事实性陈述后必须紧跟一个或多个引用标记，例如 [1] 或 [1][2]。"
         "引用编号只能使用证据中已有的编号，且必须支持其紧邻的陈述；不得创造编号或把引用集中堆在段落末尾。"
@@ -236,18 +239,17 @@ def answer_prompt(
                     (
                         "system",
                         "你是录音问答助手。仅依据给出的证据，以自然、清楚的中文直接回答。"
-                        "{answer_policy}"
+                        "{answer_style}"
                         "不要提及内部检索或模型推理；不要补充证据外的事实。"
                         "{citation_policy}{continuation_policy}",
                     ),
-                    ("human", "近期对话（仅用于理解追问）：\n{history}\n\n问题：{query}\n\n已有回答：\n{existing_answer}\n\n证据：\n{evidence}"),
+                    ("human", "问题：{query}\n\n已有回答：\n{existing_answer}\n\n证据：\n{evidence}"),
                 ]
             ),
             {
                 "query": query,
                 "evidence": evidence_text,
-                "history": history or "（无）",
-                "answer_policy": answer_policy,
+                "answer_style": answer_style,
                 "citation_policy": citation_policy,
                 "continuation_policy": continuation_policy,
                 "existing_answer": existing_answer or "（无）",
@@ -259,13 +261,13 @@ def answer_prompt(
                 (
                     "system",
                     "你是录音问答助手。仅依据给出的回答计划和证据，以自然、清楚的中文回答。"
-                    "{answer_policy}"
+                    "{answer_style}"
                     "不要提及内部检索、计划或模型推理；不要补充证据外的事实。"
                     "{citation_policy}{continuation_policy}",
                 ),
                 (
                     "human",
-                    "近期对话（仅用于理解追问）：\n{history}\n\n问题：{query}\n\n已有回答：\n{existing_answer}\n\n回答计划：\n{plan}\n\n证据：\n{evidence}",
+                    "问题：{query}\n\n已有回答：\n{existing_answer}\n\n回答计划：\n{plan}\n\n证据：\n{evidence}",
                 ),
             ]
         ),
@@ -273,8 +275,7 @@ def answer_prompt(
             "query": query,
             "plan": plan,
             "evidence": evidence_text,
-            "history": history or "（无）",
-            "answer_policy": answer_policy,
+            "answer_style": answer_style,
             "citation_policy": citation_policy,
             "continuation_policy": continuation_policy,
             "existing_answer": existing_answer or "（无）",

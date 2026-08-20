@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Iterator, Sequence
 from threading import Lock
 from time import monotonic, sleep
 from typing import cast
@@ -12,6 +12,8 @@ import httpx
 from l1_foundation.llm.contracts import (
     ChatMessage,
     CompletionOptions,
+    JsonObject,
+    JsonValue,
     LanguageModel,
     LlmCompletion,
     LlmProvider,
@@ -19,6 +21,7 @@ from l1_foundation.llm.contracts import (
     ProviderCapabilities,
     ResponseFormatType,
     ToolCall,
+    as_json_object,
 )
 from l1_foundation.llm.errors import LlmConfigurationError, LlmResponseError, UnsupportedResponseFormatError
 
@@ -195,9 +198,10 @@ class OpenAiCompatibleLanguageModel(LanguageModel):
                     data = cast(object, json.loads(value))
                 except json.JSONDecodeError as error:
                     raise LlmResponseError(f"{self._provider_label} returned an invalid SSE JSON event") from error
-                if not isinstance(data, Mapping):
-                    raise LlmResponseError(f"{self._provider_label} returned a non-object SSE event")
-                event = cast(Mapping[str, object], data)
+                try:
+                    event = as_json_object(data)
+                except TypeError as error:
+                    raise LlmResponseError(f"{self._provider_label} returned an invalid SSE JSON object") from error
                 self._log_response_payload(event, stream=True)
                 usage = self._mapping(event.get("usage"))
                 choices = event.get("choices")
@@ -271,7 +275,7 @@ class OpenAiCompatibleLanguageModel(LanguageModel):
 
     def _post_chat_completions(
         self,
-        payload: Mapping[str, object],
+        payload: JsonObject,
         min_request_interval_seconds: float,
     ) -> httpx.Response:
         self._log_request_payload(payload, stream=False)
@@ -286,7 +290,7 @@ class OpenAiCompatibleLanguageModel(LanguageModel):
 
     def _stream_chat_completion_lines(
         self,
-        payload: Mapping[str, object],
+        payload: JsonObject,
         min_request_interval_seconds: float,
     ) -> Iterator[str]:
         self._log_request_payload(payload, stream=True)
@@ -327,10 +331,10 @@ class OpenAiCompatibleLanguageModel(LanguageModel):
     def _wait_for_request_slot(self, request_model: str, interval_seconds: float) -> None:
         self._request_rate_limiter.wait(self.provider, request_model, interval_seconds)
 
-    def _payload(self, messages: Sequence[ChatMessage], options: CompletionOptions, *, stream: bool) -> dict[str, object]:
+    def _payload(self, messages: Sequence[ChatMessage], options: CompletionOptions, *, stream: bool) -> JsonObject:
         if options.temperature > self._max_temperature:
             raise LlmConfigurationError(f"{self._provider_label} temperature must be between 0 and {self._max_temperature:g}")
-        payload: dict[str, object] = {
+        payload: JsonObject = {
             "model": options.model or self._model,
             "messages": [self._message_payload(item) for item in messages],
             "max_tokens": options.max_tokens,
@@ -377,11 +381,11 @@ class OpenAiCompatibleLanguageModel(LanguageModel):
                     "仅输出符合以下 JSON Schema 的 JSON 对象，不要输出解释或 Markdown：\n"
                     f"{json.dumps(response_format.json_schema, ensure_ascii=False, separators=(',', ':'))}"
                 )
-                message_list = cast(list[dict[str, str]], payload["messages"])
+                message_list = cast(list[JsonObject], payload["messages"])
                 message_list.insert(0, {"role": "system", "content": schema_instruction})
         return payload
 
-    def _json_schema_for_provider(self, schema: Mapping[str, object]) -> Mapping[str, object]:
+    def _json_schema_for_provider(self, schema: JsonObject) -> JsonObject:
         """Translate standard JSON Schema into the provider dialect when needed."""
 
         return schema
@@ -397,7 +401,7 @@ class OpenAiCompatibleLanguageModel(LanguageModel):
                 body = f"<response body unavailable: {type(body_error).__name__}>"
             raise LlmResponseError(f"{self._provider_label} API returned HTTP {response.status_code}: {body}") from error
 
-    def _log_request_payload(self, payload: Mapping[str, object], *, stream: bool) -> None:
+    def _log_request_payload(self, payload: JsonObject, *, stream: bool) -> None:
         """Log request shape for provider debugging without exposing full prompt data."""
 
         logger.info(
@@ -412,7 +416,7 @@ class OpenAiCompatibleLanguageModel(LanguageModel):
             ),
         )
 
-    def _log_response_payload(self, payload: Mapping[str, object], *, stream: bool) -> None:
+    def _log_response_payload(self, payload: JsonObject, *, stream: bool) -> None:
         """Log provider response fields while bounding every string value."""
 
         logger.info(
@@ -428,30 +432,29 @@ class OpenAiCompatibleLanguageModel(LanguageModel):
         )
 
     @classmethod
-    def _truncated_for_log(cls, value: object, *, string_limit: int) -> object:
-        if isinstance(value, Mapping):
-            mapping = cast(Mapping[object, object], value)
+    def _truncated_for_log(cls, value: JsonValue, *, string_limit: int) -> JsonValue:
+        if isinstance(value, dict):
             return {
                 str(key): cls._truncated_for_log(item, string_limit=string_limit)
-                for key, item in mapping.items()
+                for key, item in value.items()
             }
-        if isinstance(value, list | tuple):
-            sequence = cast(list[object] | tuple[object, ...], value)
-            return [cls._truncated_for_log(item, string_limit=string_limit) for item in sequence]
+        if isinstance(value, list):
+            return [cls._truncated_for_log(item, string_limit=string_limit) for item in value]
         if isinstance(value, str) and len(value) > string_limit:
             return f"{value[:string_limit]}…<truncated,len={len(value)}>"
         return value
 
-    def _json_mapping(self, response: httpx.Response) -> Mapping[str, object]:
+    def _json_mapping(self, response: httpx.Response) -> JsonObject:
         try:
             data = cast(object, response.json())
         except ValueError as error:
             raise LlmResponseError(f"{self._provider_label} returned invalid JSON") from error
-        if not isinstance(data, Mapping):
-            raise LlmResponseError(f"{self._provider_label} returned a non-object response")
-        return cast(Mapping[str, object], data)
+        try:
+            return as_json_object(data)
+        except TypeError as error:
+            raise LlmResponseError(f"{self._provider_label} returned a non-object response") from error
 
-    def _message_content(self, data: Mapping[str, object]) -> tuple[str, tuple[ToolCall, ...], str | None]:
+    def _message_content(self, data: JsonObject) -> tuple[str, tuple[ToolCall, ...], str | None]:
         choice = self._first_choice(data)
         message = self._mapping(choice.get("message"))
         text = message.get("content")
@@ -465,8 +468,8 @@ class OpenAiCompatibleLanguageModel(LanguageModel):
         return content, tool_calls, self._optional_string(choice.get("finish_reason"))
 
     @classmethod
-    def _message_payload(cls, message: ChatMessage) -> dict[str, object]:
-        payload: dict[str, object] = {"role": message.role.value, "content": message.content}
+    def _message_payload(cls, message: ChatMessage) -> JsonObject:
+        payload: JsonObject = {"role": message.role.value, "content": message.content}
         if message.tool_calls:
             payload["tool_calls"] = [
                 cls._tool_call_payload(call)
@@ -488,9 +491,10 @@ class OpenAiCompatibleLanguageModel(LanguageModel):
             return ()
         result: list[ToolCall] = []
         for item in cast(list[object], value):
-            if not isinstance(item, Mapping):
-                raise LlmResponseError(f"{self._provider_label} returned an invalid tool call")
-            call = cast(Mapping[str, object], item)
+            try:
+                call = as_json_object(item)
+            except TypeError as error:
+                raise LlmResponseError(f"{self._provider_label} returned an invalid tool call") from error
             function = self._mapping(call.get("function"))
             call_id = call.get("id")
             name = function.get("name")
@@ -501,8 +505,10 @@ class OpenAiCompatibleLanguageModel(LanguageModel):
                 arguments = cast(object, json.loads(raw_arguments))
             except json.JSONDecodeError as error:
                 raise LlmResponseError(f"{self._provider_label} returned invalid tool call arguments") from error
-            if not isinstance(arguments, Mapping):
-                raise LlmResponseError(f"{self._provider_label} returned non-object tool call arguments")
+            try:
+                argument_object = as_json_object(arguments)
+            except TypeError as error:
+                raise LlmResponseError(f"{self._provider_label} returned non-object tool call arguments") from error
             # Gemini's OpenAI-compatible responses normally put the signature
             # on the first tool call. Accept the message-level form too: it
             # has appeared in compatibility responses and the signature still
@@ -514,15 +520,15 @@ class OpenAiCompatibleLanguageModel(LanguageModel):
                 ToolCall(
                     id=call_id,
                     name=name,
-                    arguments=cast(Mapping[str, object], arguments),
+                    arguments=argument_object,
                     thought_signature=signature,
                 )
             )
         return tuple(result)
 
     @staticmethod
-    def _tool_call_payload(call: ToolCall) -> dict[str, object]:
-        payload: dict[str, object] = {
+    def _tool_call_payload(call: ToolCall) -> JsonObject:
+        payload: JsonObject = {
             "id": call.id,
             "type": "function",
             "function": {
@@ -535,26 +541,32 @@ class OpenAiCompatibleLanguageModel(LanguageModel):
         return payload
 
     @classmethod
-    def _thought_signature(cls, call: Mapping[str, object]) -> str | None:
+    def _thought_signature(cls, call: JsonObject) -> str | None:
         extra_content = cls._mapping(call.get("extra_content"))
         google = cls._mapping(extra_content.get("google"))
         signature = google.get("thought_signature")
         return signature if isinstance(signature, str) else None
 
-    def _delta_text(self, data: Mapping[str, object]) -> tuple[str, str | None]:
+    def _delta_text(self, data: JsonObject) -> tuple[str, str | None]:
         choice = self._first_choice(data)
         delta = self._mapping(choice.get("delta"))
         return str(delta.get("content") or ""), self._optional_string(choice.get("finish_reason"))
 
-    def _first_choice(self, data: Mapping[str, object]) -> Mapping[str, object]:
+    def _first_choice(self, data: JsonObject) -> JsonObject:
         choices = data.get("choices")
-        if not isinstance(choices, list) or not choices or not isinstance(choices[0], Mapping):
+        if not isinstance(choices, list) or not choices:
             raise LlmResponseError(f"{self._provider_label} returned no completion choices")
-        return cast(Mapping[str, object], choices[0])
+        try:
+            return as_json_object(choices[0])
+        except TypeError as error:
+            raise LlmResponseError(f"{self._provider_label} returned an invalid completion choice") from error
 
     @staticmethod
-    def _mapping(value: object) -> Mapping[str, object]:
-        return cast(Mapping[str, object], value) if isinstance(value, Mapping) else {}
+    def _mapping(value: JsonValue | object) -> JsonObject:
+        try:
+            return as_json_object(value)
+        except TypeError:
+            return {}
 
     @staticmethod
     def _integer(value: object) -> int | None:
@@ -565,7 +577,7 @@ class OpenAiCompatibleLanguageModel(LanguageModel):
         return str(value) if value is not None else None
 
     @staticmethod
-    def _request_id(data: Mapping[str, object]) -> str | None:
+    def _request_id(data: JsonObject) -> str | None:
         value = data.get("request_id") or data.get("id")
         return str(value) if value is not None else None
 

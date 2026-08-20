@@ -118,10 +118,26 @@ class EmbeddingIndexingStage:
         except ImportError as error:
             raise RuntimeError("sentence-transformers is not installed; start the GPU worker with backend/.venv") from error
         options: dict[str, object] = {"local_files_only": True, "trust_remote_code": True}
-        if self._device != "auto":
-            options["device"] = self._device
+        device = self._resolve_device()
+        options["device"] = device
+        logger.info("录音索引：加载 embedding 模型 %s，推理设备=%s", self._model_name, device)
         self._model = module.SentenceTransformer(str(model_path), **options)
         return self._model
+
+    def _resolve_device(self) -> str:
+        """Prefer an available accelerator while keeping an explicit override available."""
+
+        if self._device != "auto":
+            return self._device
+        try:
+            torch = cast(Any, import_module("torch"))
+            if torch.cuda.is_available():
+                return "cuda"
+            if torch.backends.mps.is_available():
+                return "mps"
+        except (ImportError, RuntimeError, AttributeError) as error:
+            logger.warning("录音索引：无法检测 GPU，回退 CPU：%s", error)
+        return "cpu"
 
     @staticmethod
     def _empty_torch_device_caches() -> None:

@@ -97,7 +97,11 @@ class ExpressionAuditItem(BaseModel):
 
         if not isinstance(value, Mapping):
             return value
-        normalized = dict(value)
+        normalized = {
+            key: item
+            for key, item in cast(Mapping[object, object], value).items()
+            if isinstance(key, str)
+        }
         normalized.pop("status", None)
         normalized.pop("occurrence_scope", None)
         return normalized

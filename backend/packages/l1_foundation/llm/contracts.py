@@ -3,7 +3,29 @@ from __future__ import annotations
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Literal, Protocol
+from typing import Literal, Protocol, cast
+
+type JsonValue = None | bool | int | float | str | list[JsonValue] | dict[str, JsonValue]
+type JsonObject = dict[str, JsonValue]
+
+
+def as_json_value(value: object) -> JsonValue:
+    """Validate and copy an untrusted Python value into the JSON value domain."""
+
+    if value is None or isinstance(value, bool | int | float | str):
+        return value
+    if isinstance(value, Mapping):
+        return {str(key): as_json_value(item) for key, item in cast(Mapping[object, object], value).items()}
+    if isinstance(value, list | tuple):
+        return [as_json_value(item) for item in cast(list[object] | tuple[object, ...], value)]
+    raise TypeError(f"Value is not JSON-compatible: {type(value).__name__}")
+
+
+def as_json_object(value: object) -> JsonObject:
+    normalized = as_json_value(value)
+    if not isinstance(normalized, dict):
+        raise TypeError("JSON value is not an object")
+    return normalized
 
 
 class LlmProvider(StrEnum):
@@ -23,14 +45,14 @@ class ChatRole(StrEnum):
 class ToolDefinition:
     name: str
     description: str
-    parameters: Mapping[str, object]
+    parameters: JsonObject
 
 
 @dataclass(frozen=True, slots=True)
 class ToolCall:
     id: str
     name: str
-    arguments: Mapping[str, object]
+    arguments: JsonObject
     # Gemini 3 attaches this opaque value to a function call.  It must be
     # replayed verbatim with the corresponding call before sending its result.
     thought_signature: str | None = None
@@ -55,7 +77,7 @@ class ResponseFormatType(StrEnum):
 @dataclass(frozen=True, slots=True)
 class ResponseFormat:
     type: ResponseFormatType = ResponseFormatType.TEXT
-    json_schema: Mapping[str, object] | None = None
+    json_schema: JsonObject | None = None
     strict: bool = True
 
     def __post_init__(self) -> None:

@@ -761,6 +761,57 @@ def test_direct_answer_prompt_keeps_all_evidence_while_final_sources_follow_cita
     assert "未选择的独特内容" in answer_prompt_text
 
 
+def test_answer_uses_original_query_without_receiving_history_text() -> None:
+    recording_id = uuid4()
+
+    class CapturingAnswerModel(FakeModel):
+        def __init__(self) -> None:
+            super().__init__()
+            self.answer_messages: Sequence[BaseMessage] = []
+            self.set_responses(
+                [
+                    '{"status":"resolved","strategy_id":"fact_lookup",'
+                    '"content_query":"项目答辩","inferred_filters":{}}',
+                    '{"verdict":"direct_answer","reason":"enough"}',
+                ]
+            )
+
+        def stream(
+            self,
+            messages: Sequence[BaseMessage],
+            max_tokens: int,
+            temperature: float = 0.1,
+        ) -> AsyncIterator[str]:
+            self.answer_messages = messages
+            return super().stream(messages, max_tokens, temperature)
+
+    model = CapturingAnswerModel()
+    history = [
+        RagHistoryMessage(role="user", content="I2C 的规定是什么？"),
+        RagHistoryMessage(
+            role="assistant",
+            content="旧回答中不应进入 answer 的独特文本。",
+            sources=[RagHistorySource(recording_id=recording_id)],
+        ),
+    ]
+
+    asyncio.run(
+        _graph(FakeRetriever(), model).run(
+            "最近是不是有个项目答辩",
+            10,
+            [recording_id],
+            lambda _name, _label, _progress: None,
+            lambda _delta: None,
+            history,
+        )
+    )
+
+    answer_prompt_text = "\n".join(str(item.content) for item in model.answer_messages)
+    assert "问题：最近是不是有个项目答辩" in answer_prompt_text
+    assert "问题：项目答辩" not in answer_prompt_text
+    assert "旧回答中不应进入 answer 的独特文本" not in answer_prompt_text
+
+
 def test_structured_logs_cover_the_direct_evidence_graph_path() -> None:
     run_id = uuid4()
     handler = JsonEventHandler()
@@ -923,7 +974,6 @@ def test_fact_lookup_adjudication_reviews_each_final_evidence_in_isolated_contex
         [
             '{"status":"resolved","strategy":"chunk_search","inferred_filters":{}}',
             '{"has_risk":true}',
-            '{"verdict":"direct_answer","reason":"enough"}',
             _audit_response("RF 的最大时延是 5 秒"),
             json.dumps(
                 {
@@ -960,6 +1010,8 @@ def test_fact_lookup_adjudication_reviews_each_final_evidence_in_isolated_contex
                 ensure_ascii=False,
             ),
             '{"items":[]}',
+            '{"verdict":"direct_answer","reason":"enough"}',
+            '{"verdict":"direct_answer","reason":"enough"}',
         ]
     )
 
@@ -981,6 +1033,7 @@ def test_fact_lookup_adjudication_reviews_each_final_evidence_in_isolated_contex
     assert "CorrectionRiskAssessment" in schema_titles
     assert "ExpressionAudit" in schema_titles
     assert "AdjudicationReview" in schema_titles
+    assert schema_titles.index("EvidenceGrade") > schema_titles.index("AdjudicationReview")
     review_inputs = [
         "\n".join(messages)
         for schema, messages in zip(model.json_schemas, model.message_batches, strict=True)
@@ -1060,7 +1113,6 @@ def test_active_adjudication_reconsiders_candidate_after_web_search_without_conf
         [
             '{"status":"resolved","strategy":"chunk_search","inferred_filters":{}}',
             '{"has_risk":true}',
-            '{"verdict":"direct_answer","reason":"enough"}',
             _audit_response("RF 的最大时延是 5 秒"),
             json.dumps(
                 {
@@ -1110,6 +1162,8 @@ def test_active_adjudication_reconsiders_candidate_after_web_search_without_conf
                 },
                 ensure_ascii=False,
             ),
+            '{"verdict":"direct_answer","reason":"enough"}',
+            '{"verdict":"direct_answer","reason":"enough"}',
         ]
     )
 
@@ -1236,7 +1290,6 @@ def test_active_adjudication_auto_overlay_is_disclosed_in_answer_context_and_sou
         [
             '{"status":"resolved","strategy":"chunk_search","inferred_filters":{}}',
             '{"has_risk":true}',
-            '{"verdict":"direct_answer","reason":"enough"}',
             _audit_response("RF 的最大时延是 5 秒"),
             json.dumps(
                 {
@@ -1286,6 +1339,8 @@ def test_active_adjudication_auto_overlay_is_disclosed_in_answer_context_and_sou
                 },
                 ensure_ascii=False,
             ),
+            '{"verdict":"abstain","reason":"original_asr_is_not_answerable"}',
+            '{"verdict":"direct_answer","reason":"enough"}',
         ]
     )
 
@@ -1315,18 +1370,18 @@ def test_active_adjudication_auto_overlay_is_disclosed_in_answer_context_and_sou
     assert searched_queries == ["I2C maximum latency"]
     answer_inputs = ["\n".join(str(message.content) for message in batch) for batch in model.answer_message_batches]
     answer_input = "\n".join(answer_inputs)
+    assert len(answer_inputs) == 1
     assert "将“RF 的最大时延是 5 秒”修正为“I²C 的最大时延是 5 微秒”" in answer_input
-    assert any("录音正文：\nRF 的最大时延是 5 秒。" in item for item in answer_inputs)
     assert any("录音正文：\nI²C 的最大时延是 5 微秒。" in item for item in answer_inputs)
     assert any("直接回答" in item and "I²C 的最大时延是 5 微秒" in item for item in answer_inputs)
     assert "I²C 的最大时延是 5 微秒" in caplog.text
     assert aggregate_stream.started
-    assert set(aggregate_stream.completed) == {"original", "corrected"}
-    assert not aggregate_stream.failed
-    assert aggregate_stream.deltas["original"]
-    assert aggregate_stream.deltas["corrected"]
-    assert "adjudication" not in aggregate_stream.completed["original"][1][0]
+    assert aggregate_stream.completed["original"] == ("没有在录音中找到足够依据。", [])
+    assert aggregate_stream.completed["corrected"][0]
     assert aggregate_stream.completed["corrected"][1][0]["adjudication"]
+    assert not aggregate_stream.failed
+    assert not aggregate_stream.deltas["original"]
+    assert aggregate_stream.deltas["corrected"]
     assert sources[0]["adjudication"]
     assert sources[0]["adjudication"][0]["target_spans"] == [  # type: ignore[index]
         {"start_char": 0, "end_char": len("RF 的最大时延是 5 秒")}
@@ -1340,7 +1395,15 @@ def test_active_adjudication_auto_overlay_is_disclosed_in_answer_context_and_sou
     schema_titles = [schema.get("title") for schema in model.json_schemas if schema is not None]
     assert schema_titles.count("CorrectionRiskAssessment") == 1
     assert schema_titles.count("ExpressionAudit") == 1
-    assert schema_titles.count("EvidenceGrade") == 1
+    assert schema_titles.count("EvidenceGrade") == 2
+    grade_inputs = [
+        "\n".join(messages)
+        for schema, messages in zip(model.json_schemas, model.message_batches, strict=True)
+        if schema is not None and schema.get("title") == "EvidenceGrade"
+    ]
+    assert len(grade_inputs) == 2
+    assert any("RF 的最大时延是 5 秒" in item for item in grade_inputs)
+    assert any("I²C 的最大时延是 5 微秒" in item for item in grade_inputs)
     assert schema_titles.count("AnswerPlan") == 0
     assert not model.tool_call_providers
 
@@ -1606,7 +1669,7 @@ def test_grade_contract_rejects_legacy_fields() -> None:
     assert "sufficient" not in EvidenceGrade.model_json_schema()["properties"]
 
 
-def test_qualified_answer_grade_enters_adjudication_when_enabled() -> None:
+def test_adjudication_completion_enters_grade() -> None:
     grade = EvidenceGrade(verdict="qualified_answer")
     state = cast(
         RagGraphState,
@@ -1617,10 +1680,10 @@ def test_qualified_answer_grade_enters_adjudication_when_enabled() -> None:
         },
     )
 
-    assert RagGraph._after_grade(state) == "adjudicate"  # pyright: ignore[reportPrivateUsage]
+    assert RagGraph._after_user_adjudication(state) == "grade_variants"  # pyright: ignore[reportPrivateUsage]
 
 
-def test_abstain_grade_does_not_trigger_a_pointless_retrieval_retry() -> None:
+def test_grade_is_terminal_after_adjudication() -> None:
     state = cast(
         RagGraphState,
         {
@@ -1633,10 +1696,10 @@ def test_abstain_grade_does_not_trigger_a_pointless_retrieval_retry() -> None:
         },
     )
 
-    assert RagGraph._after_grade(state) == "finalize"  # pyright: ignore[reportPrivateUsage]
+    assert RagGraph._after_user_adjudication(state) == "grade_variants"  # pyright: ignore[reportPrivateUsage]
 
 
-def test_direct_answer_grade_enters_adjudication_when_enabled() -> None:
+def test_direct_answer_grade_no_longer_routes_back_to_adjudication() -> None:
     state = cast(
         RagGraphState,
         {
@@ -1646,7 +1709,7 @@ def test_direct_answer_grade_enters_adjudication_when_enabled() -> None:
         },
     )
 
-    assert RagGraph._after_grade(state) == "adjudicate"  # pyright: ignore[reportPrivateUsage]
+    assert RagGraph._after_user_adjudication(state) == "grade_variants"  # pyright: ignore[reportPrivateUsage]
 
 
 def test_multiple_scope_recordings_force_plan_even_when_grader_marks_direct() -> None:
@@ -1809,7 +1872,7 @@ def test_answer_plan_validation_removes_invalid_and_duplicate_indexes_without_di
     assert plan.items[0].evidence_indexes == [3]
 
 
-def test_chunk_search_grades_the_scope_free_content_query() -> None:
+def test_chunk_search_grades_the_original_query() -> None:
     class CapturingGradeModel(FakeModel):
         def __init__(self) -> None:
             self.messages: list[Sequence[BaseMessage]] = []
@@ -1853,8 +1916,8 @@ def test_chunk_search_grades_the_scope_free_content_query() -> None:
 
     rendered = "\n".join(str(message.content) for message in model.messages[0])
     assert cast(EvidenceGrade, result["grade"]).verdict == "direct_answer"
-    assert "问题：关于硅光的前景都讨论了什么" in rendered
-    assert "问题：最近的一个录音里" not in rendered
+    assert "问题：最近的一个录音里关于硅光的前景都讨论了什么" in rendered
+    assert "问题：关于硅光的前景都讨论了什么" not in rendered
     assert "硅光具有较好的发展前景。" in rendered
     assert "recording_id" not in rendered
     assert "录音名字：最近录音" in rendered

@@ -21,6 +21,7 @@ from l2_core.rag.contracts import Evidence, EvidenceGrade
 from l2_core.rag.graph import RagGraph
 from l2_core.rag.hooks import RagNodeCompleted, RagOperationCompleted
 from l2_core.rag.retrieval import RagRetriever
+from l2_core.rag_adjudication_evaluation.runner import RagAdjudicationEvaluationRunner
 from l2_core.rag_evaluation.contracts import EvidenceAnchor, RankedItem, RetrievalMetrics
 from l2_core.rag_evaluation.evidence_matcher import match_ranked_item
 from l2_core.rag_evaluation.metrics import mean_metrics, percentile, retrieval_metrics
@@ -126,7 +127,8 @@ class RagEvaluationWorker:
                     """
                     with candidate as (
                         select id from evaluation_runs
-                        where status = 'queued' and evaluator_type = 'rag_retrieval'
+                        where status = 'queued'
+                          and evaluator_type in ('rag_retrieval', 'rag_adjudication')
                         order by created_at
                         for update skip locked
                         limit 1
@@ -168,7 +170,8 @@ class RagEvaluationWorker:
                     set status = 'queued', started_at = null, finished_at = null,
                         completed_case_count = 0, failed_case_count = 0,
                         error_message = 'Recovered after evaluation worker heartbeat timeout', updated_at = now()
-                    where status = 'running' and evaluator_type = 'rag_retrieval'
+                    where status = 'running'
+                      and evaluator_type in ('rag_retrieval', 'rag_adjudication')
                       and cancel_requested = false
                       and updated_at < now() - (:stale_after_seconds * interval '1 second')
                     """
@@ -190,6 +193,21 @@ class RagEvaluationWorker:
             stop_event.wait(min(30.0, self._settings.rag_evaluation_stale_run_seconds / 3))
 
     async def _execute_async(self, run_id: UUID) -> None:
+        with self._engine.connect() as connection:
+            evaluator_type = str(
+                connection.execute(
+                    text("select evaluator_type from evaluation_runs where id = :run_id"),
+                    {"run_id": run_id},
+                ).scalar_one()
+            )
+        if evaluator_type == "rag_adjudication":
+            async with self._model_worker_client(self._settings) as model_worker:
+                await RagAdjudicationEvaluationRunner(
+                    self._engine,
+                    self._settings,
+                    cast(WorkerClient, model_worker),
+                ).execute(run_id)
+            return
         with self._engine.begin() as connection:
             connection.execute(
                 text(
@@ -212,7 +230,9 @@ class RagEvaluationWorker:
                         """
                     ),
                     {"run_id": run_id},
-                ).mappings().one()
+                )
+                .mappings()
+                .one()
             )
             cases = [
                 dict(row)
@@ -276,9 +296,7 @@ class RagEvaluationWorker:
                     result_id = self._start_case(run_id, case_id, str(case["query"]))
                     try:
                         evidence = self._load_evidence(case_id)
-                        scope_ids = self._scope_recording_ids(
-                            cast(Mapping[str, object], case["scope"]), workspace_recording_ids
-                        )
+                        scope_ids = self._scope_recording_ids(cast(Mapping[str, object], case["scope"]), workspace_recording_ids)
                         hook = EvaluationTraceHook()
                         state = await graph.run_retrieval(
                             query=str(case["query"]),
@@ -365,9 +383,7 @@ class RagEvaluationWorker:
         return _AsyncSyncWorkerClient(self._worker_client)
 
     @staticmethod
-    def _empty_terminal_operation(
-        hook: EvaluationTraceHook, route_error: str | None
-    ) -> RagOperationCompleted:
+    def _empty_terminal_operation(hook: EvaluationTraceHook, route_error: str | None) -> RagOperationCompleted:
         route_node = next((item for item in reversed(hook.nodes) if item.node == "route"), None)
         return RagOperationCompleted(
             node="route",
@@ -750,25 +766,19 @@ class RagEvaluationWorker:
                 "embedding_model": str(embedding.get("model", self._settings.embedding_model)),
                 "embedding_dimensions": _int_setting(embedding, "dimensions", self._settings.embedding_dimensions),
                 "rag_hybrid_search_enabled": bool(config.get("hybrid_enabled", True)),
-                "rag_query_term_expansion_enabled": bool(
-                    config.get("query_term_expansion_enabled", self._settings.rag_query_term_expansion_enabled)
-                ),
+                "rag_query_term_expansion_enabled": bool(config.get("query_term_expansion_enabled", self._settings.rag_query_term_expansion_enabled)),
                 "rag_vector_candidate_limit": _int_setting(config, "vector_top_k", self._settings.rag_vector_candidate_limit),
                 "rag_lexical_candidate_limit": _int_setting(config, "lexical_top_k", self._settings.rag_lexical_candidate_limit),
                 "rag_fused_candidate_limit": _int_setting(config, "fused_top_k", self._settings.rag_fused_candidate_limit),
                 "rag_rrf_k": _int_setting(config, "rrf_k", self._settings.rag_rrf_k),
                 "rag_vector_weight": _float_setting(config, "vector_weight", self._settings.rag_vector_weight),
                 "rag_lexical_weight": _float_setting(config, "lexical_weight", self._settings.rag_lexical_weight),
-                "rag_chunk_context_window_utterances": _int_setting(
-                    config, "context_window_utterances", self._settings.rag_chunk_context_window_utterances
-                ),
+                "rag_chunk_context_window_utterances": _int_setting(config, "context_window_utterances", self._settings.rag_chunk_context_window_utterances),
                 "rag_rerank_enabled": bool(rerank.get("enabled", self._settings.rag_rerank_enabled)),
                 "rag_rerank_model": str(rerank.get("model", self._settings.rag_rerank_model)),
                 "rag_rerank_candidate_limit": _int_setting(rerank, "candidate_limit", self._settings.rag_rerank_candidate_limit),
                 "rag_rerank_output_limit": _int_setting(rerank, "output_limit", self._settings.rag_rerank_output_limit),
-                "rag_rerank_max_total_tokens": _int_setting(
-                    rerank, "max_total_tokens", self._settings.rag_rerank_max_total_tokens
-                ),
+                "rag_rerank_max_total_tokens": _int_setting(rerank, "max_total_tokens", self._settings.rag_rerank_max_total_tokens),
             }
         )
 

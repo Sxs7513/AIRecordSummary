@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from datetime import datetime
 from operator import add
-from typing import Annotated, Literal, Self, TypedDict, cast
+from typing import Annotated, Literal, NotRequired, Required, Self, TypedDict, cast
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -15,6 +15,104 @@ RouteStatus = Literal["resolved", "ambiguous", "unresolved"]
 StrategyId = Literal["fact_lookup", "metadata_lookup", "scope_summary"]
 RetrievalStrategy = Literal["scope_summary", "chunk_search"]
 RouteErrorCode = Literal["ambiguous_recording_scope", "unresolved_query", "unsupported_time_expression"]
+EvidenceMatchType = Literal["vector", "lexical", "hybrid", "scope"]
+type JsonValue = None | bool | int | float | str | list[JsonValue] | dict[str, JsonValue]
+type JsonObject = dict[str, JsonValue]
+
+
+class RetrievalCandidateRow(TypedDict, total=False):
+    """A trusted search result after conversion from a SQLAlchemy row mapping."""
+
+    chunk_id: Required[UUID]
+    recording_id: Required[UUID]
+    text: Required[str]
+    start_ms: Required[int]
+    end_ms: Required[int]
+    speaker_labels: Required[list[str]]
+    is_target_person: Required[bool]
+    source_utterance_segment_ids: Required[list[UUID]]
+    metadata: Required[Mapping[str, object] | None]
+    title: Required[str]
+    file_name: Required[str]
+    location: Required[str | None]
+    duration_seconds: Required[int | None]
+    created_at: Required[datetime]
+    score: Required[float]
+    exact_match: bool
+    match_type: EvidenceMatchType
+    matched_speaker_profile_ids: list[UUID]
+    protected_lexical_terms: list[str]
+
+
+class MetadataSpeaker(TypedDict):
+    name: str
+    speaking_duration_seconds: float
+
+
+class RecordingMetadataRow(TypedDict):
+    id: UUID
+    file_name: str
+    location: str | None
+    duration_seconds: int | None
+    created_at: datetime
+    speakers: list[MetadataSpeaker]
+
+
+class ScopeRecordingRow(TypedDict):
+    id: UUID
+    title: str
+    file_name: str
+    location: str | None
+    duration_seconds: int | None
+    created_at: datetime
+
+
+class ScopeUtteranceRow(TypedDict):
+    recording_id: UUID
+    utterance_index: int
+    speaker_label: str | None
+    text: str
+    start_ms: int
+    end_ms: int
+    is_target_person: bool
+    speaker_profile_id: UUID | None
+    utterance_count: int
+    speaker_labels: list[str]
+
+
+class EvidenceSourceRecording(TypedDict):
+    id: str
+    title: NotRequired[str]
+    fileName: str
+    location: str | None
+    durationSeconds: int | None
+
+
+class EvidenceSourceChunk(TypedDict):
+    id: str
+    startMs: int
+    endMs: int
+    speakerLabels: list[str]
+    isTargetPerson: bool
+    matchedSpeakerProfiles: list[str]
+
+
+class EvidenceSourceFacts(TypedDict):
+    scope_verified: bool
+    speaker_count: NotRequired[int | None]
+    utterance_count: NotRequired[int | None]
+    transcript_truncated: NotRequired[bool]
+
+
+class EvidenceSource(TypedDict):
+    index: int
+    recording: EvidenceSourceRecording
+    chunk: EvidenceSourceChunk
+    score: float
+    matchType: EvidenceMatchType
+    facts: EvidenceSourceFacts
+    url: str
+    adjudication: NotRequired[list[dict[str, object]]]
 
 
 def _uuid_list() -> list[UUID]:
@@ -157,11 +255,11 @@ class Evidence(BaseModel):
     recording: EvidenceRecording
     chunk: EvidenceChunk
     score: float
-    match_type: Literal["vector", "lexical", "hybrid", "scope"]
+    match_type: EvidenceMatchType
     facts: EvidenceFacts = Field(default_factory=EvidenceFacts)
     url: str
 
-    def source_payload(self) -> dict[str, object]:
+    def source_payload(self) -> EvidenceSource:
         return {
             "index": self.index,
             "recording": {
@@ -181,7 +279,12 @@ class Evidence(BaseModel):
             },
             "score": self.score,
             "matchType": self.match_type,
-            "facts": self.facts.model_dump(mode="json"),
+            "facts": EvidenceSourceFacts(
+                scope_verified=self.facts.scope_verified,
+                speaker_count=self.facts.speaker_count,
+                utterance_count=self.facts.utterance_count,
+                transcript_truncated=self.facts.transcript_truncated,
+            ),
             "url": self.url,
         }
 
@@ -212,6 +315,41 @@ class RetrievalTerms(BaseModel):
     phrases: list[str] = Field(default_factory=list, max_length=4)
 
 
+StructuredFactKey = Literal["file_name", "duration_seconds", "created_at", "location", "speakers"]
+StructuredFactValue = str | int | float | bool | list[str] | list[dict[str, str | int | float]] | None
+
+
+def _evidence_list() -> list[Evidence]:
+    return []
+
+
+def _structured_fact_list() -> list[StructuredFact]:
+    return []
+
+
+def _evidence_source_list() -> list[EvidenceSource]:
+    return []
+
+
+class StructuredFact(BaseModel):
+    key: StructuredFactKey
+    label: str
+    value: StructuredFactValue
+    recording_id: UUID
+
+
+class StrategyResult(BaseModel):
+    status: Literal["ready", "not_found", "needs_clarification"]
+    answer_context: str = ""
+    corrected_answer_context: str | None = None
+    evidence: list[Evidence] = Field(default_factory=_evidence_list)
+    facts: list[StructuredFact] = Field(default_factory=_structured_fact_list)
+    sources: list[EvidenceSource] = Field(default_factory=_evidence_source_list)
+    original_sources: list[EvidenceSource] = Field(default_factory=_evidence_source_list)
+    corrected_sources: list[EvidenceSource] = Field(default_factory=_evidence_source_list)
+    message: str | None = None
+
+
 class RagGraphState(TypedDict):
     run_id: str
     execution_mode: Literal["answer", "retrieval"]
@@ -227,7 +365,7 @@ class RagGraphState(TypedDict):
     retrieval_lexical_queries: list[str]
     retrieval_protected_lexical_queries: list[str]
     retrieval_attempt: int
-    retrieval_candidates: list[dict[str, object]]
+    retrieval_candidates: list[RetrievalCandidateRow]
     protected_chunk_ids: list[str]
     rerank_input_tokens: int
     rerank_skipped_candidates: int
@@ -235,10 +373,42 @@ class RagGraphState(TypedDict):
     answer_evidence: list[Evidence]
     message: str | None
     grade: EvidenceGrade | None
+    original_grade: EvidenceGrade | None
+    corrected_grade: EvidenceGrade | None
     planning_required: bool
     answer_plan: AnswerPlan | None
     query_correction_risk: bool
     adjudication_agent_state: AdjudicationAgentState | None
     adjudication_user_decision: ClaimConfirmationDecision | None
     token_usage: Annotated[int, add]
-    strategy_result: object | None
+    strategy_result: StrategyResult | None
+
+
+class RagStateUpdate(TypedDict, total=False):
+    """Fields a RAG graph node may update; keys outside graph state are rejected."""
+
+    route: RagRoute | None
+    route_error: str | None
+    filters: ResolvedFilters | None
+    content_query: str
+    retrieval_expanded_query: str | None
+    retrieval_lexical_queries: list[str]
+    retrieval_protected_lexical_queries: list[str]
+    retrieval_attempt: int
+    retrieval_candidates: list[RetrievalCandidateRow]
+    protected_chunk_ids: list[str]
+    rerank_input_tokens: int
+    rerank_skipped_candidates: int
+    evidence: list[Evidence]
+    answer_evidence: list[Evidence]
+    message: str | None
+    grade: EvidenceGrade | None
+    original_grade: EvidenceGrade | None
+    corrected_grade: EvidenceGrade | None
+    planning_required: bool
+    answer_plan: AnswerPlan | None
+    query_correction_risk: bool
+    adjudication_agent_state: AdjudicationAgentState | None
+    adjudication_user_decision: ClaimConfirmationDecision | None
+    token_usage: int
+    strategy_result: StrategyResult | None

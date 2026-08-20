@@ -82,9 +82,12 @@ def correction_risk_prompt(query: str) -> tuple[ChatPromptTemplate, dict[str, st
             [
                 (
                     "system",
-                    "判断用户问题的答案是否依赖录音中的精确表达。"
-                    "如果某个词、名称、标识、数值或其他细节一旦识别错误，就可能改变答案含义或结论，则 has_risk=true。"
-                    "如果问题只需要概括性、原理性或定性回答，不依赖这些精确细节，则 has_risk=false。"
+                    "判断用户问题是否涉及半导体技术表达，并严格按以下优先级判断："
+                    "第一，只要 query 中出现半导体行业的专业技术名词，has_risk 必须为 true。"
+                    "第二，如果问题要求从录音中识别、提取、解释、比较或总结半导体技术表达，"
+                    "即使 query 没有直接写出具体技术名词，has_risk 也必须为 true。"
+                    "上述规则不受提问形式影响；即使问题要求概括、原理性或定性回答，也必须返回 true。"
+                    "只有问题完全不涉及半导体技术时，才返回 false。"
                     "仅按 schema 输出。"
                 ),
                 ("human", "{query}"),

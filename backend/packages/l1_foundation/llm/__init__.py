@@ -2,6 +2,8 @@ from l1_foundation.llm.contracts import (
     ChatMessage,
     ChatRole,
     CompletionOptions,
+    JsonObject,
+    JsonValue,
     LanguageModel,
     LlmCompletion,
     LlmProvider,
@@ -11,6 +13,8 @@ from l1_foundation.llm.contracts import (
     ResponseFormatType,
     ToolCall,
     ToolDefinition,
+    as_json_object,
+    as_json_value,
 )
 from l1_foundation.llm.errors import LlmConfigurationError, LlmError, LlmResponseError, UnsupportedResponseFormatError
 from l1_foundation.llm.factory import create_language_model, create_language_model_from_settings
@@ -35,6 +39,8 @@ __all__ = [
     "ChatRole",
     "CompletionOptions",
     "LanguageModel",
+    "JsonObject",
+    "JsonValue",
     "GeminiLanguageModel",
     "LlmCompletion",
     "LlmConfigurationError",
@@ -48,6 +54,8 @@ __all__ = [
     "ResponseFormatType",
     "ToolCall",
     "ToolDefinition",
+    "as_json_object",
+    "as_json_value",
     "UnsupportedResponseFormatError",
     "LlmGenerateInput",
     "LlmGenerateResult",

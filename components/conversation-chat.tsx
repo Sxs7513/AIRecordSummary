@@ -183,7 +183,7 @@ function AggregateMessageCard({ message, isPrimary }: { message: SubMessage; isP
   const citations = message.sources.map(toSourceLink).filter((source): source is SourceLink => source !== null);
   const corrections = isPrimary ? message.sources.flatMap(toCorrectionLinks) : [];
   const streaming = message.status === "pending" || message.status === "streaming";
-  return <section className={`aggregate-message-card ${isPrimary ? "primary" : ""}`}><header><h3>{message.title}</h3>{isPrimary ? <span>推荐</span> : null}</header>{corrections.length > 0 ? <div className="aggregate-corrections">{corrections.map((correction) => <a href={correction.href} key={`${correction.proposalId}-${correction.href}`} rel="noreferrer" target="_blank">{correction.originalExpression} → {correction.resolvedExpression}</a>)}</div> : null}{text ? <MarkdownContent className="chat-markdown" markdown={text} streaming={streaming} citations={citations} /> : message.status === "failed" ? <p className="chat-error">{message.error ?? "该版本生成失败"}</p> : <p className="subtle">正在生成…</p>}{message.status === "failed" && text ? <p className="chat-error">{message.error ?? "该版本生成失败"}</p> : null}{citations.length > 0 ? <div className="message-sources"><button aria-expanded={sourcesExpanded} className="message-sources-toggle" onClick={() => setSourcesExpanded((expanded) => !expanded)} type="button">引用了 {citations.length} 条录音资料</button>{sourcesExpanded ? <ul className="message-source-list">{citations.map((source) => <li key={`${source.index}-${source.recordingId}-${source.href}`}><a href={source.href} rel="noreferrer" target="_blank"><span className="message-source-index">[{source.index}]</span>{source.title}{source.timeRange ? <span>{source.timeRange}</span> : null}</a></li>)}</ul> : null}</div> : null}</section>;
+  return <section className={`aggregate-message-card ${isPrimary ? "primary" : ""}`}><header><h3>{message.title}</h3>{isPrimary ? <span>推荐</span> : null}</header>{corrections.length > 0 ? <details className="aggregate-corrections"><summary>转写纠偏（{corrections.length}）</summary><div className="aggregate-correction-links">{corrections.map((correction) => <a href={correction.href} key={`${correction.proposalId}-${correction.href}`} rel="noreferrer" target="_blank">{correction.originalExpression} → {correction.resolvedExpression}</a>)}</div></details> : null}{text ? <MarkdownContent className="chat-markdown" markdown={text} streaming={streaming} citations={citations} /> : message.status === "failed" ? <p className="chat-error">{message.error ?? "该版本生成失败"}</p> : <p className="subtle">正在生成…</p>}{message.status === "failed" && text ? <p className="chat-error">{message.error ?? "该版本生成失败"}</p> : null}{citations.length > 0 ? <div className="message-sources"><button aria-expanded={sourcesExpanded} className="message-sources-toggle" onClick={() => setSourcesExpanded((expanded) => !expanded)} type="button">引用了 {citations.length} 条录音资料</button>{sourcesExpanded ? <ul className="message-source-list">{citations.map((source) => <li key={`${source.index}-${source.recordingId}-${source.href}`}><a href={source.href} rel="noreferrer" target="_blank"><span className="message-source-index">[{source.index}]</span>{source.title}{source.timeRange ? <span>{source.timeRange}</span> : null}</a></li>)}</ul> : null}</div> : null}</section>;
 }
 
 function AdjudicationConfirmationCard({ block, conversationId, onSubmitted, onError }: { block: AdjudicationConfirmationBlock; conversationId: string; onSubmitted: (turn: ConversationTurn) => void; onError: (message: string | null) => void }) {
@@ -212,12 +212,15 @@ function toCorrectionLinks(source: Record<string, unknown>): CorrectionLink[] {
   const recording = isRecord(source.recording) ? source.recording : null;
   const chunk = isRecord(source.chunk) ? source.chunk : null;
   const recordingId = recording?.id;
+  const chunkId = chunk?.id;
   const adjudication = source.adjudication;
-  if (typeof recordingId !== "string" || !Array.isArray(adjudication)) return [];
+  if (typeof recordingId !== "string" || typeof chunkId !== "string" || !Array.isArray(adjudication)) return [];
   const startMs = typeof chunk?.startMs === "number" ? chunk.startMs : null;
   const endMs = typeof chunk?.endMs === "number" ? chunk.endMs : null;
   return adjudication.flatMap((value) => {
     if (!isRecord(value)) return [];
+    const correctionChunkId = value.chunk_id;
+    if (typeof correctionChunkId === "string" && correctionChunkId !== chunkId) return [];
     const proposalId = value.proposal_id;
     const originalExpression = value.original_expression;
     const resolvedExpression = value.resolved_expression;

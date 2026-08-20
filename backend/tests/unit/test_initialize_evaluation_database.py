@@ -41,12 +41,23 @@ def test_evaluation_schema_is_additive_and_separate_from_base_schema() -> None:
     assert "create table if not exists evaluation_run_models" in schema
     assert "create table if not exists evaluation_case_results" in schema
     assert "create table if not exists evaluation_metric_values" in schema
+    assert "create table if not exists rag_adjudication_evaluation_case_drafts" in schema
+    assert "create table if not exists rag_adjudication_evaluation_evidence_drafts" in schema
+    assert "create table if not exists rag_adjudication_evaluation_correction_drafts" in schema
+    assert "create table if not exists rag_adjudication_evaluation_cases" in schema
+    assert "create table if not exists rag_adjudication_evaluation_case_results" in schema
+    assert "create table if not exists rag_adjudication_evaluation_metric_values" in schema
     assert "model_version_ids uuid[]" not in schema
     assert "rag_evaluation_evidence_drafts_source_recording_id_fkey" in schema
     assert "rag_evaluation_evidence_source_recording_id_fkey" in schema
     assert "rag_corpus_snapshot_chunks_recording_id_fkey" in schema
     assert "rag_evaluation_ranked_results_recording_id_fkey" in schema
     assert "app.evaluation_maintenance" in schema
+    assert "source_draft_correction_id uuid" not in schema
+    assert "references rag_adjudication_evaluation_correction_drafts" not in schema
+    assert "drop column if exists source_draft_correction_id" in schema
+    assert "drop column if exists source_draft_id" in schema
+    assert "drop column if exists source_draft_evidence_id" in schema
 
 
 def test_initializer_checks_base_tables_then_executes_evaluation_schema(monkeypatch: Any, tmp_path: Path) -> None:

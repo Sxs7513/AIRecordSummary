@@ -3,9 +3,8 @@ from __future__ import annotations
 import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime
 from time import perf_counter
-from typing import Any, cast
+from typing import Any, TypedDict, cast
 from uuid import UUID
 
 from sqlalchemy import Engine, text
@@ -15,7 +14,19 @@ from l1_foundation.worker import SyncWorkerClient
 from l2_core.audio_processing.worker_tasks import EmbeddingEncodeTaskResult, embedding_encode_command
 from l2_core.rag.adjudication.contracts import AdjudicationAgentState
 from l2_core.rag.checkpoint import render_evidence_text
-from l2_core.rag.contracts import Evidence, EvidenceChunk, EvidenceFacts, EvidenceRecording, ResolvedFilters
+from l2_core.rag.contracts import (
+    Evidence,
+    EvidenceChunk,
+    EvidenceFacts,
+    EvidenceRecording,
+    JsonObject,
+    JsonValue,
+    RecordingMetadataRow,
+    ResolvedFilters,
+    RetrievalCandidateRow,
+    ScopeRecordingRow,
+    ScopeUtteranceRow,
+)
 from l2_core.rag.evidence_overlays import apply_evidence_overlays, render_correction_notices
 from l2_core.rag.normalization import normalize_search_text
 from l2_core.rag.observability import log_event
@@ -28,13 +39,56 @@ logger = logging.getLogger("rag")
 
 
 @dataclass
-class RetrievalCandidate:
-    row: dict[str, object]
+class RankedCandidate:
+    row: RetrievalCandidateRow
     vector_rank: int | None = None
     vector_score: float | None = None
     lexical_rank: int | None = None
     lexical_score: float | None = None
     fused_score: float = 0.0
+
+
+class ExpandedUtteranceRow(TypedDict):
+    chunk_id: UUID
+    utterance_index: int
+    speaker_label: str | None
+    text: str
+    start_ms: int
+    end_ms: int
+    is_target_person: bool
+    speaker_profile_id: UUID | None
+
+
+def _json_objects(value: JsonValue | None) -> list[JsonObject]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, dict)]
+
+
+def _retrieval_candidate_row(value: Mapping[Any, object]) -> RetrievalCandidateRow:
+    """Mark the fixed projection returned by the candidate SQL queries as trusted."""
+
+    return cast(RetrievalCandidateRow, dict(value))
+
+
+def _expanded_utterance_row(value: Mapping[Any, object]) -> ExpandedUtteranceRow:
+    """Convert the fixed context-expansion SQL projection at the database boundary."""
+
+    return cast(ExpandedUtteranceRow, dict(value))
+
+
+def _recording_metadata_row(value: Mapping[Any, object]) -> RecordingMetadataRow:
+    """Convert the fixed metadata SQL projection at the database boundary."""
+
+    return cast(RecordingMetadataRow, dict(value))
+
+
+def _scope_recording_row(value: Mapping[Any, object]) -> ScopeRecordingRow:
+    return cast(ScopeRecordingRow, dict(value))
+
+
+def _scope_utterance_row(value: Mapping[Any, object]) -> ScopeUtteranceRow:
+    return cast(ScopeUtteranceRow, dict(value))
 
 
 class RagRetriever:
@@ -46,11 +100,11 @@ class RagRetriever:
     def release(self) -> None:
         return
 
-    def hydrate_checkpoint_state(self, state: dict[str, Any]) -> dict[str, Any]:
+    def hydrate_checkpoint_state(self, state: JsonObject) -> JsonObject:
         """Restore omitted candidate/evidence text from the authoritative recording tables."""
 
-        hydrated: dict[str, Any] = {**state}
-        candidates = [dict(item) for item in cast(list[dict[str, Any]], state.get("retrieval_candidates", []))]
+        hydrated: JsonObject = {**state}
+        candidates = [dict(item) for item in _json_objects(state.get("retrieval_candidates"))]
         chunk_ids = [str(item["chunk_id"]) for item in candidates if item.get("chunk_id") is not None]
         candidate_text: dict[str, str] = {}
         if chunk_ids:
@@ -63,23 +117,23 @@ class RagRetriever:
                 candidate_text = {str(row["id"]): str(row["text"]) for row in rows}
         for candidate in candidates:
             candidate["text"] = candidate_text.get(str(candidate.get("chunk_id")), "")
-        hydrated["retrieval_candidates"] = candidates
+        hydrated["retrieval_candidates"] = cast(JsonValue, candidates)
 
         text_cache: dict[tuple[str, int, int], str] = {}
         for field in ("evidence", "answer_evidence"):
-            hydrated[field] = self._hydrate_checkpoint_evidence(
-                cast(list[dict[str, Any]], state.get(field, [])),
-                text_cache,
+            hydrated[field] = cast(
+                JsonValue,
+                self._hydrate_checkpoint_evidence(_json_objects(state.get(field)), text_cache),
             )
         raw_strategy = state.get("strategy_result")
         if isinstance(raw_strategy, dict):
-            strategy = cast(dict[str, Any], raw_strategy)
-            hydrated_strategy = dict(strategy)
+            strategy = raw_strategy
+            hydrated_strategy: JsonObject = dict(strategy)
             evidence = self._hydrate_checkpoint_evidence(
-                cast(list[dict[str, Any]], strategy.get("evidence", [])),
+                _json_objects(strategy.get("evidence")),
                 text_cache,
             )
-            hydrated_strategy["evidence"] = evidence
+            hydrated_strategy["evidence"] = cast(JsonValue, evidence)
             validated_evidence = [Evidence.model_validate(item) for item in evidence]
             hydrated_strategy["answer_context"] = render_evidence_text(validated_evidence)
             if strategy.get("corrected_answer_context") is not None:
@@ -96,15 +150,15 @@ class RagRetriever:
 
     def _hydrate_checkpoint_evidence(
         self,
-        values: list[dict[str, Any]],
+        values: list[JsonObject],
         cache: dict[tuple[str, int, int], str],
-    ) -> list[dict[str, Any]]:
-        result: list[dict[str, Any]] = []
+    ) -> list[JsonObject]:
+        result: list[JsonObject] = []
         for value in values:
             item = dict(value)
-            recording = cast(dict[str, Any], item["recording"])
-            chunk = dict(cast(dict[str, Any], item["chunk"]))
-            key = (str(recording["id"]), int(chunk["start_ms"]), int(chunk["end_ms"]))
+            recording = cast(JsonObject, item["recording"])
+            chunk = dict(cast(JsonObject, item["chunk"]))
+            key = (str(recording["id"]), cast(int, chunk["start_ms"]), cast(int, chunk["end_ms"]))
             if key not in cache:
                 with self._engine.connect() as connection:
                     self._set_statement_timeout(connection)
@@ -183,7 +237,7 @@ class RagRetriever:
         embedding: list[float],
         filters: ResolvedFilters,
         limit: int | None = None,
-    ) -> list[dict[str, object]]:
+    ) -> list[RetrievalCandidateRow]:
         vector = "[" + ",".join(f"{item:.8g}" for item in embedding) + "]"
         values: dict[str, object] = {
             "embedding": vector,
@@ -204,7 +258,7 @@ class RagRetriever:
         with self._engine.connect() as connection:
             self._set_statement_timeout(connection)
             return [
-                dict(row)
+                _retrieval_candidate_row(row)
                 for row in (
                     connection.execute(
                         text(
@@ -235,7 +289,7 @@ class RagRetriever:
         topic: str,
         filters: ResolvedFilters,
         limit: int | None = None,
-    ) -> list[dict[str, object]]:
+    ) -> list[RetrievalCandidateRow]:
         query = normalize_search_text(topic)
         if not query:
             return []
@@ -251,7 +305,7 @@ class RagRetriever:
         with self._engine.connect() as connection:
             self._set_statement_timeout(connection)
             return [
-                dict(row)
+                _retrieval_candidate_row(row)
                 for row in (
                     connection.execute(
                         text(
@@ -284,35 +338,35 @@ class RagRetriever:
 
     def fuse_candidates(
         self,
-        vector_rows: list[dict[str, object]],
-        lexical_rows: list[dict[str, object]],
+        vector_rows: list[RetrievalCandidateRow],
+        lexical_rows: list[RetrievalCandidateRow],
         limit: int,
-    ) -> list[dict[str, object]]:
+    ) -> list[RetrievalCandidateRow]:
         return self.fuse_candidate_lists([vector_rows], [lexical_rows], limit)
 
     def fuse_candidate_lists(
         self,
-        vector_lists: list[list[dict[str, object]]],
-        lexical_lists: list[list[dict[str, object]]],
+        vector_lists: list[list[RetrievalCandidateRow]],
+        lexical_lists: list[list[RetrievalCandidateRow]],
         limit: int,
-    ) -> list[dict[str, object]]:
+    ) -> list[RetrievalCandidateRow]:
         """Fuse each retrieval query's ranked list with RRF before applying Top-N."""
 
-        candidates: dict[UUID, RetrievalCandidate] = {}
+        candidates: dict[UUID, RankedCandidate] = {}
         for rows in vector_lists:
             for rank, row in enumerate(rows, start=1):
-                chunk_id = cast(UUID, row["chunk_id"])
-                candidate = candidates.setdefault(chunk_id, RetrievalCandidate(row=row))
+                chunk_id = row["chunk_id"]
+                candidate = candidates.setdefault(chunk_id, RankedCandidate(row=row))
                 candidate.vector_rank = min(candidate.vector_rank, rank) if candidate.vector_rank is not None else rank
-                score = float(cast(float, row["score"]))
+                score = row["score"]
                 candidate.vector_score = max(candidate.vector_score, score) if candidate.vector_score is not None else score
                 candidate.fused_score += self._settings.rag_vector_weight / (self._settings.rag_rrf_k + rank)
         for rows in lexical_lists:
             for rank, row in enumerate(rows, start=1):
-                chunk_id = cast(UUID, row["chunk_id"])
-                candidate = candidates.setdefault(chunk_id, RetrievalCandidate(row=row))
+                chunk_id = row["chunk_id"]
+                candidate = candidates.setdefault(chunk_id, RankedCandidate(row=row))
                 candidate.lexical_rank = min(candidate.lexical_rank, rank) if candidate.lexical_rank is not None else rank
-                score = float(cast(float, row["score"]))
+                score = row["score"]
                 candidate.lexical_score = max(candidate.lexical_score, score) if candidate.lexical_score is not None else score
                 candidate.fused_score += self._settings.rag_lexical_weight / (self._settings.rag_rrf_k + rank)
         ordered = sorted(
@@ -323,9 +377,9 @@ class RagRetriever:
                 str(item.row["chunk_id"]),
             ),
         )
-        result: list[dict[str, object]] = []
+        result: list[RetrievalCandidateRow] = []
         for candidate in ordered[: min(limit, self._settings.rag_fused_candidate_limit)]:
-            row = dict(candidate.row)
+            row = candidate.row.copy()
             row["score"] = candidate.fused_score
             row["match_type"] = (
                 "hybrid"
@@ -337,7 +391,7 @@ class RagRetriever:
             result.append(row)
         return result
 
-    def expand_candidates(self, rows: list[dict[str, object]]) -> list[Evidence]:
+    def expand_candidates(self, rows: list[RetrievalCandidateRow]) -> list[Evidence]:
         with self._engine.connect() as connection:
             self._set_statement_timeout(connection)
             expanded = self._expand_chunk_contexts(connection, rows)
@@ -375,31 +429,31 @@ class RagRetriever:
         ], result
 
     @staticmethod
-    def _merge_overlapping_contexts(rows: list[dict[str, object]]) -> list[dict[str, object]]:
+    def _merge_overlapping_contexts(rows: list[RetrievalCandidateRow]) -> list[RetrievalCandidateRow]:
         """Merge expanded candidates that cover the same recording time range."""
 
-        merged: list[dict[str, object]] = []
+        merged: list[RetrievalCandidateRow] = []
         for row in rows:
             overlapping = next(
                 (
                     item
                     for item in merged
                     if item["recording_id"] == row["recording_id"]
-                    and int(cast(int, item["start_ms"])) <= int(cast(int, row["end_ms"]))
-                    and int(cast(int, row["start_ms"])) <= int(cast(int, item["end_ms"]))
+                    and item["start_ms"] <= row["end_ms"]
+                    and row["start_ms"] <= item["end_ms"]
                 ),
                 None,
             )
             if overlapping is None:
-                merged.append(dict(row))
+                merged.append(row.copy())
                 continue
             overlapping["start_ms"] = min(
-                int(cast(int, overlapping["start_ms"])),
-                int(cast(int, row["start_ms"])),
+                overlapping["start_ms"],
+                row["start_ms"],
             )
             overlapping["end_ms"] = max(
-                int(cast(int, overlapping["end_ms"])),
-                int(cast(int, row["end_ms"])),
+                overlapping["end_ms"],
+                row["end_ms"],
             )
             overlapping["text"] = "\n".join(
                 dict.fromkeys(
@@ -412,16 +466,16 @@ class RagRetriever:
             overlapping["speaker_labels"] = list(
                 dict.fromkeys(
                     [
-                        *cast(list[str], overlapping.get("speaker_labels") or []),
-                        *cast(list[str], row.get("speaker_labels") or []),
+                        *overlapping["speaker_labels"],
+                        *row["speaker_labels"],
                     ]
                 )
             )
             overlapping["matched_speaker_profile_ids"] = list(
                 dict.fromkeys(
                     [
-                        *cast(list[UUID], overlapping.get("matched_speaker_profile_ids") or []),
-                        *cast(list[UUID], row.get("matched_speaker_profile_ids") or []),
+                        *overlapping.get("matched_speaker_profile_ids", []),
+                        *row.get("matched_speaker_profile_ids", []),
                     ]
                 )
             )
@@ -441,8 +495,8 @@ class RagRetriever:
             return self.expand_candidates(self.retrieve_candidates(topic, filters, limit))
 
         started = perf_counter()
-        vector_rows: list[dict[str, object]] = []
-        lexical_rows: list[dict[str, object]] = []
+        vector_rows: list[RetrievalCandidateRow] = []
+        lexical_rows: list[RetrievalCandidateRow] = []
         vector_error: Exception | None = None
         lexical_error: Exception | None = None
         try:
@@ -491,14 +545,14 @@ class RagRetriever:
         )
         return evidence
 
-    def retrieve_candidates(self, topic: str, filters: ResolvedFilters, limit: int) -> list[dict[str, object]]:
+    def retrieve_candidates(self, topic: str, filters: ResolvedFilters, limit: int) -> list[RetrievalCandidateRow]:
         embedding = self.generate_query_embedding(topic)
         rows = self.retrieve_vector_candidates(embedding, filters, limit)
         for row in rows:
             row["match_type"] = "vector"
         return rows
 
-    def _expand_chunk_contexts(self, connection: Any, rows: list[dict[str, object]]) -> list[dict[str, object]]:
+    def _expand_chunk_contexts(self, connection: Any, rows: list[RetrievalCandidateRow]) -> list[RetrievalCandidateRow]:
         window = self._settings.rag_chunk_context_window_utterances
         chunk_ids = [str(row["chunk_id"]) for row in rows if row.get("source_utterance_segment_ids")]
         if not chunk_ids:
@@ -540,12 +594,12 @@ class RagRetriever:
             .mappings()
             .all()
         )
-        utterances_by_chunk: dict[UUID, list[dict[str, object]]] = {}
+        utterances_by_chunk: dict[UUID, list[ExpandedUtteranceRow]] = {}
         for utterance in utterances:
-            utterance_data = dict(utterance)
-            utterances_by_chunk.setdefault(cast(UUID, utterance_data["chunk_id"]), []).append(utterance_data)
+            utterance_data = _expanded_utterance_row(utterance)
+            utterances_by_chunk.setdefault(utterance_data["chunk_id"], []).append(utterance_data)
         for row in rows:
-            chunk_utterances = utterances_by_chunk.get(cast(UUID, row["chunk_id"]), [])
+            chunk_utterances = utterances_by_chunk.get(row["chunk_id"], [])
             if not chunk_utterances:
                 continue
             row["text"] = "\n".join(f"{item['speaker_label'] or 'Unknown Speaker'}: {item['text']}" for item in chunk_utterances)
@@ -566,7 +620,7 @@ class RagRetriever:
         values["offset"] = max(0, min(9, rank - 1)) if rank else 0
         with self._engine.connect() as connection:
             self._set_statement_timeout(connection)
-            recordings = (
+            raw_recordings = (
                 connection.execute(
                     text(
                         f"""select recordings.id, recordings.title, recordings.file_name, recordings.location,
@@ -578,10 +632,11 @@ class RagRetriever:
                 .mappings()
                 .all()
             )
-            if not recordings:
+            if not raw_recordings:
                 return []
-            recording_ids = [cast(UUID, recording["id"]) for recording in recordings]
-            utterance_rows = (
+            recordings = [_scope_recording_row(row) for row in raw_recordings]
+            recording_ids = [recording["id"] for recording in recordings]
+            raw_utterance_rows = (
                 connection.execute(
                     text(
                         """
@@ -629,11 +684,13 @@ class RagRetriever:
                 .mappings()
                 .all()
             )
-        utterances_by_recording: dict[UUID, list[object]] = {recording_id: [] for recording_id in recording_ids}
-        for row in utterance_rows:
-            utterances_by_recording[cast(UUID, row["recording_id"])].append(row)
+        utterances_by_recording: dict[UUID, list[ScopeUtteranceRow]] = {recording_id: [] for recording_id in recording_ids}
+        for raw_row in raw_utterance_rows:
+            row = _scope_utterance_row(raw_row)
+            utterances_by_recording[row["recording_id"]].append(row)
         return [
-            self._scope_evidence(index, recording, utterances_by_recording[cast(UUID, recording["id"])]) for index, recording in enumerate(recordings, start=1)
+            self._scope_evidence(index, recording, utterances_by_recording[recording["id"]])
+            for index, recording in enumerate(recordings, start=1)
         ]
 
     def retrieve_metadata(
@@ -641,7 +698,7 @@ class RagRetriever:
         filters: ResolvedFilters,
         limit: int | None,
         rank: int | None,
-    ) -> list[dict[str, object]]:
+    ) -> list[RecordingMetadataRow]:
         """Load only the trusted recording metadata exposed to metadata_lookup."""
 
         values: dict[str, object] = {}
@@ -689,7 +746,7 @@ class RagRetriever:
                 .mappings()
                 .all()
             )
-            return [dict(row) for row in rows]
+            return [_recording_metadata_row(row) for row in rows]
 
     def _set_statement_timeout(self, connection: Any) -> None:
         if not hasattr(connection, "dialect"):
@@ -700,26 +757,24 @@ class RagRetriever:
         )
 
     @staticmethod
-    def _scope_evidence(index: int, recording: object, utterance_rows: list[object]) -> Evidence:
-        recording_data = cast(dict[str, object], recording)
-        utterances = [cast(dict[str, object], row) for row in utterance_rows]
+    def _scope_evidence(index: int, recording: ScopeRecordingRow, utterances: list[ScopeUtteranceRow]) -> Evidence:
         first_row = utterances[0] if utterances else None
-        speaker_labels = [str(label) for label in cast(list[object], first_row["speaker_labels"])] if first_row is not None else []
-        utterance_count = int(cast(int, first_row["utterance_count"])) if first_row is not None else 0
+        speaker_labels = first_row["speaker_labels"] if first_row is not None else []
+        utterance_count = first_row["utterance_count"] if first_row is not None else 0
         untruncated_body = "\n".join(f"{item['speaker_label'] or 'Unknown Speaker'}: {item['text']}" for item in utterances)
         body = untruncated_body[:MAX_SCOPE_CHARS]
-        start_ms = int(cast(int, utterances[0]["start_ms"])) if utterances else 0
-        end_ms = int(cast(int, utterances[-1]["end_ms"])) if utterances else 0
-        recording_id = cast(UUID, recording_data["id"])
+        start_ms = utterances[0]["start_ms"] if utterances else 0
+        end_ms = utterances[-1]["end_ms"] if utterances else 0
+        recording_id = recording["id"]
         return Evidence(
             index=index,
             recording=EvidenceRecording(
                 id=recording_id,
-                title=str(recording_data["title"]),
-                file_name=str(recording_data["file_name"]),
-                location=cast(str | None, recording_data["location"]),
-                duration_seconds=cast(int | None, recording_data["duration_seconds"]),
-                created_at=cast(datetime, recording_data["created_at"]),
+                title=recording["title"],
+                file_name=recording["file_name"],
+                location=recording["location"],
+                duration_seconds=recording["duration_seconds"],
+                created_at=recording["created_at"],
             ),
             chunk=EvidenceChunk(
                 id=recording_id,
@@ -729,7 +784,7 @@ class RagRetriever:
                 speaker_labels=speaker_labels,
                 is_target_person=any(bool(item["is_target_person"]) for item in utterances),
                 matched_speaker_profiles=list(
-                    dict.fromkeys(cast(UUID, item["speaker_profile_id"]) for item in utterances if item["speaker_profile_id"] is not None)
+                    dict.fromkeys(item["speaker_profile_id"] for item in utterances if item["speaker_profile_id"] is not None)
                 ),
             ),
             score=1.0,
@@ -744,8 +799,7 @@ class RagRetriever:
         )
 
     @staticmethod
-    def _chunk_evidence(index: int, row: object) -> Evidence:
-        data = cast(dict[str, object], row)
+    def _chunk_evidence(index: int, data: RetrievalCandidateRow) -> Evidence:
         raw_metadata = data.get("metadata")
         metadata: dict[str, object] = (
             {key: value for key, value in cast(Mapping[object, object], raw_metadata).items() if isinstance(key, str)}
@@ -759,27 +813,27 @@ class RagRetriever:
         return Evidence(
             index=index,
             recording=EvidenceRecording(
-                id=cast(UUID, data["recording_id"]),
-                title=str(data["title"]),
-                file_name=str(data["file_name"]),
-                location=cast(str | None, data["location"]),
-                duration_seconds=cast(int | None, data["duration_seconds"]),
-                created_at=cast(datetime, data["created_at"]),
+                id=data["recording_id"],
+                title=data["title"],
+                file_name=data["file_name"],
+                location=data["location"],
+                duration_seconds=data["duration_seconds"],
+                created_at=data["created_at"],
             ),
             chunk=EvidenceChunk(
-                id=cast(UUID, data["chunk_id"]),
-                text=str(data["text"]),
-                start_ms=int(cast(int, data["start_ms"])),
-                end_ms=int(cast(int, data["end_ms"])),
-                speaker_labels=cast(list[str], data["speaker_labels"] or []),
-                is_target_person=bool(data["is_target_person"]),
-                matched_speaker_profiles=cast(list[UUID], data.get("matched_speaker_profile_ids") or []),
+                id=data["chunk_id"],
+                text=data["text"],
+                start_ms=data["start_ms"],
+                end_ms=data["end_ms"],
+                speaker_labels=data["speaker_labels"],
+                is_target_person=data["is_target_person"],
+                matched_speaker_profiles=data.get("matched_speaker_profile_ids", []),
                 topic=topic if isinstance(topic, str) and topic else None,
                 terms=terms,
                 search_context=search_context if isinstance(search_context, str) and search_context else None,
             ),
-            score=float(cast(float, data["score"])),
-            match_type=cast(Any, data.get("match_type", "vector")),
+            score=data["score"],
+            match_type=data.get("match_type", "vector"),
             url=f"/recordings/{data['recording_id']}?t={data['start_ms']}&end={data['end_ms']}",
         )
 

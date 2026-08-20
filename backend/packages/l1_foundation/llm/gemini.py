@@ -1,9 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
-from typing import cast
-
-from l1_foundation.llm.contracts import LlmProvider
+from l1_foundation.llm.contracts import JsonObject, JsonValue, LlmProvider
 from l1_foundation.llm.openai_compatible import OpenAiCompatibleLanguageModel, SynchronousRequestRateLimiter
 
 _SUPPORTED_SCHEMA_SCALAR_KEYS = (
@@ -48,37 +45,35 @@ class GeminiLanguageModel(OpenAiCompatibleLanguageModel):
             request_rate_limiter=request_rate_limiter,
         )
 
-    def _json_schema_for_provider(self, schema: Mapping[str, object]) -> Mapping[str, object]:
+    def _json_schema_for_provider(self, schema: JsonObject) -> JsonObject:
         """Return Gemini's supported strict JSON Schema subset."""
 
-        raw_defs: object = schema.get("$defs")
-        definitions: Mapping[str, object] = (
-            cast(Mapping[str, object], raw_defs) if isinstance(raw_defs, Mapping) else dict[str, object]()
-        )
+        raw_defs = schema.get("$defs")
+        definitions = raw_defs if isinstance(raw_defs, dict) else {}
 
-        def normalize(raw: object) -> dict[str, object]:
-            if not isinstance(raw, Mapping):
+        def normalize(raw: JsonValue) -> JsonObject:
+            if not isinstance(raw, dict):
                 return {}
-            node = cast(Mapping[str, object], raw)
-            reference: object = node.get("$ref")
+            node = raw
+            reference = node.get("$ref")
             if isinstance(reference, str) and reference.startswith("#/$defs/"):
-                target: object = definitions.get(reference.removeprefix("#/$defs/"))
+                target = definitions.get(reference.removeprefix("#/$defs/"))
                 return normalize(target)
 
-            normalized: dict[str, object] = {
+            normalized: JsonObject = {
                 key: node[key] for key in _SUPPORTED_SCHEMA_SCALAR_KEYS if key in node
             }
-            raw_any_of: object = node.get("anyOf")
+            raw_any_of = node.get("anyOf")
             if isinstance(raw_any_of, list):
-                any_of_items = cast(list[object], raw_any_of)
+                any_of_items = raw_any_of
 
-                def is_null_schema(item: object) -> bool:
-                    if not isinstance(item, Mapping):
+                def is_null_schema(item: JsonValue) -> bool:
+                    if not isinstance(item, dict):
                         return False
-                    return cast(Mapping[str, object], item).get("type") == "null"
+                    return item.get("type") == "null"
 
                 null_count = sum(1 for item in any_of_items if is_null_schema(item))
-                value_items: list[object] = [item for item in any_of_items if not is_null_schema(item)]
+                value_items = [item for item in any_of_items if not is_null_schema(item)]
                 if null_count == 1 and len(value_items) == 1:
                     nullable = normalize(value_items[0])
                     value_type = nullable.get("type")
@@ -93,27 +88,24 @@ class GeminiLanguageModel(OpenAiCompatibleLanguageModel):
                         normalized["anyOf"] = [normalize(item) for item in any_of_items]
                 else:
                     normalized["anyOf"] = [normalize(item) for item in any_of_items]
-            raw_properties: object = node.get("properties")
-            if isinstance(raw_properties, Mapping):
-                property_map = cast(Mapping[object, object], raw_properties)
-                properties = {str(key): normalize(value) for key, value in property_map.items()}
+            raw_properties = node.get("properties")
+            if isinstance(raw_properties, dict):
+                properties: JsonObject = {key: normalize(value) for key, value in raw_properties.items()}
                 normalized["properties"] = properties
                 raw_required: object = node.get("required")
                 if isinstance(raw_required, list):
                     normalized["required"] = [
                         name
-                        for name in cast(list[object], raw_required)
+                        for name in raw_required
                         if isinstance(name, str) and name in properties
                     ]
                 normalized["additionalProperties"] = False
-            raw_items: object = node.get("items")
-            if isinstance(raw_items, Mapping):
-                normalized["items"] = normalize(cast(Mapping[object, object], raw_items))
-            raw_prefix_items: object = node.get("prefixItems")
+            raw_items = node.get("items")
+            if isinstance(raw_items, dict):
+                normalized["items"] = normalize(raw_items)
+            raw_prefix_items = node.get("prefixItems")
             if isinstance(raw_prefix_items, list):
-                normalized["prefixItems"] = [
-                    normalize(item) for item in cast(list[object], raw_prefix_items)
-                ]
+                normalized["prefixItems"] = [normalize(item) for item in raw_prefix_items]
             return normalized
 
         return normalize(schema)

@@ -34,6 +34,8 @@ def test_route_prompt_relies_on_response_schema_without_embedding_format_instruc
     assert "conversation_history 是按时间升序排列的历史对话数组" in rendered
     assert "sources 只绑定到所在 assistant 消息" in rendered
     assert "current_query 可可靠关联到一条或多条 assistant 历史消息" in rendered
+    assert "显式补全 current_query 中的指代和省略" in rendered
+    assert "这种补全不视为增加新事实" in rendered
     assert "time_range.start 和 time_range.end" in rendered
     assert "左闭右开区间 [start,end)" in rendered
     assert "一周从星期一开始" in rendered
@@ -98,6 +100,19 @@ def test_grade_prompt_uses_a_general_qualified_answer_rule() -> None:
     assert "收购" not in system
 
 
+def test_grade_prompt_keeps_explicit_recording_answers_direct() -> None:
+    prompt, values, _parser = grade_prompt(
+        "I2C 的时延规定是多少",
+        "I2C 有规定，时延不能大于五微秒。",
+    )
+
+    rendered = "\n".join(str(message.content) for message in prompt.invoke(values).to_messages())
+
+    assert "若证据直接陈述了问题所求的结论" in rendered
+    assert "必须选择此项" in rendered
+    assert "不得仅因内容来自录音转写而降为 qualified_answer" in rendered
+
+
 def test_grade_prompt_does_not_decide_answer_planning() -> None:
     prompt, values, _parser = grade_prompt("发布日期是什么", "发布日期是 8 月 1 日。")
 
@@ -127,38 +142,57 @@ def test_direct_answer_prompt_does_not_require_or_expose_an_answer_plan() -> Non
         "发布日期是什么",
         None,
         "[1] 发布日期是 8 月 1 日。",
-        "",
         "direct_answer",
     )
 
     rendered = "\n".join(str(message.content) for message in prompt.invoke(values).to_messages())
 
-    assert "回答计划" not in rendered
+    assert "回答计划：" not in rendered
     assert "仅依据给出的证据" in rendered
     assert "证据评估" not in rendered
     assert "每个可核实的事实性陈述后必须紧跟一个或多个引用标记" in rendered
     assert "不得创造编号" in rendered
 
 
-def test_answer_prompt_requires_inferences_to_remain_qualified() -> None:
-    prompt, values = answer_prompt(
+def test_answer_prompt_uses_the_same_user_facing_style_for_all_verdicts() -> None:
+    qualified_prompt, qualified_values = answer_prompt(
         "对方是否真的想收购",
         None,
         "A：之前经常被你们采风，聊完也没有下文。",
-        "",
         "qualified_answer",
     )
+    direct_prompt, direct_values = answer_prompt(
+        "发布日期是什么",
+        None,
+        "发布日期是 8 月 1 日。",
+        "direct_answer",
+    )
 
-    rendered = "\n".join(str(message.content) for message in prompt.invoke(values).to_messages())
+    qualified_rendered = "\n".join(str(message.content) for message in qualified_prompt.invoke(qualified_values).to_messages())
+    direct_rendered = "\n".join(str(message.content) for message in direct_prompt.invoke(direct_values).to_messages())
 
-    assert "区分证据内容和基于证据的解释" in rendered
-    assert "不得把解释写成确定事实" in rendered
+    assert "像熟悉录音内容的助手一样" in qualified_rendered
+    assert "简单问题直接用一句话或一个短段落回答" in qualified_rendered
+    assert "先给结论，再补充对回答有帮助的必要信息" in qualified_rendered
+    assert "不要说明答案如何得出" in qualified_rendered
+    assert "不要使用“证据内容”“推测/分析”“回答计划”等内部标签" in qualified_rendered
+    assert "不得把不确定的解释写成确定事实" not in qualified_rendered
+    assert qualified_rendered.replace("对方是否真的想收购", "").replace("A：之前经常被你们采风，聊完也没有下文。", "") == direct_rendered.replace("发布日期是什么", "").replace("发布日期是 8 月 1 日。", "")
 
 
 def test_answer_prompt_without_assessment_does_not_invent_assessment_constraints() -> None:
-    prompt, values = answer_prompt("录音有多长", None, "时长：120 秒", "")
+    prompt, values = answer_prompt("录音有多长", None, "时长：120 秒")
 
     rendered = "\n".join(str(message.content) for message in prompt.invoke(values).to_messages())
 
     assert "证据评估" not in rendered
     assert "supported_claims" not in rendered
+
+
+def test_answer_prompt_does_not_receive_conversation_history() -> None:
+    prompt, values = answer_prompt("I2C 的时延是多少", None, "[1] I2C 的时延不能大于五微秒。")
+
+    rendered = "\n".join(str(message.content) for message in prompt.invoke(values).to_messages())
+
+    assert "近期对话" not in rendered
+    assert "history" not in values

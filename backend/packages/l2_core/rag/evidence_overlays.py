@@ -43,10 +43,6 @@ def apply_evidence_overlays(evidence: list[Evidence], overlays: list[EvidenceOve
 
 
 def render_correction_notices(overlays: list[EvidenceOverlay]) -> str:
-    lines = ["转写纠偏（回答必须采用修正表达，并明确告诉用户“将原表达修正为新表达”）："]
-    lines.extend(
-        f"- 证据[{overlay.evidence_index}]：将“{overlay.original_expression}”修正为“{overlay.resolved_expression}”"
-        f"（{overlay.status}，confidence={overlay.confidence:.3f}）"
-        for overlay in overlays
-    )
-    return "\n".join(lines)
+    if not overlays:
+        return ""
+    return "转写纠偏已应用于上述录音正文。回答时仅依据修正后的正文直接回答问题，不要在回答正文中罗列或说明纠偏过程。"

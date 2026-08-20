@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable, Generator, Mapping
+from collections.abc import Awaitable, Callable, Generator
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
 from functools import wraps
@@ -10,7 +10,7 @@ from time import monotonic
 from typing import cast
 
 from l2_core.rag.checkpoint import RagCheckpointSession, completed_state
-from l2_core.rag.contracts import RagGraphState
+from l2_core.rag.contracts import RagGraphState, RagStateUpdate
 
 
 class RagExecutionCancelled(Exception):
@@ -52,7 +52,7 @@ class RagExecutionMiddleware:
             raise_if_rag_cancelled()
             if checkpoint is not None:
                 current_state = cast(RagGraphState, args[0])
-                output = cast(Mapping[str, object], result)
+                output = cast(RagStateUpdate, result)
                 await asyncio.to_thread(checkpoint.save, key, completed_state(current_state, output))
             return result
 

@@ -9,7 +9,7 @@ from langgraph.graph import END, START, StateGraph
 
 from l1_foundation.observability import finish_invocation, finish_span, start_invocation
 from l1_foundation.observability.context import current_span
-from l2_core.rag.contracts import Evidence, RagGraphState, ResolvedFilters
+from l2_core.rag.contracts import Evidence, RagGraphState, RagStateUpdate, ResolvedFilters, RetrievalCandidateRow
 from l2_core.rag.execution_middleware import rag_execution_middleware
 from l2_core.rag.observability import elapsed_ms, log_event, started_at
 from l2_core.rag.retrieval import RagRetriever
@@ -69,7 +69,7 @@ class ChunkEvidencePipeline:
     async def invoke(self, state: RagGraphState) -> RagGraphState:
         return cast(RagGraphState, await self._graph.ainvoke(state))
 
-    async def retrieve(self, state: RagGraphState) -> dict[str, object]:
+    async def retrieve(self, state: RagGraphState) -> RagStateUpdate:
         node_started = self._node_started(state, "retrieve")
         filters = state["filters"]
         if filters is None:
@@ -142,7 +142,7 @@ class ChunkEvidencePipeline:
         expanded_query: str | None = None,
         lexical_queries: list[str] | None = None,
         protected_lexical_queries: list[str] | None = None,
-    ) -> list[dict[str, object]]:
+    ) -> list[RetrievalCandidateRow]:
         if not self._retriever.hybrid_search_enabled:
             vector_started = started_at()
             rows = await asyncio.to_thread(self._retriever.retrieve_candidates, query, filters, limit)
@@ -161,10 +161,10 @@ class ChunkEvidencePipeline:
             protected_lexical_queries=sorted(protected_searches),
         )
 
-        async def vector_search(embedding: list[float]) -> list[dict[str, object]]:
+        async def vector_search(embedding: list[float]) -> list[RetrievalCandidateRow]:
             return await asyncio.to_thread(self._retriever.retrieve_vector_candidates, embedding, filters)
 
-        async def vector_searches() -> list[list[dict[str, object]] | BaseException]:
+        async def vector_searches() -> list[list[RetrievalCandidateRow] | BaseException]:
             try:
                 embeddings = await asyncio.to_thread(self._retriever.generate_query_embeddings, vector_queries)
             except Exception as error:
@@ -264,7 +264,7 @@ class ChunkEvidencePipeline:
         )
         return fused
 
-    async def expand_context(self, state: RagGraphState) -> dict[str, object]:
+    async def expand_context(self, state: RagGraphState) -> RagStateUpdate:
         node_started = self._node_started(state, "expand_context")
         candidates = state["retrieval_candidates"]
         evidence = await asyncio.to_thread(self._retriever.expand_candidates, candidates)
@@ -289,7 +289,7 @@ class ChunkEvidencePipeline:
             return "rerank"
         return "done"
 
-    async def rerank(self, state: RagGraphState) -> dict[str, object]:
+    async def rerank(self, state: RagGraphState) -> RagStateUpdate:
         node_started = self._node_started(state, "rerank")
         evidence = state["evidence"]
         query = state["content_query"]
@@ -391,7 +391,7 @@ def _evidence_log_entries(evidence: list[Evidence]) -> list[dict[str, object]]:
 
 def _candidate_results(
     queries: list[str],
-    results: list[list[dict[str, object]] | BaseException],
+    results: list[list[RetrievalCandidateRow] | BaseException],
 ) -> list[dict[str, object]]:
     return [
         {
@@ -404,7 +404,7 @@ def _candidate_results(
     ]
 
 
-def _candidate_refs(rows: list[dict[str, object]]) -> list[dict[str, object]]:
+def _candidate_refs(rows: list[RetrievalCandidateRow]) -> list[dict[str, object]]:
     return [
         {
             "chunk_id": str(row["chunk_id"]),
@@ -419,16 +419,16 @@ def _candidate_refs(rows: list[dict[str, object]]) -> list[dict[str, object]]:
 
 
 def _retain_protected_lexical_candidates(
-    fused: list[dict[str, object]],
+    fused: list[RetrievalCandidateRow],
     lexical_queries: list[str],
-    lexical_results: list[list[dict[str, object]] | BaseException],
+    lexical_results: list[list[RetrievalCandidateRow] | BaseException],
     protected_queries: set[str],
-) -> list[dict[str, object]]:
+) -> list[RetrievalCandidateRow]:
     """Keep the first exact lexical hit for each meaningful query anchor."""
 
     fused_by_chunk = {str(row["chunk_id"]): row for row in fused}
     protected_by_chunk: dict[str, set[str]] = {}
-    protected_rows: dict[str, dict[str, object]] = {}
+    protected_rows: dict[str, RetrievalCandidateRow] = {}
     for lexical_query, result in zip(lexical_queries, lexical_results, strict=True):
         if lexical_query not in protected_queries or not isinstance(result, list):
             continue
@@ -438,9 +438,11 @@ def _retain_protected_lexical_candidates(
         chunk_id = str(exact_match["chunk_id"])
         protected_rows[chunk_id] = fused_by_chunk.get(chunk_id, exact_match)
         protected_by_chunk.setdefault(chunk_id, set()).add(lexical_query)
-    retained: list[dict[str, object]] = []
+    retained: list[RetrievalCandidateRow] = []
     for chunk_id, row in protected_rows.items():
-        retained.append({**row, "protected_lexical_terms": sorted(protected_by_chunk[chunk_id])})
+        retained_row = row.copy()
+        retained_row["protected_lexical_terms"] = sorted(protected_by_chunk[chunk_id])
+        retained.append(retained_row)
     retained.extend(row for row in fused if str(row["chunk_id"]) not in protected_rows)
     return retained
 

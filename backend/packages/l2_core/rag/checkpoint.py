@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, time
 from enum import Enum
 from pathlib import Path
-from typing import Any, cast
+from typing import cast
 from uuid import UUID
 
 from pydantic import BaseModel
@@ -18,12 +18,15 @@ from l2_core.rag.contracts import (
     AnswerPlan,
     Evidence,
     EvidenceGrade,
+    JsonObject,
+    JsonValue,
     RagGraphState,
     RagHistoryMessage,
     RagRoute,
+    RagStateUpdate,
     ResolvedFilters,
+    StrategyResult,
 )
-from l2_core.rag.strategies.base import StrategyResult
 
 WORKFLOW_VERSION = "rag-v11"
 
@@ -54,9 +57,9 @@ class RagCheckpointStore:
         self._redis_store = redis
         self._ttl_seconds = ttl_seconds
 
-    def load_all(self, generation_id: UUID, input_hash: str) -> list[tuple[str, str, dict[str, Any]]]:
+    def load_all(self, generation_id: UUID, input_hash: str) -> list[tuple[str, str, JsonObject]]:
         values = self._redis_store.get_states_by_pattern(f"generation:{generation_id}:rag-checkpoint:*")
-        checkpoints: list[tuple[str, str, dict[str, Any]]] = []
+        checkpoints: list[tuple[str, str, JsonObject]] = []
         for value in values.values():
             if (
                 value.get("status") != "completed"
@@ -71,7 +74,7 @@ class RagCheckpointStore:
                 (
                     cast(str, value["completed_at"]),
                     cast(str, value["node"]),
-                    cast(dict[str, Any], value["state"]),
+                    cast(JsonObject, value["state"]),
                 )
             )
         return sorted(checkpoints, key=lambda checkpoint: checkpoint[0])
@@ -102,7 +105,7 @@ class RagCheckpointSession:
     generation_id: UUID
     source_generation_id: UUID | None
     input_hash: str
-    hydrate_state: Callable[[dict[str, Any]], dict[str, Any]]
+    hydrate_state: Callable[[JsonObject], JsonObject]
     rerun_nodes: set[str] = field(default_factory=_string_set)
     repeatable_nodes: set[str] = field(default_factory=_string_set)
 
@@ -137,40 +140,42 @@ class RagCheckpointSession:
             self._completed_nodes.add(node)
 
 
-def completed_state(current: RagGraphState, output: Mapping[str, object]) -> RagGraphState:
+def completed_state(current: RagGraphState, output: RagStateUpdate) -> RagGraphState:
     merged = cast(RagGraphState, {**current, **output})
     if "token_usage" in output:
-        merged["token_usage"] = current.get("token_usage", 0) + int(cast(int, output["token_usage"]))
+        merged["token_usage"] = current.get("token_usage", 0) + output["token_usage"]
     return merged
 
 
-def _serialize_state_without_evidence_text(state: RagGraphState) -> dict[str, Any]:
-    serialized = cast(dict[str, Any], _json_value(dict(state)))
-    for candidate in cast(list[dict[str, Any]], serialized.get("retrieval_candidates", [])):
-        candidate.pop("text", None)
+def _serialize_state_without_evidence_text(state: RagGraphState) -> JsonObject:
+    serialized = cast(JsonObject, _json_value(dict(state)))
+    raw_candidates = serialized.get("retrieval_candidates")
+    if isinstance(raw_candidates, list):
+        for candidate in raw_candidates:
+            if isinstance(candidate, dict):
+                candidate.pop("text", None)
     for state_field in ("evidence", "answer_evidence"):
-        _strip_evidence_text(cast(list[dict[str, Any]], serialized.get(state_field, [])))
+        _strip_evidence_text(serialized.get(state_field))
     raw_strategy = serialized.get("strategy_result")
     if isinstance(raw_strategy, dict):
-        strategy = cast(dict[str, Any], raw_strategy)
-        strategy["answer_context"] = ""
-        if strategy.get("corrected_answer_context") is not None:
-            strategy["corrected_answer_context"] = ""
-        _strip_evidence_text(cast(list[dict[str, Any]], strategy.get("evidence", [])))
+        raw_strategy["answer_context"] = ""
+        if raw_strategy.get("corrected_answer_context") is not None:
+            raw_strategy["corrected_answer_context"] = ""
+        _strip_evidence_text(raw_strategy.get("evidence"))
     return serialized
 
 
-def _strip_evidence_text(items: list[dict[str, Any]]) -> None:
-    for item in items:
-        raw_chunk = item.get("chunk")
-        if isinstance(raw_chunk, dict):
-            chunk = cast(dict[str, Any], raw_chunk)
+def _strip_evidence_text(value: JsonValue | None) -> None:
+    if not isinstance(value, list):
+        return
+    for item in value:
+        if isinstance(item, dict) and isinstance((chunk := item.get("chunk")), dict):
             chunk.pop("text", None)
 
 
-def _json_value(value: object) -> object:
+def _json_value(value: object) -> JsonValue:
     if isinstance(value, BaseModel):
-        return value.model_dump(mode="json")
+        return _json_value(value.model_dump(mode="json"))
     if isinstance(value, Mapping):
         mapping = cast(Mapping[object, object], value)
         return {str(key): _json_value(item) for key, item in mapping.items()}
@@ -182,17 +187,21 @@ def _json_value(value: object) -> object:
         return str(value)
     if isinstance(value, Enum):
         return _json_value(value.value)
-    return value
+    if value is None or isinstance(value, bool | int | float | str):
+        return value
+    raise TypeError(f"Unsupported checkpoint value: {type(value).__name__}")
 
 
-def _deserialize_state(value: dict[str, Any]) -> RagGraphState:
-    state = dict(value)
-    state["history"] = [RagHistoryMessage.model_validate(item) for item in state.get("history", [])]
+def _deserialize_state(value: JsonObject) -> RagGraphState:
+    state: dict[str, object] = dict(value)
+    state["history"] = [RagHistoryMessage.model_validate(item) for item in cast(list[object], state.get("history", []))]
     state["route"] = RagRoute.model_validate(state["route"]) if state.get("route") is not None else None
     state["filters"] = ResolvedFilters.model_validate(state["filters"]) if state.get("filters") is not None else None
-    state["evidence"] = [Evidence.model_validate(item) for item in state.get("evidence", [])]
-    state["answer_evidence"] = [Evidence.model_validate(item) for item in state.get("answer_evidence", [])]
+    state["evidence"] = [Evidence.model_validate(item) for item in cast(list[object], state.get("evidence", []))]
+    state["answer_evidence"] = [Evidence.model_validate(item) for item in cast(list[object], state.get("answer_evidence", []))]
     state["grade"] = EvidenceGrade.model_validate(state["grade"]) if state.get("grade") is not None else None
+    state["original_grade"] = EvidenceGrade.model_validate(state["original_grade"]) if state.get("original_grade") is not None else None
+    state["corrected_grade"] = EvidenceGrade.model_validate(state["corrected_grade"]) if state.get("corrected_grade") is not None else None
     state["answer_plan"] = AnswerPlan.model_validate(state["answer_plan"]) if state.get("answer_plan") is not None else None
     state["adjudication_agent_state"] = (
         AdjudicationAgentState.model_validate(state["adjudication_agent_state"])

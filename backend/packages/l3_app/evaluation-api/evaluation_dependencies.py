@@ -10,6 +10,7 @@ from l2_core.audio_processing.stages.transcribe_qwen_asr.context import build_qw
 from l2_core.auth.authorization import AuthorizationService
 from l2_core.auth.contracts import CurrentUser
 from l2_core.auth.service import AuthenticationError, AuthService
+from l2_core.rag_adjudication_evaluation.service import RagAdjudicationEvaluationService
 from l2_core.rag_evaluation.service import RagEvaluationService
 
 
@@ -60,3 +61,13 @@ def get_rag_evaluation_service(request: Request) -> RagEvaluationService:
 
 
 RagEvaluationServiceDependency = Annotated[RagEvaluationService, Depends(get_rag_evaluation_service)]
+
+
+def get_rag_adjudication_evaluation_service(request: Request) -> RagAdjudicationEvaluationService:
+    return RagAdjudicationEvaluationService(request.app.state.database_engine, request.app.state.settings)
+
+
+RagAdjudicationEvaluationServiceDependency = Annotated[
+    RagAdjudicationEvaluationService,
+    Depends(get_rag_adjudication_evaluation_service),
+]

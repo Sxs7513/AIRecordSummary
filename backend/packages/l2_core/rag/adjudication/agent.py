@@ -41,13 +41,14 @@ from l2_core.rag.adjudication.prompts import (
     expression_audit_prompt,
 )
 from l2_core.rag.adjudication.web_research import GroundedSearchClient
-from l2_core.rag.contracts import AnswerPlan, AnswerPlanItem, Evidence, RagGraphState
+from l2_core.rag.contracts import AnswerPlan, AnswerPlanItem, Evidence, RagGraphState, RagStateUpdate
 from l2_core.rag.execution_middleware import rag_execution_middleware
 from l2_core.rag.token_budget import RagTokenBudgetMiddleware
 
 logger = logging.getLogger("rag")
 StructuredCompleter = Callable[[list[BaseMessage], dict[str, Any]], Awaitable[LlmGenerateResult]]
 EventLogger = Callable[..., None]
+_MAX_REFERENCE_EVIDENCE = 5
 
 
 class NodeStarted(Protocol):
@@ -147,7 +148,7 @@ class EvidenceAdjudicationAgent:
         )
         self._graph: Any = builder.compile()
 
-    async def start(self, state: RagGraphState) -> Mapping[str, object]:
+    async def start(self, state: RagGraphState) -> RagStateUpdate:
         """Initialize if needed, then run the checkpointable internal agent graph to completion."""
 
         initial_tokens = state.get("token_usage", 0)
@@ -201,7 +202,7 @@ class EvidenceAdjudicationAgent:
             "token_usage": max(0, result.get("token_usage", 0) - initial_tokens),
         }
 
-    async def _agent_step_node(self, state: RagGraphState) -> dict[str, object]:
+    async def _agent_step_node(self, state: RagGraphState) -> RagStateUpdate:
         node_started = self._node_started(state, "adjudication_agent_step")
         agent = state["adjudication_agent_state"]
         if agent is None:
@@ -235,12 +236,12 @@ class EvidenceAdjudicationAgent:
             operation=transition.operation,
             model_execution="online" if transition.completion is not None else "none",
         )
-        output: dict[str, object] = {"adjudication_agent_state": transition.state}
+        output: RagStateUpdate = {"adjudication_agent_state": transition.state}
         if transition.completion is not None:
             output["token_usage"] = self._token_budget.actual_usage(transition.completion)
         return output
 
-    async def _execute_operation_node(self, state: RagGraphState) -> dict[str, object]:
+    async def _execute_operation_node(self, state: RagGraphState) -> RagStateUpdate:
         node_started = self._node_started(state, "adjudication_execute_operation")
         agent = state["adjudication_agent_state"]
         if agent is None:
@@ -298,7 +299,7 @@ class EvidenceAdjudicationAgent:
             terminal=transition.terminal,
             model_execution="online" if transition.completion is not None else "none",
         )
-        output: dict[str, object] = {"adjudication_agent_state": transition.state}
+        output: RagStateUpdate = {"adjudication_agent_state": transition.state}
         if transition.completion is not None:
             output["token_usage"] = self._token_budget.actual_usage(transition.completion)
         return output
@@ -1350,15 +1351,11 @@ class EvidenceAdjudicationAgent:
             query=state["query"],
             plan=case_plan,
             evidence=evidence,
-            reference_evidence=sorted(
-                [
-                    item
-                    for item in state["answer_evidence"]
-                    if item.recording.id == evidence.recording.id
-                    and not (item.index == evidence.index and item.chunk.id == evidence.chunk.id)
-                ],
-                key=lambda item: (item.chunk.start_ms, item.chunk.end_ms, item.index),
-            ),
+            reference_evidence=[
+                item
+                for item in state["answer_evidence"]
+                if not (item.index == evidence.index and item.chunk.id == evidence.chunk.id)
+            ][:_MAX_REFERENCE_EVIDENCE],
             run_id=state.get("run_id", "standalone"),
         )
 

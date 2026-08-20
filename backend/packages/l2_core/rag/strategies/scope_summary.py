@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from typing import Any, Literal, cast
 
 from langgraph.graph import END, START, StateGraph
 
-from l2_core.rag.contracts import Evidence, EvidenceGrade, RagGraphState
+from l2_core.rag.contracts import Evidence, EvidenceGrade, RagGraphState, RagStateUpdate
 from l2_core.rag.execution_middleware import rag_execution_middleware
 from l2_core.rag.observability import started_at
 from l2_core.rag.retrieval import RagRetriever
@@ -54,7 +54,7 @@ class ScopeSummaryStrategy:
         builder.add_edge("finalize", END)
         self._graph: Any = builder.compile()
 
-    async def invoke(self, state: RagGraphState) -> Mapping[str, object]:
+    async def invoke(self, state: RagGraphState) -> RagStateUpdate:
         initial_tokens = state.get("token_usage", 0)
         result = cast(RagGraphState, await self._graph.ainvoke(state))
         return {
@@ -68,7 +68,7 @@ class ScopeSummaryStrategy:
             "strategy_result": result["strategy_result"],
         }
 
-    async def _retrieve(self, state: RagGraphState) -> dict[str, object]:
+    async def _retrieve(self, state: RagGraphState) -> RagStateUpdate:
         node_started = self._node_started(state, "retrieve_scope")
         route = state["route"]
         filters = state["filters"]
@@ -108,7 +108,7 @@ class ScopeSummaryStrategy:
         return "prepare_scope"
 
     @staticmethod
-    async def _prepare(state: RagGraphState) -> dict[str, object]:
+    async def _prepare(state: RagGraphState) -> RagStateUpdate:
         return {
             "grade": EvidenceGrade(
                 verdict="direct_answer",
@@ -116,7 +116,7 @@ class ScopeSummaryStrategy:
             )
         }
 
-    async def _finalize(self, state: RagGraphState) -> dict[str, object]:
+    async def _finalize(self, state: RagGraphState) -> RagStateUpdate:
         answer_evidence = state["answer_evidence"] or state["evidence"]
         ready = bool(answer_evidence)
         return {

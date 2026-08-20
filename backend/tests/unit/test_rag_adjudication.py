@@ -1028,6 +1028,42 @@ def test_adjudication_initialization_honors_configured_case_limit() -> None:
     assert [case.evidence_index for case in state.cases] == [1, 2, 3, 4, 5]
 
 
+def test_adjudication_context_uses_up_to_five_cross_recording_references() -> None:
+    evidence = [
+        Evidence(
+            index=index,
+            recording=EvidenceRecording(id=uuid4(), title=f"录音 {index}", file_name=f"{index}.mp3"),
+            chunk=EvidenceChunk(id=uuid4(), text=f"证据 {index}", start_ms=index * 1_000, end_ms=(index + 1) * 1_000),
+            score=1,
+            match_type="vector",
+            url=f"/recordings/{index}",
+        )
+        for index in range(1, 8)
+    ]
+    target = evidence[2]
+    agent = object.__new__(EvidenceAdjudicationAgent)
+    agent_state = AdjudicationAgentState(
+        risk=True,
+        cases=[EvidenceAdjudicationCaseState(evidence_index=target.index, chunk_id=target.chunk.id)],
+    )
+
+    context = agent._context(  # pyright: ignore[reportPrivateUsage]
+        cast(
+            Any,
+            {
+                "query": "问题",
+                "answer_plan": None,
+                "answer_evidence": evidence,
+                "run_id": "run-1",
+            },
+        ),
+        agent_state,
+    )
+
+    assert [item.index for item in context.reference_evidence] == [1, 2, 4, 5, 6]
+    assert all(item.recording.id != target.recording.id for item in context.reference_evidence)
+
+
 def test_adjudication_static_prompts_are_bounded_and_contain_no_example_answers() -> None:
     recording_id = uuid4()
     evidence = Evidence(

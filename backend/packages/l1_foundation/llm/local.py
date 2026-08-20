@@ -3,20 +3,22 @@ from __future__ import annotations
 import gc
 import json
 import logging
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from importlib import import_module
 from pathlib import Path
-from typing import Any, Protocol, cast
+from typing import NotRequired, Protocol, TypedDict, cast
 
 from l1_foundation.llm.contracts import (
     ChatMessage,
     CompletionOptions,
+    JsonObject,
     LanguageModel,
     LlmCompletion,
     LlmProvider,
     LlmStreamEvent,
     ProviderCapabilities,
     ResponseFormatType,
+    as_json_object,
 )
 from l1_foundation.llm.errors import LlmConfigurationError, LlmResponseError
 
@@ -24,10 +26,23 @@ logger = logging.getLogger("llm")
 STOP_TOKENS = ["</s>", "<|im_end|>"]
 
 
-class LlamaModel(Protocol):
-    metadata: Mapping[str, object]
+class LlamaInvocationOptions(TypedDict):
+    max_tokens: int
+    temperature: float
+    stop: list[str]
+    echo: bool
+    stream: bool
+    grammar: NotRequired[object]
 
-    def __call__(self, prompt: str, **kwargs: object) -> Mapping[str, object] | Iterable[Mapping[str, object]]: ...
+
+class LlamaTokenizerHandle(Protocol):
+    def token_get_text(self, token_id: int) -> str: ...
+
+
+class LlamaModel(Protocol):
+    metadata: JsonObject
+
+    def __call__(self, prompt: str, **kwargs: object) -> JsonObject | Iterable[JsonObject]: ...
 
     def close(self) -> None: ...
 
@@ -87,9 +102,9 @@ class LocalLlamaLanguageModel(LanguageModel):
             logger.info("Local LLM GPU inference failed; retrying on CPU", exc_info=True)
             self._switch_to_cpu()
             response = self._load_model()(prompt, **invoke_options)
-        if not isinstance(response, Mapping):
+        if not isinstance(response, dict):
             raise LlmResponseError("Local LLM returned an invalid non-streaming response")
-        text, finish_reason = self._completion_text(cast(Mapping[str, object], response))
+        text, finish_reason = self._completion_text(cast(JsonObject, response))
         if not text.strip():
             raise LlmResponseError("Local LLM returned an empty completion")
         clean_text = text.strip()
@@ -121,11 +136,11 @@ class LocalLlamaLanguageModel(LanguageModel):
 
     def _stream_response(
         self,
-        response: Mapping[str, object] | Iterable[Mapping[str, object]],
+        response: JsonObject | Iterable[JsonObject],
         prompt_tokens: int,
     ) -> Iterator[LlmStreamEvent]:
-        if isinstance(response, Mapping):
-            text, finish_reason = self._completion_text(cast(Mapping[str, object], response))
+        if isinstance(response, dict):
+            text, finish_reason = self._completion_text(cast(JsonObject, response))
             if text:
                 yield LlmStreamEvent(
                     text,
@@ -186,10 +201,10 @@ class LocalLlamaLanguageModel(LanguageModel):
             gc.collect()
             logger.info("Local LLM：模型已释放 model=%s", self.model_name)
 
-    def _invoke_options(self, options: CompletionOptions, *, stream: bool) -> dict[str, object]:
+    def _invoke_options(self, options: CompletionOptions, *, stream: bool) -> LlamaInvocationOptions:
         if options.model is not None and options.model != self.model_name:
             raise LlmConfigurationError("local LLM does not support per-request model overrides")
-        values: dict[str, object] = {
+        values: LlamaInvocationOptions = {
             "max_tokens": options.max_tokens,
             "temperature": options.temperature,
             "stop": STOP_TOKENS,
@@ -261,9 +276,7 @@ class LocalLlamaLanguageModel(LanguageModel):
 
     def _chat_prompt(self, messages: Sequence[ChatMessage], options: CompletionOptions) -> str:
         model = self._load_model()
-        metadata_value = cast(object, getattr(model, "metadata", None))
-        metadata: Mapping[str, object] = cast(Mapping[str, object], metadata_value) if isinstance(metadata_value, Mapping) else dict[str, object]()
-        template: object | None = metadata.get("tokenizer.chat_template")
+        template = model.metadata.get("tokenizer.chat_template")
         enable_thinking = options.enbale_thinking
         if isinstance(template, str) and template:
             try:
@@ -271,9 +284,9 @@ class LocalLlamaLanguageModel(LanguageModel):
                 formatter_factory = formatter_module.Jinja2ChatFormatter
                 eos_token_id = model.token_eos()
                 bos_token_id = model.token_bos()
-                concrete_model = cast(Any, model)
-                eos_token = concrete_model._model.token_get_text(eos_token_id) if eos_token_id != -1 else "<|im_end|>"
-                bos_token = concrete_model._model.token_get_text(bos_token_id) if bos_token_id != -1 else ""
+                tokenizer = cast(LlamaTokenizerHandle, object.__getattribute__(model, "_model"))
+                eos_token = tokenizer.token_get_text(eos_token_id) if eos_token_id != -1 else "<|im_end|>"
+                bos_token = tokenizer.token_get_text(bos_token_id) if bos_token_id != -1 else ""
                 formatter = formatter_factory(
                     template=template,
                     eos_token=eos_token,
@@ -287,12 +300,17 @@ class LocalLlamaLanguageModel(LanguageModel):
         return "".join(f"<|im_start|>{message.role.value}\n{message.content.strip()}\n<|im_end|>\n" for message in messages) + "<|im_start|>assistant\n"
 
     @staticmethod
-    def _completion_text(response: Mapping[str, object], allow_empty: bool = False) -> tuple[str, str | None]:
+    def _completion_text(response: JsonObject, allow_empty: bool = False) -> tuple[str, str | None]:
         choices = response.get("choices")
-        if not isinstance(choices, list) or not choices or not isinstance(choices[0], Mapping):
+        if not isinstance(choices, list) or not choices:
             if allow_empty:
                 return "", None
             raise LlmResponseError("Local LLM returned no completion choices")
-        choice = cast(Mapping[str, object], choices[0])
+        try:
+            choice = as_json_object(choices[0])
+        except TypeError as error:
+            if allow_empty:
+                return "", None
+            raise LlmResponseError("Local LLM returned an invalid completion choice") from error
         finish_reason = choice.get("finish_reason")
         return str(choice.get("text") or ""), str(finish_reason) if finish_reason is not None else None

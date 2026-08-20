@@ -210,7 +210,7 @@ class RagService:
                             "status": "pending",
                         },
                     },
-                    sources,
+                    [dict(source) for source in sources],
                     preserve_checkpoints=True,
                 )
                 log_event(
@@ -226,7 +226,7 @@ class RagService:
                 sink.text(answer)
             sink.succeed(
                 {"notEnoughEvidence": not_enough_evidence, "message": message},
-                sources,
+                [dict(source) for source in sources],
                 final_text=None if sink.has_aggregate_message else answer,
             )
             log_event(

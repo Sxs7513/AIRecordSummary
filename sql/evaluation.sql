@@ -12,7 +12,7 @@ create table if not exists evaluation_datasets (
     workspace_id uuid not null references workspaces(id) on delete restrict,
     name text not null,
     description text,
-    task_type text not null check (task_type in ('asr', 'rag_retrieval', 'rag_answer')),
+    task_type text not null check (task_type in ('asr', 'rag_retrieval', 'rag_adjudication', 'rag_answer')),
     status text not null default 'active' check (status in ('active', 'archived')),
     created_by_user_id uuid not null references users(id) on delete restrict,
     archived_at timestamptz,
@@ -44,7 +44,7 @@ alter table evaluation_datasets
     drop constraint if exists evaluation_datasets_task_type_check;
 alter table evaluation_datasets
     add constraint evaluation_datasets_task_type_check
-    check (task_type in ('asr', 'rag_retrieval', 'rag_answer'));
+    check (task_type in ('asr', 'rag_retrieval', 'rag_adjudication', 'rag_answer'));
 
 -- Exactly one source is present:
 -- - recording_id imports an existing production recording;
@@ -334,6 +334,153 @@ begin
     end if;
 end $$;
 
+
+
+
+-- RAG adjudication evaluation ---------------------------------------------
+-- Component evaluation starts from frozen Evidence snapshots and does not
+-- depend on live retrieval or on the continued existence of source recordings.
+
+create table if not exists rag_adjudication_evaluation_case_drafts (
+    id uuid primary key default gen_random_uuid(),
+    dataset_id uuid not null references evaluation_datasets(id) on delete restrict,
+    query text not null,
+    tags text[] not null default '{}',
+    status text not null default 'draft' check (status in ('draft', 'reviewed', 'approved')),
+    revision integer not null default 1 check (revision > 0),
+    reviewed_by_user_id uuid references users(id) on delete restrict,
+    reviewed_at timestamptz,
+    approved_by_user_id uuid references users(id) on delete restrict,
+    approved_at timestamptz,
+    created_by_user_id uuid not null references users(id) on delete restrict,
+    created_at timestamptz not null default now(),
+    updated_at timestamptz not null default now(),
+    check (length(btrim(query)) > 0),
+    check ((reviewed_by_user_id is null) = (reviewed_at is null)),
+    check ((approved_by_user_id is null) = (approved_at is null))
+);
+
+comment on table rag_adjudication_evaluation_case_drafts is
+    '可编辑的 RAG ASR 文本裁决评测 Case 草稿，经过审核和批准后可冻结为版本快照。';
+
+create index if not exists rag_adjudication_case_drafts_dataset_idx
+    on rag_adjudication_evaluation_case_drafts (dataset_id, updated_at desc);
+
+create table if not exists rag_adjudication_evaluation_evidence_drafts (
+    id uuid primary key default gen_random_uuid(),
+    case_draft_id uuid not null references rag_adjudication_evaluation_case_drafts(id) on delete cascade,
+    role text not null check (role in ('target', 'reference')),
+    position integer not null check (position >= 0),
+    source_recording_id uuid not null,
+    source_chunk_id uuid,
+    recording_title text not null,
+    recording_file_name text not null,
+    chunk_index integer not null check (chunk_index >= 0),
+    text text not null,
+    start_ms integer not null check (start_ms >= 0),
+    end_ms integer not null check (end_ms >= start_ms),
+    metadata jsonb not null default '{}'::jsonb,
+    content_checksum text not null,
+    created_at timestamptz not null default now(),
+    check (length(btrim(text)) > 0),
+    check (length(btrim(content_checksum)) > 0),
+    check (jsonb_typeof(metadata) = 'object'),
+    unique (case_draft_id, role, position),
+    unique (case_draft_id, source_chunk_id)
+);
+
+comment on table rag_adjudication_evaluation_evidence_drafts is
+    '可编辑的 Case 证据草稿；Target 是待裁决文本，Reference 为辅助上下文。';
+
+create index if not exists rag_adjudication_evidence_drafts_case_idx
+    on rag_adjudication_evaluation_evidence_drafts (case_draft_id, role, position);
+
+create table if not exists rag_adjudication_evaluation_correction_drafts (
+    id uuid primary key default gen_random_uuid(),
+    target_evidence_draft_id uuid not null references rag_adjudication_evaluation_evidence_drafts(id) on delete cascade,
+    start_char integer not null check (start_char >= 0),
+    end_char integer not null check (end_char > start_char),
+    original_expression text not null,
+    accepted_expressions text[] not null,
+    created_at timestamptz not null default now(),
+    updated_at timestamptz not null default now(),
+    check (length(btrim(original_expression)) > 0),
+    check (cardinality(accepted_expressions) > 0),
+    unique (target_evidence_draft_id, start_char, end_char)
+);
+
+comment on table rag_adjudication_evaluation_correction_drafts is
+    '可编辑的 Gold 纠偏标注草稿，定义原始文本区间及可接受的纠偏表达。';
+
+create table if not exists rag_adjudication_evaluation_cases (
+    id uuid primary key default gen_random_uuid(),
+    dataset_version_id uuid not null references evaluation_dataset_versions(id) on delete restrict,
+    query text not null,
+    tags text[] not null default '{}',
+    split text not null default 'test' check (split = 'test'),
+    created_at timestamptz not null default now(),
+    check (length(btrim(query)) > 0)
+);
+
+comment on table rag_adjudication_evaluation_cases is
+    '冻结数据集版本中的 RAG ASR 文本裁决评测 Case 快照。';
+
+create index if not exists rag_adjudication_cases_version_idx
+    on rag_adjudication_evaluation_cases (dataset_version_id, id);
+
+create table if not exists rag_adjudication_evaluation_evidence (
+    id uuid primary key default gen_random_uuid(),
+    evaluation_case_id uuid not null references rag_adjudication_evaluation_cases(id) on delete restrict,
+    role text not null check (role in ('target', 'reference')),
+    position integer not null check (position >= 0),
+    source_recording_id uuid not null,
+    source_chunk_id uuid,
+    recording_title text not null,
+    recording_file_name text not null,
+    chunk_index integer not null check (chunk_index >= 0),
+    text text not null,
+    start_ms integer not null check (start_ms >= 0),
+    end_ms integer not null check (end_ms >= start_ms),
+    metadata jsonb not null default '{}'::jsonb,
+    content_checksum text not null,
+    created_at timestamptz not null default now(),
+    check (length(btrim(text)) > 0),
+    check (length(btrim(content_checksum)) > 0),
+    check (jsonb_typeof(metadata) = 'object'),
+    unique (evaluation_case_id, role, position)
+);
+
+comment on table rag_adjudication_evaluation_evidence is
+    '冻结 Case 的证据快照，保存评测所需的 Target 与 Reference 文本和元数据。';
+
+create table if not exists rag_adjudication_evaluation_corrections (
+    id uuid primary key default gen_random_uuid(),
+    target_evidence_id uuid not null references rag_adjudication_evaluation_evidence(id) on delete restrict,
+    start_char integer not null check (start_char >= 0),
+    end_char integer not null check (end_char > start_char),
+    original_expression text not null,
+    accepted_expressions text[] not null,
+    created_at timestamptz not null default now(),
+    check (length(btrim(original_expression)) > 0),
+    check (cardinality(accepted_expressions) > 0),
+    unique (target_evidence_id, start_char, end_char)
+);
+
+comment on table rag_adjudication_evaluation_corrections is
+    '冻结证据上的 Gold 纠偏快照；独立保存评测预期，不依赖 Draft Gold。';
+
+-- Frozen Gold must be a self-contained snapshot.  Draft corrections remain editable
+-- after a version is frozen, so snapshots cannot retain a foreign-key reference to them.
+alter table rag_adjudication_evaluation_corrections
+    drop column if exists source_draft_correction_id;
+
+alter table rag_adjudication_evaluation_cases
+    drop column if exists source_draft_id;
+
+alter table rag_adjudication_evaluation_evidence
+    drop column if exists source_draft_evidence_id;
+
+
 create table if not exists model_versions (
     id uuid primary key default gen_random_uuid(),
     workspace_id uuid not null references workspaces(id) on delete restrict,
@@ -482,6 +629,154 @@ create index if not exists evaluation_runs_workspace_created_idx
     on evaluation_runs (workspace_id, created_at desc);
 create index if not exists evaluation_runs_dataset_idx
     on evaluation_runs (dataset_version_id, split, created_at desc);
+
+
+-- RAG adjudication run and result tables.
+create table if not exists rag_adjudication_evaluation_run_specs (
+    evaluation_run_id uuid primary key references evaluation_runs(id) on delete cascade,
+    config_snapshot jsonb not null default '{}'::jsonb,
+    created_at timestamptz not null default now(),
+    check (jsonb_typeof(config_snapshot) = 'object')
+);
+
+comment on table rag_adjudication_evaluation_run_specs is
+    'RAG ASR 文本裁决评测 Run 的执行配置快照。';
+
+create table if not exists rag_adjudication_evaluation_case_results (
+    id uuid primary key default gen_random_uuid(),
+    evaluation_run_id uuid not null references evaluation_runs(id) on delete cascade,
+    evaluation_case_id uuid not null references rag_adjudication_evaluation_cases(id) on delete restrict,
+    status text not null check (status in ('running', 'succeeded', 'failed')),
+    latency_ms integer check (latency_ms is null or latency_ms >= 0),
+    token_usage integer not null default 0 check (token_usage >= 0),
+    agent_state jsonb,
+    overlays jsonb not null default '[]'::jsonb,
+    pending_confirmation jsonb,
+    error_type text,
+    error_message text,
+    created_at timestamptz not null default now(),
+    updated_at timestamptz not null default now(),
+    check (agent_state is null or jsonb_typeof(agent_state) = 'object'),
+    check (jsonb_typeof(overlays) = 'array'),
+    unique (evaluation_run_id, evaluation_case_id)
+);
+
+comment on table rag_adjudication_evaluation_case_results is
+    '单个冻结 Case 在一次 RAG ASR 文本裁决评测 Run 中的 Agent 输出与执行结果。';
+
+create index if not exists rag_adjudication_case_results_run_idx
+    on rag_adjudication_evaluation_case_results (evaluation_run_id, status);
+
+create table if not exists rag_adjudication_evaluation_correction_results (
+    case_result_id uuid not null references rag_adjudication_evaluation_case_results(id) on delete cascade,
+    gold_correction_id uuid not null references rag_adjudication_evaluation_corrections(id) on delete restrict,
+    matched_proposal_id text,
+    passed boolean not null,
+    actual_expression text,
+    details jsonb not null default '{}'::jsonb,
+    created_at timestamptz not null default now(),
+    primary key (case_result_id, gold_correction_id),
+    check (jsonb_typeof(details) = 'object')
+);
+
+comment on table rag_adjudication_evaluation_correction_results is
+    '单条 Gold 纠偏在一次 Case 评测中的匹配结果与通过状态。';
+
+create table if not exists rag_adjudication_evaluation_metric_values (
+    evaluation_run_id uuid not null references evaluation_runs(id) on delete cascade,
+    metric_name text not null,
+    metric_version text not null,
+    value numeric not null,
+    passed_count integer not null check (passed_count >= 0),
+    sample_count integer not null check (sample_count >= 0),
+    details jsonb not null default '{}'::jsonb,
+    created_at timestamptz not null default now(),
+    primary key (evaluation_run_id, metric_name, metric_version),
+    check (jsonb_typeof(details) = 'object')
+);
+
+comment on table rag_adjudication_evaluation_metric_values is
+    'RAG ASR 文本裁决评测 Run 的聚合指标值，例如 Gold Correction Accuracy。';
+
+
+create or replace function reject_frozen_rag_adjudication_case_mutation()
+returns trigger language plpgsql as $$
+declare version_status text;
+begin
+    if current_setting('app.evaluation_maintenance', true) = 'on' then
+        if tg_op = 'DELETE' then return old; end if;
+        return new;
+    end if;
+    select status into version_status from evaluation_dataset_versions
+    where id=coalesce(new.dataset_version_id, old.dataset_version_id);
+    if version_status = 'frozen' then
+        raise exception 'RAG adjudication dataset version is frozen and immutable';
+    end if;
+    if tg_op = 'DELETE' then return old; end if;
+    return new;
+end;
+$$;
+
+create or replace function reject_frozen_rag_adjudication_evidence_mutation()
+returns trigger language plpgsql as $$
+declare version_status text;
+begin
+    if current_setting('app.evaluation_maintenance', true) = 'on' then
+        if tg_op = 'DELETE' then return old; end if;
+        return new;
+    end if;
+    select versions.status into version_status
+    from rag_adjudication_evaluation_cases cases
+    join evaluation_dataset_versions versions on versions.id=cases.dataset_version_id
+    where cases.id=coalesce(new.evaluation_case_id, old.evaluation_case_id);
+    if version_status = 'frozen' then
+        raise exception 'RAG adjudication dataset version is frozen and immutable';
+    end if;
+    if tg_op = 'DELETE' then return old; end if;
+    return new;
+end;
+$$;
+
+create or replace function reject_frozen_rag_adjudication_correction_mutation()
+returns trigger language plpgsql as $$
+declare version_status text;
+begin
+    if current_setting('app.evaluation_maintenance', true) = 'on' then
+        if tg_op = 'DELETE' then return old; end if;
+        return new;
+    end if;
+    select versions.status into version_status
+    from rag_adjudication_evaluation_evidence evidence
+    join rag_adjudication_evaluation_cases cases on cases.id=evidence.evaluation_case_id
+    join evaluation_dataset_versions versions on versions.id=cases.dataset_version_id
+    where evidence.id=coalesce(new.target_evidence_id, old.target_evidence_id);
+    if version_status = 'frozen' then
+        raise exception 'RAG adjudication dataset version is frozen and immutable';
+    end if;
+    if tg_op = 'DELETE' then return old; end if;
+    return new;
+end;
+$$;
+
+drop trigger if exists rag_adjudication_cases_immutable_trigger
+    on rag_adjudication_evaluation_cases;
+create trigger rag_adjudication_cases_immutable_trigger
+before insert or update or delete on rag_adjudication_evaluation_cases
+for each row execute function reject_frozen_rag_adjudication_case_mutation();
+
+drop trigger if exists rag_adjudication_evidence_immutable_trigger
+    on rag_adjudication_evaluation_evidence;
+create trigger rag_adjudication_evidence_immutable_trigger
+before insert or update or delete on rag_adjudication_evaluation_evidence
+for each row execute function reject_frozen_rag_adjudication_evidence_mutation();
+
+drop trigger if exists rag_adjudication_corrections_immutable_trigger
+    on rag_adjudication_evaluation_corrections;
+create trigger rag_adjudication_corrections_immutable_trigger
+before insert or update or delete on rag_adjudication_evaluation_corrections
+for each row execute function reject_frozen_rag_adjudication_correction_mutation();
+
+
 
 -- Normalized relation gives model IDs real foreign keys, unlike uuid[].
 create table if not exists evaluation_run_models (

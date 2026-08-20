@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from inspect import signature
 from time import monotonic
@@ -14,6 +14,7 @@ from l1_foundation.llm.contracts import (
     ChatMessage,
     ChatRole,
     CompletionOptions,
+    JsonObject,
     LanguageModel,
     LlmCompletion,
     LlmProvider,
@@ -41,7 +42,7 @@ class WorkerToolCall(BaseModel):
 
     id: str
     name: str
-    arguments: dict[str, object]
+    arguments: JsonObject
     thought_signature: str | None = None
 
 
@@ -50,7 +51,7 @@ class WorkerToolDefinition(BaseModel):
 
     name: str
     description: str
-    parameters: dict[str, object]
+    parameters: JsonObject
 
 
 class WorkerChatMessage(BaseModel):
@@ -67,7 +68,7 @@ class WorkerResponseFormat(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     type: ResponseFormatType = ResponseFormatType.TEXT
-    json_schema: dict[str, object] | None = None
+    json_schema: JsonObject | None = None
     strict: bool = True
 
     @model_validator(mode="after")
@@ -192,7 +193,7 @@ def build_llm_generate_command(
                 temperature=options.temperature,
                 response_format=WorkerResponseFormat(
                     type=options.response_format.type,
-                    json_schema=dict(schema) if isinstance(schema, Mapping) else None,
+                    json_schema=dict(schema) if schema is not None else None,
                     strict=options.response_format.strict,
                 ),
                 tools=[

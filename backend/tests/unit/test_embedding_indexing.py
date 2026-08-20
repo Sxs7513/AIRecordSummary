@@ -91,3 +91,49 @@ def test_embedding_indexing_adds_topic_to_model_input_without_changing_chunk_tex
         "Speaker A: 你们大概做到多少？\nSpeaker B: 三千万左右。",
         "Speaker A: 普通正文。",
     ]
+
+
+def test_embedding_device_prefers_cuda_then_mps(monkeypatch: Any, tmp_path: Path) -> None:
+    stage = EmbeddingIndexingStage(ArtifactStore(tmp_path), "test/model", tmp_path, dimensions=2)
+
+    class FakeTorch:
+        class cuda:
+            @staticmethod
+            def is_available() -> bool:
+                return True
+
+        class backends:
+            class mps:
+                @staticmethod
+                def is_available() -> bool:
+                    return True
+
+    def import_torch(_name: str) -> type[FakeTorch]:
+        return FakeTorch
+
+    monkeypatch.setattr("l2_core.audio_processing.stages.embedding_indexing.import_module", import_torch)
+
+    assert stage._resolve_device() == "cuda"  # pyright: ignore[reportPrivateUsage]
+
+
+def test_embedding_device_uses_mps_when_cuda_is_unavailable(monkeypatch: Any, tmp_path: Path) -> None:
+    stage = EmbeddingIndexingStage(ArtifactStore(tmp_path), "test/model", tmp_path, dimensions=2)
+
+    class FakeTorch:
+        class cuda:
+            @staticmethod
+            def is_available() -> bool:
+                return False
+
+        class backends:
+            class mps:
+                @staticmethod
+                def is_available() -> bool:
+                    return True
+
+    def import_torch(_name: str) -> type[FakeTorch]:
+        return FakeTorch
+
+    monkeypatch.setattr("l2_core.audio_processing.stages.embedding_indexing.import_module", import_torch)
+
+    assert stage._resolve_device() == "mps"  # pyright: ignore[reportPrivateUsage]

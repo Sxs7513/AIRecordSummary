@@ -1,20 +1,19 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from datetime import datetime
 from typing import Any, Literal, cast
-from uuid import UUID
 
 from langgraph.graph import END, START, StateGraph
 
-from l2_core.rag.contracts import RagGraphState
+from l2_core.rag.contracts import EvidenceSource, MetadataSpeaker, RagGraphState, RagStateUpdate, RecordingMetadataRow
 from l2_core.rag.execution_middleware import rag_execution_middleware
 from l2_core.rag.observability import started_at
 from l2_core.rag.retrieval import RagRetriever
-from l2_core.rag.strategies.base import StrategyResult, StructuredFact
+from l2_core.rag.strategies.base import StrategyResult, StructuredFact, StructuredFactKey
 
-_FACT_FIELDS: tuple[tuple[str, str], ...] = (
+_FACT_FIELDS: tuple[tuple[StructuredFactKey, str], ...] = (
     ("file_name", "文件名"),
     ("duration_seconds", "时长（秒）"),
     ("created_at", "上传时间"),
@@ -48,7 +47,7 @@ class MetadataLookupStrategy:
         builder.add_edge("load_metadata", END)
         self._graph: Any = builder.compile()
 
-    async def invoke(self, state: RagGraphState) -> Mapping[str, object]:
+    async def invoke(self, state: RagGraphState) -> RagStateUpdate:
         result = cast(RagGraphState, await self._graph.ainvoke(state))
         return {
             "evidence": [],
@@ -60,14 +59,14 @@ class MetadataLookupStrategy:
             "strategy_result": result["strategy_result"],
         }
 
-    async def _load(self, state: RagGraphState) -> dict[str, object]:
+    async def _load(self, state: RagGraphState) -> RagStateUpdate:
         node_started = self._node_started(state, "load_metadata")
         route = state["route"]
         filters = state["filters"]
         if route is None or filters is None:
             raise RuntimeError("Metadata lookup requires a resolved route")
         if filters.match_none:
-            rows: list[dict[str, object]] = []
+            rows: list[RecordingMetadataRow] = []
         else:
             operation_started = started_at()
             rows = await asyncio.to_thread(
@@ -102,17 +101,17 @@ class MetadataLookupStrategy:
         }
 
     @staticmethod
-    def _facts(rows: list[dict[str, object]]) -> list[StructuredFact]:
+    def _facts(rows: list[RecordingMetadataRow]) -> list[StructuredFact]:
         facts: list[StructuredFact] = []
         for row in rows:
-            recording_id = cast(UUID, row["id"])
+            recording_id = row["id"]
             for key, label in _FACT_FIELDS:
                 value = row.get(key)
                 if key == "location" and not _has_text(value):
                     continue
                 facts.append(
                     StructuredFact(
-                        key=cast(Any, key),
+                        key=key,
                         label=label,
                         value=_fact_value(value),
                         recording_id=recording_id,
@@ -121,7 +120,7 @@ class MetadataLookupStrategy:
         return facts
 
     @staticmethod
-    def _render(rows: list[dict[str, object]]) -> str:
+    def _render(rows: list[RecordingMetadataRow]) -> str:
         blocks: list[str] = []
         for index, row in enumerate(rows, start=1):
             lines = [f"[{index}] 录音：{row['file_name']}", f"recording_id：{row['id']}"]
@@ -134,25 +133,25 @@ class MetadataLookupStrategy:
         return "\n\n".join(blocks)
 
     @staticmethod
-    def _sources(rows: list[dict[str, object]]) -> list[dict[str, object]]:
-        sources: list[dict[str, object]] = []
+    def _sources(rows: list[RecordingMetadataRow]) -> list[EvidenceSource]:
+        sources: list[EvidenceSource] = []
         for index, row in enumerate(rows, start=1):
-            recording_id = cast(UUID, row["id"])
-            duration_seconds = cast(int | None, row.get("duration_seconds"))
+            recording_id = row["id"]
+            duration_seconds = row["duration_seconds"]
             sources.append(
                 {
                     "index": index,
                     "recording": {
                         "id": str(recording_id),
                         "fileName": str(row["file_name"]),
-                        "location": cast(str | None, row.get("location")) if _has_text(row.get("location")) else None,
+                        "location": row["location"] if _has_text(row["location"]) else None,
                         "durationSeconds": duration_seconds,
                     },
                     "chunk": {
                         "id": str(recording_id),
                         "startMs": 0,
                         "endMs": (duration_seconds or 0) * 1_000,
-                        "speakerLabels": _speaker_names(row.get("speakers")),
+                        "speakerLabels": _speaker_names(row["speakers"]),
                         "isTargetPerson": False,
                         "matchedSpeakerProfiles": [],
                     },
@@ -181,12 +180,10 @@ def _render_value(value: object) -> str:
     if isinstance(value, datetime):
         return value.isoformat()
     if isinstance(value, list):
-        speaker_durations = [f"{item.get('name', '未知')}：{item.get('speaking_duration_seconds', 0)} 秒" for item in value if isinstance(item, dict)]
-        return "、".join(speaker_durations or [str(item) for item in value]) or "未知"
+        speakers = cast(list[MetadataSpeaker], value)
+        return "、".join(f"{item['name']}：{item['speaking_duration_seconds']} 秒" for item in speakers) or "未知"
     return "未知" if value is None else str(value)
 
 
-def _speaker_names(value: object) -> list[str]:
-    if not isinstance(value, list):
-        return []
-    return [str(item["name"]) for item in value if isinstance(item, dict) and isinstance(item.get("name"), str)]
+def _speaker_names(value: list[MetadataSpeaker]) -> list[str]:
+    return [item["name"] for item in value]
