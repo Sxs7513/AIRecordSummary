@@ -22,6 +22,7 @@ from l2_core.rag.contracts import (
     JsonObject,
     JsonValue,
     RecordingMetadataRow,
+    RecordingProfileCandidate,
     ResolvedFilters,
     RetrievalCandidateRow,
     ScopeRecordingRow,
@@ -96,6 +97,10 @@ class RagRetriever:
         self._engine = engine
         self._settings = settings
         self._worker_client = worker_client
+
+    @property
+    def recording_profile_search_enabled(self) -> bool:
+        return self._settings.rag_recording_profile_search_enabled
 
     def release(self) -> None:
         return
@@ -283,6 +288,119 @@ class RagRetriever:
                     .all()
                 )
             ]
+
+    def retrieve_recording_profile_candidates(
+        self,
+        embedding: list[float],
+        filters: ResolvedFilters,
+    ) -> list[RecordingProfileCandidate]:
+        if not self._settings.rag_recording_profile_search_enabled:
+            return []
+        vector = self._vector_literal(embedding)
+        values: dict[str, object] = {
+            "embedding": vector,
+            "embedding_provider": "sentence_transformers",
+            "embedding_model": self._settings.embedding_model,
+            "embedding_dimensions": self._settings.embedding_dimensions,
+            "min_score": self._settings.rag_recording_profile_min_score,
+            "limit": self._settings.rag_recording_profile_candidate_limit,
+        }
+        clauses = [
+            "recordings.status = 'completed'",
+            "embedding_models.provider = :embedding_provider",
+            "embedding_models.model_name = :embedding_model",
+            "embedding_models.dimensions = :embedding_dimensions",
+            "1 - (profile_documents.embedding <=> cast(:embedding as halfvec)) >= :min_score",
+        ]
+        self._append_recording_filters(clauses, values, filters)
+        with self._engine.connect() as connection:
+            self._set_statement_timeout(connection)
+            rows = (
+                connection.execute(
+                    text(
+                        f"""
+                        select profile_documents.recording_id,
+                               1 - (profile_documents.embedding <=> cast(:embedding as halfvec)) as score
+                        from recording_retrieval_documents profile_documents
+                        join recordings on recordings.id = profile_documents.recording_id
+                        join embedding_models on embedding_models.id = profile_documents.embedding_model_id
+                        where {" and ".join(clauses)}
+                        order by profile_documents.embedding <=> cast(:embedding as halfvec)
+                        limit :limit
+                        """
+                    ),
+                    values,
+                )
+                .mappings()
+                .all()
+            )
+        return [RecordingProfileCandidate(recording_id=UUID(str(row["recording_id"])), score=float(row["score"])) for row in rows]
+
+    def retrieve_recording_profile_scoped_chunk_candidates(
+        self,
+        embedding: list[float],
+        candidates: list[RecordingProfileCandidate],
+    ) -> list[RetrievalCandidateRow]:
+        if not candidates:
+            return []
+        vector = self._vector_literal(embedding)
+        profile_scores = {candidate["recording_id"]: candidate["score"] for candidate in candidates}
+        values: dict[str, object] = {
+            "embedding": vector,
+            "embedding_provider": "sentence_transformers",
+            "embedding_model": self._settings.embedding_model,
+            "embedding_dimensions": self._settings.embedding_dimensions,
+            "recording_ids": [str(recording_id) for recording_id in profile_scores],
+            "per_recording_limit": self._settings.rag_recording_profile_scoped_chunk_limit,
+        }
+        with self._engine.connect() as connection:
+            self._set_statement_timeout(connection)
+            rows = (
+                connection.execute(
+                    text(
+                        """
+                        with scoped_chunks as materialized (
+                            select chunks.id as chunk_id, chunks.recording_id, chunks.text,
+                                   chunks.start_ms, chunks.end_ms, chunks.speaker_labels,
+                                   chunks.is_target_person, chunks.source_utterance_segment_ids,
+                                   chunks.metadata, chunks.embedding,
+                                   recordings.title, recordings.file_name, recordings.location,
+                                   recordings.duration_seconds, recordings.created_at
+                            from recording_search_chunks chunks
+                            join recordings on recordings.id = chunks.recording_id
+                            join embedding_models on embedding_models.id = chunks.embedding_model_id
+                            where chunks.recording_id = any(cast(:recording_ids as uuid[]))
+                              and recordings.status = 'completed'
+                              and embedding_models.provider = :embedding_provider
+                              and embedding_models.model_name = :embedding_model
+                              and embedding_models.dimensions = :embedding_dimensions
+                        ), ranked as (
+                            select scoped_chunks.*,
+                                   1 - (embedding <=> cast(:embedding as halfvec)) as score,
+                                   row_number() over (
+                                       partition by recording_id
+                                       order by embedding <=> cast(:embedding as halfvec), chunk_id
+                                   ) as recording_rank
+                            from scoped_chunks
+                        )
+                        select * from ranked
+                        where recording_rank <= :per_recording_limit
+                        order by recording_id, recording_rank
+                        """
+                    ),
+                    values,
+                )
+                .mappings()
+                .all()
+            )
+        result: list[RetrievalCandidateRow] = []
+        for row in rows:
+            candidate = _retrieval_candidate_row(row)
+            candidate["match_type"] = "vector"
+            candidate["retrieved_via_recording_profile"] = True
+            candidate["recording_profile_score"] = profile_scores[candidate["recording_id"]]
+            result.append(candidate)
+        return result
 
     def retrieve_lexical_candidates(
         self,
@@ -755,6 +873,10 @@ class RagRetriever:
             text("select set_config('statement_timeout', :timeout, true)"),
             {"timeout": f"{getattr(self._settings, 'rag_sql_statement_timeout_ms', 15_000)}ms"},
         )
+
+    @staticmethod
+    def _vector_literal(vector: Sequence[float]) -> str:
+        return "[" + ",".join(f"{item:.8g}" for item in vector) + "]"
 
     @staticmethod
     def _scope_evidence(index: int, recording: ScopeRecordingRow, utterances: list[ScopeUtteranceRow]) -> Evidence:

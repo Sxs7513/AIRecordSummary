@@ -98,10 +98,10 @@ def _normalize(value: object) -> dict[str, object]:
                 "file_names": filters.get("file_names", filters.get("fileNames", [])),
                 "locations": filters.get("locations", filters.get("location", [])),
                 "target_person_only": filters.get("target_person_only", filters.get("targetPersonOnly", False)),
-                "recording_ids": filters.get("recording_ids", filters.get("recordingIds", [])),
                 "speaker_profile_ids": filters.get("speaker_profile_ids", filters.get("speakerProfileIds", [])),
             }
         ),
+        "history_recording_ids": raw.get("history_recording_ids", raw.get("historyRecordingIds", [])),
         "error_code": error_code,
         "reason": reason or "router_output_normalized",
     }
@@ -126,7 +126,7 @@ def _has_recording_scope(route: RagRoute) -> bool:
             route.recording_limit is not None,
             route.recording_rank is not None,
             route.time_range is not None,
-            bool(inferred.recording_ids),
+            bool(route.history_recording_ids),
             bool(inferred.speaker_profile_ids),
             bool(inferred.person_names),
             bool(inferred.file_names),

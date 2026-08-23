@@ -13,6 +13,7 @@ from l2_core.audio_processing.projections import RecordingProjectionService
 from l2_core.audio_processing.stages.recording_models import Utterance
 from l2_core.audio_processing.stages.summary.generation import create_manual_summary_generation
 from l2_core.audio_processing.stages.summary.stage import GenerateSummaryStage
+from l2_core.audio_processing.stages.summary_embedding_indexing import SummaryEmbeddingIndexer
 from l2_core.auth.contracts import CurrentUser
 from l2_core.generation.event_sink import GenerationEventSink
 from l2_core.generation.service import GenerationService
@@ -38,12 +39,14 @@ class RecordingSummaryRegenerationService:
         generation_service: GenerationService,
         summary_stage: GenerateSummaryStage,
         publisher: GenerationCommandPublisher | None = None,
+        summary_embedding_indexer: SummaryEmbeddingIndexer | None = None,
     ) -> None:
         self._engine = engine
         self._generation_service = generation_service
         self._access = RecordingAccessService(engine)
         self._projections = RecordingProjectionService(engine)
         self._stage = summary_stage
+        self._summary_embedding_indexer = summary_embedding_indexer
         self._publisher = publisher
         self._tasks: set[Task[None]] = set()
 
@@ -102,6 +105,16 @@ class RecordingSummaryRegenerationService:
             if sink.cancel_if_requested():
                 return
             self._projections.project(recording_id, "generate_summary", output)
+            if self._summary_embedding_indexer is not None:
+                try:
+                    embedding = await to_thread(
+                        self._summary_embedding_indexer.encode,
+                        output.summary_text,
+                        self._recording_title(recording_id),
+                    )
+                    self._projections.project(recording_id, "summary_embedding_indexing", embedding)
+                except Exception:
+                    logger.warning("summary：重新生成后的向量化失败 recording_id=%s", recording_id, exc_info=True)
             sink.succeed(output.model_dump(mode="json"))
             logger.info("summary：手动重新生成完成，recording_id=%s generation_id=%s", recording_id, generation_id)
         except Exception as error:
@@ -139,6 +152,15 @@ class RecordingSummaryRegenerationService:
                 )
                 for row in rows
             ]
+
+    def _recording_title(self, recording_id: UUID) -> str:
+        with self._engine.connect() as connection:
+            return str(
+                connection.execute(
+                    text("select title from recordings where id = :recording_id"),
+                    {"recording_id": recording_id},
+                ).scalar_one()
+            )
 
     @staticmethod
     def _generation_progress(sink: GenerationEventSink) -> Callable[[int, str], None]:

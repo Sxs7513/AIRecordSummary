@@ -167,6 +167,7 @@ class RagGraph:
                     classify_query_correction_risk=self._classify_query_correction_risk,
                     adjudication_agent=self._adjudication_agent.start,
                     apply_user_adjudication_decision=self._apply_user_adjudication_decision,
+                    retry_without_history_scope=self._retry_without_history_scope,
                     adjudication_enabled=asr_adjudication_enabled,
                     after_user_adjudication=self._after_user_adjudication,
                     transition=self._transition,
@@ -650,6 +651,7 @@ class RagGraph:
             route=None,
             route_error=None,
             filters=None,
+            history_scope_active=False,
             content_query=query,
             retrieval_expanded_query=None,
             retrieval_lexical_queries=[],
@@ -824,9 +826,8 @@ class RagGraph:
             )
             return {"route_error": route_error, "token_usage": token_usage}
         scope_ids = [UUID(value) for value in state["scope_recording_ids"]]
-        preliminary = make_filters(route, None, scope_ids)
-        recording_ids = self._retriever.resolve_recording_scope(preliminary, route.recording_limit, route.recording_rank)
-        filters = make_filters(route, recording_ids, scope_ids).model_copy(update={"recording_scope_resolved": True})
+        history_scope_active = bool(route.history_recording_ids)
+        filters = self._resolve_route_filters(route, scope_ids, include_history_scope=history_scope_active)
         self._node_completed(
             state,
             "route",
@@ -846,6 +847,7 @@ class RagGraph:
             "route": route,
             "route_error": None,
             "filters": filters,
+            "history_scope_active": history_scope_active,
             "content_query": route.content_query.strip() if route.content_query and route.content_query.strip() else state["query"],
             "token_usage": token_usage,
         }
@@ -855,7 +857,7 @@ class RagGraph:
 
         node_started = self._node_started(state, "expand_retrieval_terms")
         if not self._query_term_expansion_enabled:
-            self._node_completed(state, "expand_retrieval_terms", node_started, enabled=False, term_count=0, phrase_count=0)
+            self._node_completed(state, "expand_retrieval_terms", node_started, enabled=False, term_count=0, phrase_count=0, evidence_query_count=0)
             return {
                 "content_query": state["content_query"],
                 "retrieval_expanded_query": None,
@@ -890,6 +892,7 @@ class RagGraph:
                 fallback=True,
                 term_count=0,
                 phrase_count=0,
+                evidence_query_count=0,
             )
             return {
                 "content_query": state["content_query"],
@@ -900,7 +903,8 @@ class RagGraph:
         content_query = terms.content_query.strip() or state["content_query"]
         anchors = list(dict.fromkeys([*terms.phrases, *terms.terms]))
         expanded_query = " ".join(anchors).strip() or None
-        lexical_queries = [item for item in anchors if item != content_query]
+        evidence_queries = list(dict.fromkeys(terms.evidence_queries))
+        lexical_queries = list(dict.fromkeys([*(item for item in anchors if item != content_query), *evidence_queries]))
         protected_lexical_queries = [item for item in lexical_queries if self._is_protected_lexical_query(item)]
         self._node_completed(
             state,
@@ -910,9 +914,11 @@ class RagGraph:
             fallback=False,
             term_count=len(terms.terms),
             phrase_count=len(terms.phrases),
+            evidence_query_count=len(evidence_queries),
             expanded_query_present=expanded_query is not None,
             extracted_terms=terms.terms,
             extracted_phrases=terms.phrases,
+            extracted_evidence_queries=evidence_queries,
             lexical_queries=lexical_queries,
             protected_lexical_queries=protected_lexical_queries,
             content_query=content_query,
@@ -1051,6 +1057,54 @@ class RagGraph:
     @staticmethod
     def _is_protected_lexical_query(value: str) -> bool:
         return value.strip() not in {"最近", "今天", "昨天", "这次", "这条", "那个", "这个", "是否", "是不是", "有没有"}
+
+    def _resolve_route_filters(
+        self,
+        route: RagRoute,
+        scope_ids: list[UUID],
+        *,
+        include_history_scope: bool,
+    ) -> ResolvedFilters:
+        preliminary = make_filters(route, None, scope_ids, include_history_scope=include_history_scope)
+        recording_ids = self._retriever.resolve_recording_scope(preliminary, route.recording_limit, route.recording_rank)
+        return make_filters(
+            route,
+            recording_ids,
+            scope_ids,
+            include_history_scope=include_history_scope,
+        ).model_copy(update={"recording_scope_resolved": True})
+
+    async def _retry_without_history_scope(self, state: RagGraphState) -> RagStateUpdate:
+        route = state["route"]
+        if route is None:
+            raise RuntimeError("History-scope retry requires a resolved route")
+        filters = self._resolve_route_filters(
+            route,
+            [UUID(value) for value in state["scope_recording_ids"]],
+            include_history_scope=False,
+        )
+        self._node_completed(
+            state,
+            "retry_without_history_scope",
+            self._node_started(state, "retry_without_history_scope"),
+            history_recording_count=len(route.history_recording_ids),
+            expanded_recording_count=len(filters.recording_ids),
+        )
+        return {
+            "filters": filters,
+            "history_scope_active": False,
+            "retrieval_attempt": state["retrieval_attempt"] + 1,
+            "retrieval_candidates": [],
+            "protected_chunk_ids": [],
+            "rerank_input_tokens": 0,
+            "rerank_skipped_candidates": 0,
+            "evidence": [],
+            "answer_evidence": [],
+            "message": None,
+            "grade": None,
+            "original_grade": None,
+            "corrected_grade": None,
+        }
 
     @staticmethod
     def _after_route(state: RagGraphState) -> Literal["retrieve", "unresolved"]:
@@ -1566,7 +1620,7 @@ class RagGraph:
 
     @staticmethod
     def _validate_selected_recording_ids(route: RagRoute, scope_recording_ids: list[UUID]) -> str | None:
-        selected_ids = set(route.inferred_filters.recording_ids)
+        selected_ids = set(route.history_recording_ids)
         if not selected_ids:
             return None
         if not selected_ids.issubset(set(scope_recording_ids)):

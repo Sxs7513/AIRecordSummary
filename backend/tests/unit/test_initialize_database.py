@@ -21,6 +21,9 @@ def test_base_schema_declares_only_the_final_tables_and_indexes() -> None:
     assert "conversations_owner_client_creation_idx" in schema
     recordings = schema.split("create table if not exists recordings (", 1)[1].split(");", 1)[0]
     assert "owner_user_id uuid not null references users(id) on delete restrict" in recordings
+    assert "content_md5 text not null" in recordings
+    assert "processing_id uuid not null unique" in recordings
+    assert "processing_pipeline_version text not null" in recordings
 
 
 def test_rebuild_schema_drops_old_runtime_tables_with_public_schema(monkeypatch: Any, tmp_path: Path) -> None:

@@ -33,7 +33,8 @@ def test_route_prompt_relies_on_response_schema_without_embedding_format_instruc
     assert "不得根据 sources 或历史文本推断人物、话题、录音内容" in rendered
     assert "conversation_history 是按时间升序排列的历史对话数组" in rendered
     assert "sources 只绑定到所在 assistant 消息" in rendered
-    assert "current_query 可可靠关联到一条或多条 assistant 历史消息" in rendered
+    assert "明确指代某条或某组 assistant 历史回答所述的对象、事实或录音" in rendered
+    assert "仅话题、实体或问题相同不构成明确指代" in rendered
     assert "显式补全 current_query 中的指代和省略" in rendered
     assert "这种补全不视为增加新事实" in rendered
     assert "time_range.start 和 time_range.end" in rendered
@@ -52,19 +53,21 @@ def test_grade_prompt_only_evaluates_the_evidence_it_receives() -> None:
     assert "最近”或“第 N 条" not in rendered
 
 
-def test_retrieval_terms_prompt_prepares_a_scope_free_content_query() -> None:
+def test_retrieval_terms_prompt_prepares_a_faithful_content_query_and_general_anchors() -> None:
     prompt, values, _parser = retrieval_terms_prompt(
         "最近的录音里，王总说 API v2 的上线时间最后定了吗？"
     )
 
     rendered = "\n".join(str(message.content) for message in prompt.invoke(values).to_messages())
 
-    assert "不生成录音范围过滤条件" in rendered
-    assert "用于录音正文检索和证据判断的 content_query" in rendered
-    assert "判断依据是成分在当前问题中的语义作用" in rendered
-    assert "不得按词语表机械删除" in rendered
-    assert "改写可能改变问题含义时，必须保留" in rendered
-    assert "不得补充同义词" in rendered
+    assert "用于正文检索和证据判断的 content_query" in rendered
+    assert "改写可能改变含义时，必须原样保留" in rendered
+    assert "不得补充、猜测、改写意图或使用同义词扩写" in rendered
+    assert "检索区分度高、应按原样匹配的短文本片段" in rendered
+    assert "表达完整关键语义的 2-8 字连续短语" in rendered
+    assert "动作、状态、关系和限定" in rendered
+    assert "可能直接出现于原文证据中的通用关系、角色或属性线索" in rendered
+    assert "不得包含输入中未出现的专有实体、数值或事实断言" in rendered
     assert "最近的录音里，王总说 API v2 的上线时间最后定了吗？" in rendered
 
 

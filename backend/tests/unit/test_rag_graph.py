@@ -44,7 +44,10 @@ from l2_core.rag.retrieval import RagRetriever
 from l2_core.rag.routing import AMBIGUOUS_RECORDING_SCOPE_MESSAGE, ROUTE_UNRESOLVED_MESSAGE
 from l2_core.rag.streaming import ThinkTagFilter
 from l2_core.rag.worker_tasks import RerankResult
-from l2_core.rag.workflows.chunk_evidence import _retain_protected_evidence  # pyright: ignore[reportPrivateUsage]
+from l2_core.rag.workflows.chunk_evidence import (  # pyright: ignore[reportPrivateUsage]
+    _retain_protected_evidence,
+    _retain_recording_profile_candidates,
+)
 
 
 class FakeModel:
@@ -277,7 +280,12 @@ class MetadataRetriever(FakeRetriever):
 
 def test_query_term_expansion_keeps_the_original_question_and_only_adds_anchors() -> None:
     model = FakeModel()
-    model.set_responses(['{"content_query":"王总说 API v2 的上线时间定了吗？","terms":["王总","API v2"],"phrases":["上线时间"]}'])
+    model.set_responses(
+        [
+            '{"content_query":"王总说 API v2 的上线时间定了吗？","terms":["王总","API v2"],'
+            '"phrases":["上线时间"],"evidence_queries":["负责人"]}'
+        ]
+    )
     graph = _graph(FakeRetriever(), model, query_term_expansion_enabled=True)
     state = RagGraph._initial_state(  # pyright: ignore[reportPrivateUsage]
         "test", "answer", "最近的录音里，王总说 API v2 的上线时间定了吗？", 10, [], None
@@ -290,7 +298,8 @@ def test_query_term_expansion_keeps_the_original_question_and_only_adds_anchors(
     assert state["query"] == "最近的录音里，王总说 API v2 的上线时间定了吗？"
     assert update["content_query"] == "王总说 API v2 的上线时间定了吗？"
     assert update["retrieval_expanded_query"] == "上线时间 王总 API v2"
-    assert update["retrieval_lexical_queries"] == ["上线时间", "王总", "API v2"]
+    assert update["retrieval_lexical_queries"] == ["上线时间", "王总", "API v2", "负责人"]
+    assert update["retrieval_protected_lexical_queries"] == ["上线时间", "王总", "API v2", "负责人"]
 
 
 def test_route_removes_recording_time_scope_from_content_query() -> None:
@@ -396,6 +405,97 @@ def test_vector_queries_are_embedded_in_one_worker_batch() -> None:
 
     assert embedding_batches == [["原始问题", "扩展检索词"]]
     assert sorted(searched_embeddings) == [[1.0], [2.0]]
+
+
+def test_summary_match_runs_exact_chunk_search_and_reserves_its_candidate(caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.INFO, logger="rag")
+    recording_id = uuid4()
+    summary_chunk_id = uuid4()
+    calls: list[str] = []
+
+    class SummaryHybridRetriever:
+        hybrid_search_enabled = True
+        recording_profile_search_enabled = True
+
+        def generate_query_embeddings(self, queries: list[str]) -> list[list[float]]:
+            assert queries == ["最近是不是有个项目答辩"]
+            return [[0.25]]
+
+        def retrieve_vector_candidates(self, _embedding: list[float], _filters: ResolvedFilters) -> list[dict[str, object]]:
+            return []
+
+        def retrieve_recording_profile_candidates(
+            self, embedding: list[float], _filters: ResolvedFilters
+        ) -> list[dict[str, object]]:
+            calls.append("summary")
+            assert embedding == [0.25]
+            return [{"recording_id": recording_id, "score": 0.88}]
+
+        def retrieve_recording_profile_scoped_chunk_candidates(
+            self,
+            embedding: list[float],
+            candidates: list[dict[str, object]],
+        ) -> list[dict[str, object]]:
+            calls.append("scoped_chunks")
+            assert embedding == [0.25]
+            assert candidates[0]["recording_id"] == recording_id
+            return [
+                {
+                    "chunk_id": summary_chunk_id,
+                    "recording_id": recording_id,
+                    "score": 0.31,
+                    "retrieved_via_recording_profile": True,
+                    "recording_profile_score": 0.88,
+                }
+            ]
+
+        def retrieve_lexical_candidates(self, _query: str, _filters: ResolvedFilters) -> list[dict[str, object]]:
+            return []
+
+        def fuse_candidate_lists(
+            self,
+            _vector_lists: list[list[dict[str, object]]],
+            _lexical_lists: list[list[dict[str, object]]],
+            _limit: int,
+        ) -> list[dict[str, object]]:
+            return []
+
+    graph = _graph(SummaryHybridRetriever(), FakeModel())
+    candidates = asyncio.run(
+        graph._retrieve_candidates(  # pyright: ignore[reportPrivateUsage]
+            "最近是不是有个项目答辩",
+            ResolvedFilters(recording_scope_resolved=True),
+            10,
+            str(uuid4()),
+        )
+    )
+
+    assert calls == ["summary", "scoped_chunks"]
+    assert candidates[0]["chunk_id"] == summary_chunk_id
+    assert candidates[0]["retrieved_via_recording_profile"] is True
+    assert '"event":"recording_profile_retrieval_completed"' in caplog.text
+    assert f'"recording_id":"{recording_id}"' in caplog.text
+    assert '"event":"recording_profile_scoped_chunk_retrieval_completed"' in caplog.text
+    assert f'"chunk_id":"{summary_chunk_id}"' in caplog.text
+
+
+def test_recording_profile_candidate_reuses_global_row_without_duplication() -> None:
+    chunk_id = uuid4()
+    recording_id = uuid4()
+    profile_row = cast(
+        dict[str, object],
+        {"chunk_id": chunk_id, "recording_id": recording_id, "score": 0.3, "retrieved_via_recording_profile": True},
+    )
+    global_row = cast(dict[str, object], {"chunk_id": chunk_id, "recording_id": recording_id, "score": 0.9, "match_type": "hybrid"})
+
+    retained = _retain_recording_profile_candidates(  # pyright: ignore[reportArgumentType]
+        [global_row],
+        [profile_row],
+    )
+
+    assert len(retained) == 1
+    assert retained[0]["retrieved_via_recording_profile"] is True
+    assert retained[0]["match_type"] == "hybrid"
 
 
 def test_exact_lexical_term_hit_is_retained_when_rrf_drops_it() -> None:
@@ -1653,10 +1753,90 @@ def test_selected_recording_ids_must_be_currently_accessible() -> None:
     route = RagRoute(
         status="resolved",
         strategy_id="scope_summary",
-        inferred_filters=InferredFilters(recording_ids=[recording_id]),
+        history_recording_ids=[recording_id],
     )
     assert RagGraph._validate_selected_recording_ids(route, [recording_id]) is None  # pyright: ignore[reportPrivateUsage]
     assert RagGraph._validate_selected_recording_ids(route, []) == "referenced_recording_unavailable"  # pyright: ignore[reportPrivateUsage]
+
+
+def test_history_scope_retry_reopens_only_the_history_constraint() -> None:
+    history_recording_id, other_recording_id = uuid4(), uuid4()
+    graph = _graph(FakeRetriever(), FakeModel())
+    state = cast(
+        RagGraphState,
+        {
+            "run_id": "test",
+            "route": RagRoute(
+                status="resolved",
+                strategy_id="fact_lookup",
+                history_recording_ids=[history_recording_id],
+            ),
+            "scope_recording_ids": [str(history_recording_id), str(other_recording_id)],
+            "history_scope_active": True,
+            "retrieval_attempt": 0,
+        },
+    )
+
+    update = asyncio.run(graph._retry_without_history_scope(state))  # pyright: ignore[reportPrivateUsage]
+
+    filters = cast(ResolvedFilters, update["filters"])
+    assert filters.recording_ids == [history_recording_id, other_recording_id]
+    assert update["history_scope_active"] is False
+    assert update["retrieval_attempt"] == 1
+
+
+def test_history_scope_retries_all_accessible_recordings_after_abstain() -> None:
+    history_recording_id, other_recording_id = uuid4(), uuid4()
+
+    class ScopeCapturingRetriever(FakeRetriever):
+        def __init__(self) -> None:
+            self.scopes: list[list[UUID]] = []
+
+        def retrieve_chunks(self, topic: str, filters: object, limit: int, run_id: str = "standalone") -> list[Evidence]:
+            del topic, limit, run_id
+            recording_ids = list(cast(ResolvedFilters, filters).recording_ids)
+            self.scopes.append(recording_ids)
+            recording_id = recording_ids[0]
+            return [
+                Evidence(
+                    index=1,
+                    recording=EvidenceRecording(id=recording_id, title="项目周会", file_name="week.mp3"),
+                    chunk=EvidenceChunk(id=uuid4(), text="关键事实。", start_ms=0, end_ms=1_000),
+                    score=0.9,
+                    match_type="vector",
+                    url=f"/recordings/{recording_id}",
+                )
+            ]
+
+    retriever = ScopeCapturingRetriever()
+    model = FakeModel()
+    model.set_responses(
+        [
+            json.dumps(
+                {
+                    "status": "resolved",
+                    "strategy": "fact_lookup",
+                    "history_recording_ids": [str(history_recording_id)],
+                    "inferred_filters": {},
+                }
+            ),
+            '{"verdict":"abstain","reason":"历史录音没有足够证据"}',
+            '{"verdict":"direct_answer","reason":"全库补充证据足够"}',
+        ]
+    )
+
+    _answer, _sources, not_enough_evidence, _message, _confirmation = asyncio.run(
+        _graph(retriever, model).run(
+            "它的负责人是谁？",
+            10,
+            [history_recording_id, other_recording_id],
+            lambda _name, _label, _progress: None,
+            lambda _delta: None,
+        )
+    )
+
+    assert not not_enough_evidence
+    assert retriever.scopes == [[history_recording_id], [history_recording_id, other_recording_id]]
 
 
 def test_grade_contract_rejects_legacy_fields() -> None:

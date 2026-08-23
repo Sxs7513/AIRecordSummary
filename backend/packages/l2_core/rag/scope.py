@@ -19,12 +19,18 @@ def resolve_time_range(route: RagRoute) -> tuple[datetime | None, datetime | Non
     return start, end
 
 
-def make_filters(route: RagRoute, resolved_recording_ids: list[UUID] | None, scope_recording_ids: list[UUID]) -> ResolvedFilters:
+def make_filters(
+    route: RagRoute,
+    resolved_recording_ids: list[UUID] | None,
+    scope_recording_ids: list[UUID],
+    *,
+    include_history_scope: bool = True,
+) -> ResolvedFilters:
     inferred = route.inferred_filters
     route_ids = list(scope_recording_ids)
     if route_ids:
-        if inferred.recording_ids:
-            route_ids = _intersection(route_ids, list(inferred.recording_ids))
+        if include_history_scope and route.history_recording_ids:
+            route_ids = _intersection(route_ids, route.history_recording_ids)
         if resolved_recording_ids is not None:
             route_ids = _intersection(route_ids, resolved_recording_ids)
     created_from, created_to = resolve_time_range(route)

@@ -13,6 +13,7 @@ from l2_core.audio_processing.stages.recording_models import (
     DiarizationOutput,
     EmbeddingIndexingOutput,
     RecordingSummaryOutput,
+    SummaryEmbeddingIndexingOutput,
     TranscriptOutput,
     UtterancesOutput,
 )
@@ -36,6 +37,8 @@ class RecordingProjectionService:
             self._project_embedding_index(recording_id, EmbeddingIndexingOutput.model_validate(output))
         elif stage_name == "generate_summary":
             self._project_summary(recording_id, RecordingSummaryOutput.model_validate(output))
+        elif stage_name == "summary_embedding_indexing":
+            self._project_summary_embedding(recording_id, SummaryEmbeddingIndexingOutput.model_validate(output))
 
     def _project_diarization(self, recording_id: RecordingId, output: DiarizationOutput) -> None:
         with self._engine.begin() as connection:
@@ -189,6 +192,59 @@ class RecordingProjectionService:
                     "provider": output.provider,
                     "model_name": output.model_name,
                     "summary_text": output.summary_text,
+                },
+            )
+            connection.execute(
+                text("delete from recording_retrieval_documents where recording_id = :recording_id"),
+                {"recording_id": recording_id},
+            )
+
+    def _project_summary_embedding(self, recording_id: RecordingId, output: SummaryEmbeddingIndexingOutput) -> None:
+        if len(output.embedding) != output.dimensions:
+            raise ValueError(f"Summary embedding dimensions do not match model metadata ({output.dimensions})")
+        with self._engine.begin() as connection:
+            embedding_model_id = cast(
+                UUID,
+                connection.execute(
+                    text(
+                        """
+                        insert into embedding_models (provider, model_name, dimensions, distance_metric, is_active)
+                        values (:provider, :model_name, :dimensions, 'cosine', true)
+                        on conflict (provider, model_name, dimensions) do update set
+                            distance_metric = excluded.distance_metric,
+                            is_active = true
+                        returning id
+                        """
+                    ),
+                    {"provider": output.provider, "model_name": output.model_name, "dimensions": output.dimensions},
+                ).scalar_one(),
+            )
+            connection.execute(
+                text(
+                    """
+                    insert into recording_retrieval_documents (
+                        recording_id, embedding_model_id, document_index, document_type,
+                        retrieval_text, content_hash, embedding
+                    ) values (
+                        :recording_id, :embedding_model_id, :document_index, :document_type,
+                        :retrieval_text, :content_hash, cast(:embedding as halfvec)
+                    )
+                    on conflict (recording_id, embedding_model_id, document_index) do update set
+                        document_type = excluded.document_type,
+                        retrieval_text = excluded.retrieval_text,
+                        content_hash = excluded.content_hash,
+                        embedding = excluded.embedding,
+                        updated_at = now()
+                    """
+                ),
+                {
+                    "recording_id": recording_id,
+                    "embedding_model_id": embedding_model_id,
+                    "document_index": output.document_index,
+                    "document_type": output.document_type,
+                    "retrieval_text": output.retrieval_text,
+                    "content_hash": output.content_hash,
+                    "embedding": self._vector_literal(output.embedding),
                 },
             )
 

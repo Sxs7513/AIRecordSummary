@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 from pathlib import Path
 from typing import Any, cast
@@ -13,7 +14,7 @@ from l1_foundation.pipeline.contracts import ArtifactRef, PipelineRunId, StageRu
 from l1_foundation.pipeline.definitions.graph import PipelineDefinition
 from l1_foundation.streaming import SyncRedisStreamStore
 from l2_core.access.recordings import RecordingAccessService
-from l2_core.application.processing_queue import ProcessingCommandPublisher, queued_processing_state
+from l2_core.application.processing_queue import ProcessingCommandPublisher, queued_processing_state, stable_recording_processing_id
 from l2_core.audio_processing.contracts import RecordingId
 from l2_core.audio_processing.definition import recording_processing
 from l2_core.auth.contracts import CurrentUser
@@ -58,9 +59,17 @@ class RecordingService:
         recording_id = RecordingId(uuid4())
         storage_path = self._storage_key(recording_id, file_name)
         destination = self._storage.resolve(storage_path)
-        file_size_bytes = await self._write_upload(upload, destination)
+        file_size_bytes, content_md5 = await self._write_upload(upload, destination)
+        processing_id = stable_recording_processing_id(
+            user.current_workspace_id,
+            user.id,
+            self._processing_definition.name,
+            self._processing_definition.version,
+            content_md5,
+        )
+        recording_created = False
         try:
-            recording = self._insert_recording(
+            recording, recording_created = self._insert_recording(
                 recording_id=recording_id,
                 workspace_id=user.current_workspace_id,
                 owner_user_id=user.id,
@@ -70,7 +79,14 @@ class RecordingService:
                 location=location.strip() if location and location.strip() else None,
                 mime_type=upload.content_type or "application/octet-stream",
                 file_size_bytes=file_size_bytes,
+                content_md5=content_md5,
+                processing_id=processing_id,
+                pipeline_name=self._processing_definition.name,
+                pipeline_version=self._processing_definition.version,
             )
+            if not recording_created:
+                self._storage.remove_tree(f"recordings/{recording_id}")
+                return recording, PipelineRunId(processing_id)
             source = self._source_audio_artifact(recording)
             if self._processing_publisher is None:
                 raise RuntimeError("Processing Kafka publisher is unavailable")
@@ -80,12 +96,15 @@ class RecordingService:
                     self._processing_definition.name,
                     self._processing_definition.version,
                     source,
+                    processing_id=processing_id,
+                    workspace_id=user.current_workspace_id,
                 )
             )
             self._mark_processing(recording_id)
             self._remember_processing(recording_id, run_id)
         except Exception:
-            self._delete_recording(recording_id)
+            if recording_created:
+                self._delete_recording(recording_id)
             destination.unlink(missing_ok=True)
             raise
         finally:
@@ -516,14 +535,26 @@ class RecordingService:
         location: str | None,
         mime_type: str,
         file_size_bytes: int,
-    ) -> DatabaseRow:
+        content_md5: str,
+        processing_id: UUID,
+        pipeline_name: str,
+        pipeline_version: str,
+    ) -> tuple[DatabaseRow, bool]:
         with self._engine.begin() as connection:
-            return dict(
+            inserted = (
                 connection.execute(
                     text(
                         """
-                    insert into recordings (id, workspace_id, owner_user_id, title, file_name, storage_path, location, mime_type, file_size_bytes, status)
-                    values (:id, :workspace_id, :owner_user_id, :title, :file_name, :storage_path, :location, :mime_type, :file_size_bytes, 'uploaded')
+                    insert into recordings (
+                        id, workspace_id, owner_user_id, title, file_name, storage_path, location,
+                        mime_type, file_size_bytes, content_md5, processing_id,
+                        processing_pipeline_name, processing_pipeline_version, status
+                    ) values (
+                        :id, :workspace_id, :owner_user_id, :title, :file_name, :storage_path, :location,
+                        :mime_type, :file_size_bytes, :content_md5, :processing_id,
+                        :pipeline_name, :pipeline_version, 'uploaded'
+                    )
+                    on conflict (processing_id) do nothing
                     returning *
                     """
                     ),
@@ -537,11 +568,26 @@ class RecordingService:
                         "location": location,
                         "mime_type": mime_type,
                         "file_size_bytes": file_size_bytes,
+                        "content_md5": content_md5,
+                        "processing_id": processing_id,
+                        "pipeline_name": pipeline_name,
+                        "pipeline_version": pipeline_version,
                     },
+                )
+                .mappings()
+                .one_or_none()
+            )
+            if inserted is not None:
+                return dict(inserted), True
+            existing = (
+                connection.execute(
+                    text("select * from recordings where processing_id = :processing_id"),
+                    {"processing_id": processing_id},
                 )
                 .mappings()
                 .one()
             )
+            return dict(existing), False
 
     def _delete_recording(self, recording_id: RecordingId) -> None:
         with self._engine.begin() as connection:
@@ -569,17 +615,19 @@ class RecordingService:
         return f"recordings/{recording_id}/{uuid4().hex}{suffix}"
 
     @staticmethod
-    async def _write_upload(upload: UploadFile, destination: Path) -> int:
+    async def _write_upload(upload: UploadFile, destination: Path) -> tuple[int, str]:
         destination.parent.mkdir(parents=True, exist_ok=True)
         total = 0
+        digest = hashlib.md5(usedforsecurity=False)
         with destination.open("wb") as file:
             while chunk := await upload.read(1024 * 1024):
                 total += len(chunk)
+                digest.update(chunk)
                 file.write(chunk)
         if total == 0:
             destination.unlink(missing_ok=True)
             raise ValueError("Uploaded audio file is empty")
-        return total
+        return total, digest.hexdigest()
 
     @staticmethod
     def _optional_row(row: RowMapping | None) -> DatabaseRow | None:

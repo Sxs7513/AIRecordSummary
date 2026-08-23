@@ -10,7 +10,7 @@ from l1_foundation.messaging import EventEnvelope
 from l1_foundation.pipeline.contracts import ArtifactRef
 from l1_foundation.streaming import SyncRedisStreamStore
 from l2_core.access.recordings import RecordingAccessService
-from l2_core.application.processing_queue import ProcessingCommandPublisher, queued_processing_state
+from l2_core.application.processing_queue import ProcessingCommandPublisher, queued_processing_state, stable_recording_processing_id
 from l2_core.application.recordings import RecordingService
 from l2_core.auth.contracts import CurrentUser
 
@@ -34,6 +34,56 @@ class _StateStore:
 
     def get_state(self, key: str) -> dict[str, object] | None:
         return self.values.get(key)
+
+
+def test_recording_processing_id_is_stable_within_user_workspace_and_pipeline() -> None:
+    workspace_id = uuid4()
+    owner_user_id = uuid4()
+
+    first = stable_recording_processing_id(workspace_id, owner_user_id, "recording_processing", "25", "a" * 32)
+    repeated = stable_recording_processing_id(workspace_id, owner_user_id, "recording_processing", "25", "A" * 32)
+
+    assert first == repeated
+
+
+def test_recording_processing_id_changes_across_identity_boundaries() -> None:
+    workspace_id = uuid4()
+    owner_user_id = uuid4()
+    base = stable_recording_processing_id(workspace_id, owner_user_id, "recording_processing", "25", "a" * 32)
+
+    assert stable_recording_processing_id(uuid4(), owner_user_id, "recording_processing", "25", "a" * 32) != base
+    assert stable_recording_processing_id(workspace_id, uuid4(), "recording_processing", "25", "a" * 32) != base
+    assert stable_recording_processing_id(workspace_id, owner_user_id, "recording_processing", "26", "a" * 32) != base
+    assert stable_recording_processing_id(workspace_id, owner_user_id, "other_pipeline", "25", "a" * 32) != base
+    assert stable_recording_processing_id(workspace_id, owner_user_id, "recording_processing", "25", "b" * 32) != base
+
+
+def test_recording_submission_uses_the_supplied_processing_identity() -> None:
+    processing_id = uuid4()
+    workspace_id = uuid4()
+    recording_id = uuid4()
+    source = ArtifactRef(artifact_type="audio.source", artifact_version="1", uri="recordings/input.wav")
+    producer = _Producer()
+    publisher = ProcessingCommandPublisher(producer)  # type: ignore[arg-type]
+
+    returned = asyncio.run(
+        publisher.submit_recording(
+            recording_id,
+            "recording_processing",
+            "25",
+            source,
+            processing_id=processing_id,
+            workspace_id=workspace_id,
+        )
+    )
+
+    assert returned == processing_id
+    [(topic, key, event)] = producer.messages
+    assert topic == "processing.commands"
+    assert key == str(processing_id)
+    assert event.processing_id == processing_id
+    assert event.workspace_id == workspace_id
+    assert event.payload["subject_id"] == str(recording_id)
 
 
 def test_queued_processing_state_is_immediately_renderable_by_recording_detail() -> None:

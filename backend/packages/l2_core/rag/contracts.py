@@ -42,6 +42,13 @@ class RetrievalCandidateRow(TypedDict, total=False):
     match_type: EvidenceMatchType
     matched_speaker_profile_ids: list[UUID]
     protected_lexical_terms: list[str]
+    retrieved_via_recording_profile: bool
+    recording_profile_score: float
+
+
+class RecordingProfileCandidate(TypedDict):
+    recording_id: UUID
+    score: float
 
 
 class MetadataSpeaker(TypedDict):
@@ -143,7 +150,6 @@ class InferredFilters(BaseModel):
     file_names: list[str] = Field(default_factory=list)
     locations: list[str] = Field(default_factory=list)
     target_person_only: bool = False
-    recording_ids: list[UUID] = Field(default_factory=_uuid_list)
     speaker_profile_ids: list[UUID] = Field(default_factory=_uuid_list)
 
 
@@ -155,6 +161,7 @@ class RagRoute(BaseModel):
     recording_rank: int | None = Field(default=None, ge=1, le=10)
     time_range: TimeRange | None = None
     inferred_filters: InferredFilters = Field(default_factory=InferredFilters)
+    history_recording_ids: list[UUID] = Field(default_factory=_uuid_list)
     error_code: RouteErrorCode | None = None
     reason: str = ""
 
@@ -306,13 +313,14 @@ class AnswerPlan(BaseModel):
 
 
 class RetrievalTerms(BaseModel):
-    """A scope-free content query and faithful anchors prepared for retrieval."""
+    """A scope-free content query, faithful anchors, and answer-evidence cues."""
 
     model_config = ConfigDict(extra="forbid")
 
     content_query: str = Field(min_length=1)
     terms: list[str] = Field(default_factory=list, max_length=6)
     phrases: list[str] = Field(default_factory=list, max_length=4)
+    evidence_queries: list[str] = Field(default_factory=list, max_length=3)
 
 
 StructuredFactKey = Literal["file_name", "duration_seconds", "created_at", "location", "speakers"]
@@ -360,6 +368,7 @@ class RagGraphState(TypedDict):
     route: RagRoute | None
     route_error: str | None
     filters: ResolvedFilters | None
+    history_scope_active: bool
     content_query: str
     retrieval_expanded_query: str | None
     retrieval_lexical_queries: list[str]
@@ -390,6 +399,7 @@ class RagStateUpdate(TypedDict, total=False):
     route: RagRoute | None
     route_error: str | None
     filters: ResolvedFilters | None
+    history_scope_active: bool
     content_query: str
     retrieval_expanded_query: str | None
     retrieval_lexical_queries: list[str]

@@ -117,6 +117,10 @@ create table if not exists recordings (
     location text,
     mime_type text not null,
     file_size_bytes bigint not null check (file_size_bytes >= 0),
+    content_md5 text not null check (content_md5 ~ '^[0-9a-f]{32}$'),
+    processing_id uuid not null unique,
+    processing_pipeline_name text not null,
+    processing_pipeline_version text not null,
     duration_seconds integer check (duration_seconds is null or duration_seconds >= 0),
     status text not null check (status in ('uploaded', 'processing', 'completed', 'failed')),
     error_message text,
@@ -145,6 +149,14 @@ comment on column recordings.mime_type is
     '音频文件 MIME 类型，例如 audio/mpeg、audio/wav。';
 comment on column recordings.file_size_bytes is
     '音频文件大小，单位字节，用于展示和容量控制。';
+comment on column recordings.content_md5 is
+    '上传文件原始字节的 MD5，用于在用户与工作区范围内生成稳定的 Processing 幂等标识。';
+comment on column recordings.processing_id is
+    '当前初始录音处理的稳定标识，由工作区、所有者、Pipeline 名称/版本和文件 MD5 生成。';
+comment on column recordings.processing_pipeline_name is
+    '生成 processing_id 时使用的不可变 Pipeline 名称。';
+comment on column recordings.processing_pipeline_version is
+    '生成 processing_id 时使用的不可变 Pipeline 版本；该版本封装完整 Stage 版本。';
 comment on column recordings.duration_seconds is
     '音频总时长，单位秒。允许为空，表示上传后尚未完成元数据提取。';
 comment on column recordings.status is
@@ -163,6 +175,7 @@ create index if not exists recordings_workspace_id_idx on recordings (workspace_
 create index if not exists recordings_owner_user_id_idx on recordings (owner_user_id);
 create index if not exists recordings_uploaded_at_idx on recordings (uploaded_at desc);
 create index if not exists recordings_created_at_idx on recordings (created_at desc);
+create index if not exists recordings_content_md5_idx on recordings (workspace_id, owner_user_id, content_md5);
 create index if not exists recordings_location_trgm_idx on recordings using gin (location gin_trgm_ops);
 
 -- 例外录音分享；不用于表达同一工作区成员的默认访问权。
@@ -574,6 +587,28 @@ create table if not exists embedding_models (
     created_at timestamptz not null default now(),
     unique (provider, model_name, dimensions)
 );
+
+create table if not exists recording_retrieval_documents (
+    id uuid primary key default gen_random_uuid(),
+    recording_id uuid not null references recordings(id) on delete cascade,
+    embedding_model_id uuid not null references embedding_models(id) on delete restrict,
+    document_index integer not null default 0 check (document_index >= 0),
+    document_type text not null default 'profile' check (document_type in ('profile', 'overview', 'outline')),
+    retrieval_text text not null,
+    content_hash text not null,
+    embedding halfvec(2560) not null,
+    created_at timestamptz not null default now(),
+    updated_at timestamptz not null default now(),
+    unique (recording_id, embedding_model_id, document_index)
+);
+
+comment on table recording_retrieval_documents is
+    '录音检索画像及其向量；由标题和总结构建，仅用于定位录音，不直接作为回答证据。';
+
+create index if not exists recording_retrieval_documents_recording_id_idx
+    on recording_retrieval_documents (recording_id);
+create index if not exists recording_retrieval_documents_hnsw_idx
+    on recording_retrieval_documents using hnsw (embedding halfvec_cosine_ops);
 
 create table if not exists recording_search_chunks (
     id uuid primary key default gen_random_uuid(),

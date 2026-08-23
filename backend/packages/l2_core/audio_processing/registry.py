@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from sqlalchemy import Engine
+
 from l1_foundation.llm import LlmProvider
 from l1_foundation.pipeline.registry import StageRegistry
 from l1_foundation.pipeline.runtime.artifact_store import ArtifactStore
@@ -15,6 +17,7 @@ from l2_core.audio_processing.stages.embedding_indexing import EmbeddingIndexing
 from l2_core.audio_processing.stages.normalize_audio import NormalizeAudioStage
 from l2_core.audio_processing.stages.preprocess_asr_audio import PreprocessAsrAudioStage
 from l2_core.audio_processing.stages.summary.stage import GenerateSummaryStage
+from l2_core.audio_processing.stages.summary_embedding_indexing import SummaryEmbeddingIndexer, SummaryEmbeddingIndexingStage
 from l2_core.audio_processing.stages.transcribe_funasr_nano import FunAsrNanoTranscribeStage
 from l2_core.audio_processing.stages.transcribe_funasr_nano.context import build_funasr_hotwords
 from l2_core.audio_processing.stages.transcribe_qwen_asr import QwenAsrTranscribeStage
@@ -29,6 +32,7 @@ def build_recording_stage_registry(
     async_worker_client: WorkerClient,
     generation_service: GenerationService | None = None,
     summary_stage: GenerateSummaryStage | None = None,
+    engine: Engine | None = None,
 ) -> StageRegistry:
     """Build every recording-owned stage; stages orchestrate atomic compute calls themselves."""
     registry = StageRegistry()
@@ -153,6 +157,7 @@ def build_recording_stage_registry(
         )
     )
     registry.register(summary_stage or build_recording_summary_stage(settings, artifact_store, worker_client, generation_service))
+    registry.register(SummaryEmbeddingIndexingStage(artifact_store, build_summary_embedding_indexer(settings, worker_client), engine))
     return registry
 
 
@@ -178,6 +183,15 @@ def build_recording_summary_stage(
         settings.recording_summary_rolling_chunk_max_tokens,
         settings.recording_summary_rolling_memory_max_chars,
         generation_service,
+    )
+
+
+def build_summary_embedding_indexer(settings: Settings, worker_client: SyncWorkerClient) -> SummaryEmbeddingIndexer:
+    return SummaryEmbeddingIndexer(
+        worker_client,
+        EmbeddingTokenCounter(settings.embedding_model, settings.resolved_embedding_model_cache_dir),
+        settings.embedding_dimensions,
+        settings.recording_summary_embedding_max_tokens,
     )
 
 

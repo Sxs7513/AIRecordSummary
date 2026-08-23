@@ -44,7 +44,14 @@ async def run() -> None:
     async_compute = KafkaWorkerClient(producer, async_redis, poll_interval_seconds=settings.compute_worker_poll_interval_seconds)
     sync_compute = SyncKafkaWorkerClient(sync_producer, redis, poll_interval_seconds=settings.compute_worker_poll_interval_seconds)
     summary_stage = build_recording_summary_stage(settings, artifact_store, sync_compute)
-    registry = build_recording_stage_registry(settings, artifact_store, sync_compute, async_compute, summary_stage=summary_stage)
+    registry = build_recording_stage_registry(
+        settings,
+        artifact_store,
+        sync_compute,
+        async_compute,
+        summary_stage=summary_stage,
+        engine=engine,
+    )
     definition = build_recording_processing(settings.asr_provider)
     handler = ProcessingCommandHandler(definition, registry, artifact_store, redis, producer, RecordingProcessingHooks(engine))
     consumer = KafkaEventConsumer(

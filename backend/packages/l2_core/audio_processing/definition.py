@@ -119,6 +119,16 @@ def build_recording_processing(asr_provider: AsrProvider = "qwen_asr") -> Pipeli
                 input_artifacts=(ArtifactBinding("utterances", "utterances.final", "build_utterances"),),
                 output_artifacts=("summary.recording",),
             ),
+            PipelineNode(
+                "summary_embedding_indexing",
+                "summary_embedding_indexing",
+                "1",
+                GPU_RETRY,
+                depends_on=("generate_summary",),
+                required=False,
+                input_artifacts=(ArtifactBinding("summary", "summary.recording", "generate_summary"),),
+                output_artifacts=("summary.embedding_index",),
+            ),
         ),
     )
 

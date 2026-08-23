@@ -139,6 +139,15 @@ class Settings(BaseSettings):
     rag_rrf_k: int = Field(default=60, gt=0, validation_alias="RAG_RRF_K")
     rag_vector_weight: float = Field(default=1.0, ge=0, validation_alias="RAG_VECTOR_WEIGHT")
     rag_lexical_weight: float = Field(default=1.0, ge=0, validation_alias="RAG_LEXICAL_WEIGHT")
+    rag_recording_profile_search_enabled: bool = Field(default=True, validation_alias="RAG_RECORDING_PROFILE_SEARCH_ENABLED")
+    rag_recording_profile_candidate_limit: int = Field(default=3, gt=0, le=20, validation_alias="RAG_RECORDING_PROFILE_CANDIDATE_LIMIT")
+    rag_recording_profile_min_score: float = Field(default=0.30, ge=-1, le=1, validation_alias="RAG_RECORDING_PROFILE_MIN_SCORE")
+    rag_recording_profile_scoped_chunk_limit: int = Field(
+        default=2,
+        gt=0,
+        le=10,
+        validation_alias="RAG_RECORDING_PROFILE_SCOPED_CHUNK_LIMIT",
+    )
     embedding_model: str = Field(default="Qwen/Qwen3-Embedding-4B", validation_alias="EMBEDDING_MODEL")
     embedding_dimensions: int = Field(default=2560, gt=0, validation_alias="EMBEDDING_DIMENSIONS")
     embedding_inference_batch_size: int = Field(default=8, gt=0, le=64, validation_alias="EMBEDDING_INFERENCE_BATCH_SIZE")
@@ -156,6 +165,7 @@ class Settings(BaseSettings):
     recording_summary_rolling_chunk_max_chars: int = Field(default=8000, gt=0, validation_alias="RECORDING_SUMMARY_ROLLING_CHUNK_MAX_CHARS")
     recording_summary_rolling_chunk_max_tokens: int = Field(default=1800, gt=0, validation_alias="RECORDING_SUMMARY_ROLLING_CHUNK_MAX_TOKENS")
     recording_summary_rolling_memory_max_chars: int = Field(default=6000, gt=0, validation_alias="RECORDING_SUMMARY_ROLLING_MEMORY_MAX_CHARS")
+    recording_summary_embedding_max_tokens: int = Field(default=512, gt=0, validation_alias="RECORDING_SUMMARY_EMBEDDING_MAX_TOKENS")
     local_llm_model_repo: str = Field(
         default="Qwen/Qwen2.5-7B-Instruct-GGUF",
         validation_alias=AliasChoices("LOCAL_LLM_MODEL_REPO", "LLM_CORRECTION_MODEL_REPO"),

@@ -2,7 +2,7 @@ from datetime import datetime
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
-from l2_core.rag.contracts import InferredFilters, RagRoute, ResolvedFilters, TimeRange
+from l2_core.rag.contracts import RagRoute, ResolvedFilters, TimeRange
 from l2_core.rag.retrieval import RagRetriever
 from l2_core.rag.routing import parse_route_response
 from l2_core.rag.scope import make_filters, resolve_time_range
@@ -227,14 +227,34 @@ def test_scope_summary_without_explicit_scope_keeps_all_accessible_recordings() 
     assert filters.recording_ids == accessible_ids
 
 
-def test_inaccessible_explicit_recording_matches_nothing_without_uuid_sentinel() -> None:
+def test_inaccessible_history_recording_matches_nothing_without_uuid_sentinel() -> None:
     route = RagRoute(
         status="resolved",
         strategy_id="scope_summary",
-        inferred_filters=InferredFilters(recording_ids=[uuid4()]),
+        history_recording_ids=[uuid4()],
     )
 
     filters = make_filters(route, None, [uuid4()])
 
     assert filters.match_none
     assert filters.recording_ids == []
+
+
+def test_history_scope_can_be_removed_without_relaxing_access_scope() -> None:
+    history_recording_id, other_recording_id = uuid4(), uuid4()
+    route = RagRoute(
+        status="resolved",
+        strategy_id="fact_lookup",
+        history_recording_ids=[history_recording_id],
+    )
+
+    first_pass = make_filters(route, None, [history_recording_id, other_recording_id])
+    fallback = make_filters(
+        route,
+        None,
+        [history_recording_id, other_recording_id],
+        include_history_scope=False,
+    )
+
+    assert first_pass.recording_ids == [history_recording_id]
+    assert fallback.recording_ids == [history_recording_id, other_recording_id]

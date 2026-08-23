@@ -28,6 +28,7 @@ class FactLookupStrategy:
         classify_query_correction_risk: Node,
         adjudication_agent: Node,
         apply_user_adjudication_decision: Node,
+        retry_without_history_scope: Node,
         adjudication_enabled: bool,
         after_user_adjudication: Callable[[RagGraphState], str],
         transition: Callable[[RagGraphState, str, str, str], None],
@@ -40,6 +41,7 @@ class FactLookupStrategy:
         self._transition = transition
         self._rerank_enabled = rerank_enabled
         self._adjudication_enabled = adjudication_enabled
+        self._retry_without_history_scope = retry_without_history_scope
         builder = cast(Any, StateGraph(RagGraphState))
         if adjudication_enabled:
             builder.add_node(
@@ -66,6 +68,14 @@ class FactLookupStrategy:
         builder.add_node(
             "grade",
             rag_execution_middleware.wrap_node(grade, graph_name=self.id, node_name="grade"),
+        )
+        builder.add_node(
+            "retry_without_history_scope",
+            rag_execution_middleware.wrap_node(
+                retry_without_history_scope,
+                graph_name=self.id,
+                node_name="retry_without_history_scope",
+            ),
         )
         if adjudication_enabled:
             builder.add_node(
@@ -115,8 +125,16 @@ class FactLookupStrategy:
             acquire_targets,
         )
         if adjudication_enabled:
-            builder.add_edge("grade", "finalize")
-            builder.add_edge("grade_variants", "finalize")
+            builder.add_conditional_edges(
+                "grade",
+                self._after_grade,
+                {"retry": "retry_without_history_scope", "finalize": "finalize"},
+            )
+            builder.add_conditional_edges(
+                "grade_variants",
+                self._after_grade,
+                {"retry": "retry_without_history_scope", "finalize": "finalize"},
+            )
             builder.add_edge("adjudication_agent", "apply_user_adjudication_decision")
             builder.add_conditional_edges(
                 "apply_user_adjudication_decision",
@@ -124,7 +142,12 @@ class FactLookupStrategy:
                 {"grade_variants": "grade_variants", "finalize": "finalize"},
             )
         else:
-            builder.add_edge("grade", "finalize")
+            builder.add_conditional_edges(
+                "grade",
+                self._after_grade,
+                {"retry": "retry_without_history_scope", "finalize": "finalize"},
+            )
+        builder.add_edge("retry_without_history_scope", "chunk_evidence")
         builder.add_edge("finalize", END)
         self._graph: Any = builder.compile()
 
@@ -137,6 +160,8 @@ class FactLookupStrategy:
             "retrieval_lexical_queries": result["retrieval_lexical_queries"],
             "retrieval_protected_lexical_queries": result["retrieval_protected_lexical_queries"],
             "retrieval_attempt": result["retrieval_attempt"],
+            "filters": result["filters"],
+            "history_scope_active": result["history_scope_active"],
             "retrieval_candidates": result["retrieval_candidates"],
             "protected_chunk_ids": result["protected_chunk_ids"],
             "rerank_input_tokens": result["rerank_input_tokens"],
@@ -181,6 +206,19 @@ class FactLookupStrategy:
             "retrieval_terminal" if target == "finalize" else "query_correction_risk" if target == "adjudicate" else "evidence_ready",
         )
         return target
+
+    def _after_grade(self, state: RagGraphState) -> Literal["retry", "finalize"]:
+        grade = state.get("grade")
+        should_retry = (
+            state["history_scope_active"]
+            and state["retrieval_attempt"] == 0
+            and grade is not None
+            and grade.verdict == "abstain"
+        )
+        if not should_retry:
+            return "finalize"
+        self._transition(state, "grade", "retry_without_history_scope", "history_scope_insufficient")
+        return "retry"
 
     async def _finalize(self, state: RagGraphState) -> RagStateUpdate:
         answer_evidence = state["answer_evidence"] or state["evidence"]

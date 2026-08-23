@@ -114,7 +114,11 @@ class ChunkEvidencePipeline:
         )
         return {
             "retrieval_candidates": candidates,
-            "protected_chunk_ids": [str(candidate["chunk_id"]) for candidate in candidates if candidate.get("protected_lexical_terms")],
+            "protected_chunk_ids": [
+                str(candidate["chunk_id"])
+                for candidate in candidates
+                if candidate.get("protected_lexical_terms") or candidate.get("retrieved_via_recording_profile")
+            ],
             "evidence": [],
             "answer_evidence": [],
             "rerank_input_tokens": 0,
@@ -164,22 +168,74 @@ class ChunkEvidencePipeline:
         async def vector_search(embedding: list[float]) -> list[RetrievalCandidateRow]:
             return await asyncio.to_thread(self._retriever.retrieve_vector_candidates, embedding, filters)
 
-        async def vector_searches() -> list[list[RetrievalCandidateRow] | BaseException]:
+        async def semantic_searches() -> tuple[list[list[RetrievalCandidateRow] | BaseException], list[RetrievalCandidateRow], BaseException | None]:
             try:
                 embeddings = await asyncio.to_thread(self._retriever.generate_query_embeddings, vector_queries)
             except Exception as error:
-                return [error for _ in vector_queries]
-            return await asyncio.gather(*(vector_search(item) for item in embeddings), return_exceptions=True)
+                return [error for _ in vector_queries], [], error
+
+            async def recording_profile_search() -> list[RetrievalCandidateRow]:
+                if not bool(getattr(self._retriever, "recording_profile_search_enabled", False)):
+                    return []
+                profile_candidates = await asyncio.to_thread(
+                    self._retriever.retrieve_recording_profile_candidates,
+                    embeddings[0],
+                    filters,
+                )
+                log_event(
+                    "recording_profile_retrieval_completed",
+                    run_id,
+                    query=query,
+                    match_count=len(profile_candidates),
+                    matches=[
+                        {
+                            "recording_id": str(candidate["recording_id"]),
+                            "score": round(candidate["score"], 6),
+                        }
+                        for candidate in profile_candidates
+                    ],
+                )
+                scoped_rows = await asyncio.to_thread(
+                    self._retriever.retrieve_recording_profile_scoped_chunk_candidates,
+                    embeddings[0],
+                    profile_candidates,
+                )
+                log_event(
+                    "recording_profile_scoped_chunk_retrieval_completed",
+                    run_id,
+                    recording_match_count=len(profile_candidates),
+                    chunk_count=len(scoped_rows),
+                    candidates=_candidate_refs(scoped_rows),
+                )
+                return scoped_rows
+
+            raw_vector_results, raw_profile_results = await asyncio.gather(
+                asyncio.gather(*(vector_search(item) for item in embeddings), return_exceptions=True),
+                recording_profile_search(),
+                return_exceptions=True,
+            )
+            vector_results = cast(list[list[RetrievalCandidateRow] | BaseException], raw_vector_results)
+            if isinstance(raw_profile_results, BaseException):
+                return vector_results, [], raw_profile_results
+            return vector_results, raw_profile_results, None
 
         vector_started = started_at()
         lexical_started = started_at()
-        vector_results, lexical_results = await asyncio.gather(
-            vector_searches(),
+        semantic_result, lexical_results = await asyncio.gather(
+            semantic_searches(),
             asyncio.gather(
                 *(asyncio.to_thread(self._retriever.retrieve_lexical_candidates, item, filters) for item in lexical_searches),
                 return_exceptions=True,
             ),
         )
+        vector_results, profile_rows, profile_error = semantic_result
+        if profile_error is not None:
+            log_event(
+                "recording_profile_retrieval_failed",
+                run_id,
+                level=logging.WARNING,
+                error_type=type(profile_error).__name__,
+            )
         vector_lists = [item for item in vector_results if isinstance(item, list)]
         lexical_lists = [item for item in lexical_results if isinstance(item, list)]
         vector_errors = [item for item in vector_results if isinstance(item, BaseException)]
@@ -232,6 +288,7 @@ class ChunkEvidencePipeline:
             lexical_results,
             protected_searches,
         )
+        fused = _retain_recording_profile_candidates(fused, profile_rows)
         self._operation_completed(
             "retrieve",
             "retrieve.rrf",
@@ -243,6 +300,8 @@ class ChunkEvidencePipeline:
                 "lexical_degraded": bool(lexical_errors),
                 "vector_query_count": len(vector_queries),
                 "lexical_query_count": len(lexical_searches),
+                "recording_profile_degraded": profile_error is not None,
+                "recording_profile_scoped_candidate_count": len(profile_rows),
             },
         )
         overlap = len({row["chunk_id"] for row in vector_rows} & {row["chunk_id"] for row in lexical_rows})
@@ -259,6 +318,8 @@ class ChunkEvidencePipeline:
             lexical_degraded=bool(lexical_errors),
             vector_query_count=len(vector_queries),
             lexical_query_count=len(lexical_searches),
+            recording_profile_candidates=len(profile_rows),
+            recording_profile_degraded=profile_error is not None,
             fused_candidate_refs=_candidate_refs(fused),
             elapsed_ms=elapsed_ms(started),
         )
@@ -412,6 +473,8 @@ def _candidate_refs(rows: list[RetrievalCandidateRow]) -> list[dict[str, object]
             "score": row.get("score"),
             "exact_match": row.get("exact_match"),
             "protected_lexical_terms": row.get("protected_lexical_terms", []),
+            "retrieved_via_recording_profile": row.get("retrieved_via_recording_profile", False),
+            "recording_profile_score": row.get("recording_profile_score"),
             "match_type": row.get("match_type"),
         }
         for row in rows
@@ -447,6 +510,24 @@ def _retain_protected_lexical_candidates(
     return retained
 
 
+def _retain_recording_profile_candidates(
+    fused: list[RetrievalCandidateRow],
+    profile_rows: list[RetrievalCandidateRow],
+) -> list[RetrievalCandidateRow]:
+    """Reserve the recording-profile lane without duplicating global candidates."""
+
+    profile_by_chunk = {str(row["chunk_id"]): row for row in profile_rows}
+    retained = list(profile_by_chunk.values())
+    for row in fused:
+        chunk_id = str(row["chunk_id"])
+        if chunk_id in profile_by_chunk:
+            retained_row = profile_by_chunk[chunk_id]
+            retained_row["match_type"] = row.get("match_type", retained_row.get("match_type", "vector"))
+            continue
+        retained.append(row)
+    return retained
+
+
 def _retain_protected_evidence(
     reranked: list[Evidence],
     original: list[Evidence],
@@ -454,5 +535,13 @@ def _retain_protected_evidence(
 ) -> list[Evidence]:
     protected_ids = set(protected_chunk_ids)
     protected = [item for item in original if str(item.chunk.id) in protected_ids]
-    protected_ids = {str(item.chunk.id) for item in protected}
-    return [*protected, *(item for item in reranked if str(item.chunk.id) not in protected_ids)]
+    combined = [*protected, *reranked]
+    unique: list[Evidence] = []
+    seen: set[str] = set()
+    for item in combined:
+        chunk_id = str(item.chunk.id)
+        if chunk_id in seen:
+            continue
+        seen.add(chunk_id)
+        unique.append(item)
+    return [item.model_copy(update={"index": index}) for index, item in enumerate(unique, start=1)]

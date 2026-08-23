@@ -196,3 +196,18 @@ class RecordingSummaryOutput(BaseModel):
     provider: Literal["local", "zhipu", "gemini"]
     model_name: str
     summary_text: str
+
+
+class SummaryEmbeddingIndexingInput(BaseModel):
+    summary: ArtifactRef
+
+
+class SummaryEmbeddingIndexingOutput(BaseModel):
+    provider: Literal["sentence_transformers"]
+    model_name: str
+    dimensions: int = Field(gt=0)
+    document_index: int = Field(default=0, ge=0)
+    document_type: Literal["profile"] = "profile"
+    retrieval_text: str
+    content_hash: str
+    embedding: list[float]

@@ -10,7 +10,7 @@ from l1_foundation.pipeline.runtime.artifact_store import ArtifactStore
 from l1_foundation.settings import get_settings
 from l1_foundation.streaming import RedisStreamStore, SyncRedisStreamStore
 from l1_foundation.worker import KafkaWorkerClient, SyncKafkaWorkerClient
-from l2_core.audio_processing.registry import build_recording_summary_stage
+from l2_core.audio_processing.registry import build_recording_summary_stage, build_summary_embedding_indexer
 from l2_core.audio_processing.stages.summary.regeneration import RecordingSummaryRegenerationService
 from l2_core.conversations.history_store import ConversationHistoryStore
 from l2_core.conversations.service import ConversationService
@@ -90,7 +90,12 @@ async def run() -> None:
     await observability.start()
     rag_service = RagService(engine, settings, worker_client, sync_worker_client, observability, sync_redis_store)
     summary_stage = build_recording_summary_stage(settings, ArtifactStore(settings.resolved_local_storage_root), sync_worker_client)
-    summary_service = RecordingSummaryRegenerationService(engine, generation_service, summary_stage)
+    summary_service = RecordingSummaryRegenerationService(
+        engine,
+        generation_service,
+        summary_stage,
+        summary_embedding_indexer=build_summary_embedding_indexer(settings, sync_worker_client),
+    )
     conversation_service = ConversationService(engine, generation_service, conversation_history_store)
     handler = GenerationCommandHandler(
         rag_service,

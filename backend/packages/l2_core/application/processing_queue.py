@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from typing import Any
-from uuid import UUID, uuid4
+from uuid import UUID, uuid4, uuid5
 
 from pydantic import BaseModel, ConfigDict
 
@@ -12,6 +13,31 @@ from l1_foundation.pipeline.contracts import ArtifactRef
 
 class ProcessingQueueUnavailableError(RuntimeError):
     """Raised when Kafka does not acknowledge a Processing command."""
+
+
+PROCESSING_ID_NAMESPACE = UUID("97f66f2a-2034-4e14-93b7-b3c5ff78b289")
+
+
+def stable_recording_processing_id(
+    workspace_id: UUID,
+    owner_user_id: UUID,
+    pipeline_name: str,
+    pipeline_version: str,
+    file_md5: str,
+) -> UUID:
+    """Identify one user's processing of identical bytes with one immutable pipeline."""
+    identity = json.dumps(
+        {
+            "file_md5": file_md5.lower(),
+            "owner_user_id": str(owner_user_id),
+            "pipeline_name": pipeline_name,
+            "pipeline_version": pipeline_version,
+            "workspace_id": str(workspace_id),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return uuid5(PROCESSING_ID_NAMESPACE, identity)
 
 
 class ProcessingWorkItem(BaseModel):
@@ -65,8 +91,17 @@ class ProcessingCommandPublisher:
     def __init__(self, producer: KafkaEventProducer) -> None:
         self._kafka_producer = producer
 
-    async def submit_recording(self, subject_id: UUID, pipeline_name: str, pipeline_version: str, source: ArtifactRef) -> UUID:
-        processing_id = uuid4()
+    async def submit_recording(
+        self,
+        subject_id: UUID,
+        pipeline_name: str,
+        pipeline_version: str,
+        source: ArtifactRef,
+        *,
+        processing_id: UUID | None = None,
+        workspace_id: UUID | None = None,
+    ) -> UUID:
+        processing_id = processing_id or uuid4()
         item = ProcessingWorkItem(
             processing_id=processing_id,
             subject_type="recording",
@@ -83,6 +118,7 @@ class ProcessingCommandPublisher:
                     "processing.requested",
                     "production-api",
                     correlation_id=processing_id,
+                    workspace_id=workspace_id,
                     processing_id=processing_id,
                     payload=item.model_dump(mode="json"),
                 ),

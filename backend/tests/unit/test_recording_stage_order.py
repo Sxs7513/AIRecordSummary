@@ -6,6 +6,7 @@ from l2_core.audio_processing.definition import build_recording_processing
 
 def test_recording_processing_stages_follow_the_declared_graph_order() -> None:
     stages = [
+        {"node_name": "summary_embedding_indexing"},
         {"node_name": "generate_summary"},
         {"node_name": "normalize_audio"},
         {"node_name": "correct_asr_windows"},
@@ -21,6 +22,7 @@ def test_recording_processing_stages_follow_the_declared_graph_order() -> None:
         "correct_asr_windows",
         "align_transcript",
         "generate_summary",
+        "summary_embedding_indexing",
     ]
 
 

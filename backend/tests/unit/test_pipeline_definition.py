@@ -50,6 +50,9 @@ def test_recording_processing_indexes_and_summarizes_in_parallel() -> None:
     assert nodes["embedding_indexing"].stage_version == "3"
     assert nodes["generate_summary"].depends_on == ("build_utterances",)
     assert nodes["generate_summary"].stage_version == "2"
+    assert nodes["summary_embedding_indexing"].depends_on == ("generate_summary",)
+    assert nodes["summary_embedding_indexing"].input_artifacts[0].artifact_type == "summary.recording"
+    assert nodes["summary_embedding_indexing"].required is False
     assert nodes["build_search_chunks"].output_artifacts == ("search.chunks",)
 
 

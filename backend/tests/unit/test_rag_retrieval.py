@@ -69,6 +69,10 @@ class FakeSettings:
     rag_lexical_weight = 1.0
     embedding_model = "Qwen/Qwen3-Embedding-4B"
     embedding_dimensions = 2560
+    rag_recording_profile_search_enabled = True
+    rag_recording_profile_candidate_limit = 3
+    rag_recording_profile_min_score = 0.3
+    rag_recording_profile_scoped_chunk_limit = 2
 
 
 def _retriever(connection: FakeConnection) -> RagRetriever:
@@ -88,6 +92,55 @@ def _recording(recording_id: UUID, title: str) -> dict[str, object]:
         "duration_seconds": 60,
         "created_at": datetime(2026, 8, 8, 9, 30, tzinfo=UTC),
     }
+
+
+def test_recording_profile_retrieval_uses_recording_level_embeddings() -> None:
+    recording_id = uuid4()
+    created_from = datetime(2026, 8, 1, tzinfo=UTC)
+    connection = FakeConnection([[{"recording_id": recording_id, "score": 0.61}]])
+
+    rows = _retriever(connection).retrieve_recording_profile_candidates(
+        [0.1, 0.2],
+        ResolvedFilters(created_from=created_from),
+    )
+
+    assert rows == [{"recording_id": recording_id, "score": 0.61}]
+    sql, parameters = connection.executions[0]
+    assert "from recording_retrieval_documents profile_documents" in sql
+    assert "recordings.created_at >= :created_from" in sql
+    assert parameters["created_from"] == created_from
+    assert parameters["min_score"] == 0.3
+
+
+def test_recording_profile_scoped_retrieval_materializes_filtered_chunks_and_marks_locator_lane() -> None:
+    recording_id = uuid4()
+    chunk_id = uuid4()
+    row = {
+        **_recording(recording_id, "项目汇报"),
+        "chunk_id": chunk_id,
+        "recording_id": recording_id,
+        "text": "团队介绍了项目进展。",
+        "start_ms": 0,
+        "end_ms": 1_000,
+        "speaker_labels": ["Speaker A"],
+        "is_target_person": False,
+        "source_utterance_segment_ids": [],
+        "metadata": {},
+        "score": 0.42,
+    }
+    connection = FakeConnection([[row]])
+
+    rows = _retriever(connection).retrieve_recording_profile_scoped_chunk_candidates(
+        [0.1, 0.2],
+        [{"recording_id": recording_id, "score": 0.71}],
+    )
+
+    assert rows[0]["chunk_id"] == chunk_id
+    assert rows[0]["retrieved_via_recording_profile"] is True
+    assert rows[0]["recording_profile_score"] == 0.71
+    sql, parameters = connection.executions[0]
+    assert "with scoped_chunks as materialized" in sql
+    assert parameters["recording_ids"] == [str(recording_id)]
 
 
 def test_retrieve_scope_loads_all_recording_utterances_in_one_batch_query() -> None:
