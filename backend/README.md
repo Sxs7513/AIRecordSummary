@@ -46,8 +46,6 @@ npm run dev:evaluation-api
 npm run dev:training-api
 ```
 
-After an intentional Redis reset, stop command processing temporarily and run `npm run infra:rebuild-redis` to replay the compacted Processing, Compute, and Generation state topics.
-
 The Production API, Compute Worker, Observability API, Evaluation API, and Training API listen on ports 8000, 8010, 8003, 8001, and 8002. `npm run dev:python-web` is a
 backward-compatible alias for `npm run dev:production-api`.
 
@@ -160,7 +158,7 @@ npm run dev:production-api
 
 It exercises `normalize → diarize → Qwen ASR → utterances → correction → summary`. It requires the models referenced by the root `.env` to be available under the repository `model-cache` directory.
 
-旧的数据库 Pipeline E2E 已随运行时表一起删除。新的故障与端到端测试必须启动真实 Kafka/Redis，并验证 Consumer 重放、幂等、retry/DLQ 和 Redis 状态重建。Pipeline Stage 不再按资源队列整体调度；原子 CPU/GPU/在线模型任务由 Compute operation 声明自己的 lane，业务 DAG 只由 `processing-worker` 推进。
+旧的数据库 Pipeline E2E 已随运行时表一起删除。新的故障与端到端测试必须启动真实 Kafka/Redis，并验证 Consumer 重放、幂等和 retry/DLQ。Pipeline Stage 不再按资源队列整体调度；原子 CPU/GPU/在线模型任务由 Compute operation 声明自己的 lane，业务 DAG 只由 `processing-worker` 推进。
 
 ## Recording API
 

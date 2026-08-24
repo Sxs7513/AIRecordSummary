@@ -5,7 +5,7 @@
 - 状态：主体改造完成（真实 Kafka/Redis 故障注入与音频端到端验证待运行）
 - 日期：2026-08-06
 - 适用范围：Production API、Processing、Compute Worker、Generation、RAG、Observability
-- 核心决策：Kafka 是任务与过程事件的持久化事实源，Redis 是活跃状态与实时流投影，PostgreSQL 只保存最终业务结果和统计查询投影
+- 核心决策：Kafka 是任务与过程事件的持久化事实源，Redis 是活跃状态与实时流投影；涉及 PostgreSQL 业务聚合写入的命令先与共享 Transactional Outbox 原子提交，再由 relay 投递 Kafka
 
 本文档替代以下文档中与任务持久化、流式事件存储和多实例调度相关的旧结论：
 
@@ -32,7 +32,7 @@
 2. Redis Streams 承载 LLM/ASR delta、progress、phase 和面向 SSE 的短期续传；
 3. Redis Hash/Set 承载活跃任务的当前状态、依赖完成集合、心跳、取消快速检查和短期幂等；
 4. PostgreSQL 退出任务队列、高频进度和 Pipeline 运行时状态管理，只保存最终业务结果与统计查询投影；
-5. 支持多 API、多 Consumer、多 CPU/GPU Worker、至少一次投递、幂等消费、重试、DLQ 和 Redis 状态重建；
+5. 支持多 API、多 Consumer、多 CPU/GPU Worker、至少一次投递、幂等消费、重试和 DLQ；
 6. 删除已经被 Kafka 或 Redis 完整接管的表、字段、Repository 和内存 Runner；
 7. 保留现有类型化 Operation、Artifact 和面向前端的 SSE 协议中仍有价值的契约。
 
@@ -48,7 +48,7 @@ PostgreSQL 保存“最后得到了什么、页面长期要查询什么”
 
 | 组件 | 负责内容 | 不负责内容 |
 | --- | --- | --- |
-| Kafka | 命令、任务、可靠取消、生命周期事件、结果事件、统计原始事件、重试、DLQ、可重建状态快照 | 逐 token SSE、复杂业务查询、大型二进制 |
+| Kafka | 命令、任务、可靠取消、生命周期事件、结果事件、统计原始事件、重试、DLQ | 逐 token SSE、任务状态快照、复杂业务查询、大型二进制 |
 | Redis Streams | LLM/ASR delta、phase、progress、heartbeat、SSE 短期断线续传 | 唯一任务事实源、永久业务结果、无限期审计 |
 | Redis Hash/Set/String | 活跃任务快照、Stage 完成集合、取消快速标记、Worker 心跳、锁、短期幂等和缓存 | 唯一一份终态、不可重建的业务数据 |
 | PostgreSQL | 用户、录音、转写、说话人、Summary、Conversation、最终 Generation 结果、Observability 查询投影 | Worker/Processing 队列、逐 delta、progress、原始事件日志和中间 Artifact 元数据 |
@@ -58,7 +58,7 @@ PostgreSQL 保存“最后得到了什么、页面长期要查询什么”
 
 1. 丢失后任务可能永远不执行：进入 Kafka；
 2. 需要另一个服务收到后开始工作：进入 Kafka；
-3. 需要重试、回放、审计或重建状态：进入 Kafka；
+3. 需要重试、回放或审计：进入 Kafka；
 4. 每秒高频更新、只用于当前进度或实时展示：进入 Redis；
 5. 需要 TTL、锁、心跳或毫秒级读取：进入 Redis；
 6. 是用户最终要长期查询的业务结果：进入 PostgreSQL；
@@ -91,33 +91,34 @@ Client ◀── SSE / state query ◀── Production API ◀── Redis
 Client ◀── final business query ◀── Production API ◀── PostgreSQL
 ```
 
-### 4.1 Kafka-first，而不是 Outbox-first
+### 4.1 业务事务使用 Outbox，内部工作流保持 Kafka-first
 
-本方案不使用 Transactional Outbox，也不新增 `outbox-relay`。
+录音上传、重试、删除以及 Conversation RAG 创建同时修改 PostgreSQL 业务聚合并产生 Kafka 命令。它们使用共享 `integration_outbox`，由独立 `outbox-relay` 以 at-least-once 语义发送。业务行与消息意图在同一个 PostgreSQL 事务提交，API 成功表示命令已被 PostgreSQL 可靠接受，不再表示 Broker 已 ACK。
 
-本次目标是让 Kafka 成为任务创建的第一个持久化落点。如果 API 先写 PostgreSQL，再写 Outbox，任务队列职责仍然部分留在数据库，与减少数据库运行时写入的目标冲突。
+不伴随 PostgreSQL 业务事务的 standalone RAG command、Compute、Processing/RAG Worker 内部过程事件和 Observability 事件继续直接发布 Kafka，避免把数据库退化为所有运行时事件的任务队列。Generation terminal 是最终业务事实，因此 `generation_runs`、Conversation terminal projection 和 Redis/SSE terminal projection outbox 必须在同一个 PostgreSQL 事务提交。
 
 命令入口必须遵循：
 
 1. API 生成 `run_id`、`task_id` 和 `event_id`；
 2. 如有文件，先原子写入文件或对象存储；
-3. API 直接发布 Kafka command；
-4. 等待 Broker ACK；
-5. ACK 成功后返回 `202 Accepted`；
-6. Kafka 不可用时返回 `503`，不得先在数据库制造一个无法执行的 queued 任务。
+3. 在同一事务写业务聚合和完整 Kafka envelope 到 `integration_outbox`；
+4. 提交 PostgreSQL 后返回 `202 Accepted`；
+5. relay 使用租约、退避和耗尽告警投递 Kafka；
+6. Kafka 不可用时命令留在 outbox 等待恢复，不回滚已提交业务事实。
 
-不得删除 Outbox 后继续使用“先提交数据库、再尽力发送 Kafka”的普通双写。Kafka-first 的前提是请求链路不同时承担必须原子提交的 PostgreSQL 业务写入。
+不得在同一路径同时保留 outbox 与提交后的尽力直发；否则会制造无意义的重复投递和两套成功语义。
 
-录音上传和 Conversation 是业务聚合写入，不是任务状态表：上传在 Kafka 拒绝命令时补偿删除刚创建的录音与文件；Conversation 已落库的 assistant message 则补偿标记为 `failed`，对应 Redis Generation 也进入带 TTL 的失败终态，并向客户端返回 `503`。这不是跨系统原子事务，因此必须依赖确定性 ID、幂等 Consumer 和显式补偿；如果未来要求业务写入与消息发布严格原子，只能重新评估 Outbox 或由 Kafka Consumer 创建业务聚合的方案。
+Relay 在 Kafka ACK 后、标记 `published_at` 前崩溃时会重复发送，因此消费者继续依赖稳定 `processing_id`/`generation_id`、终态检查、Stage 缓存和幂等投影。已发送行保留一段时间供审计后清理；当前不引入通用 inbox。
 
 ### 4.2 最终结果链路
 
-- 小型结果，如 RAG 回答和 Summary，直接放入 `generation.completed` 消息；
-- 大型结果，如完整 ASR JSON，先原子写对象存储，再在完成消息中携带 URI、checksum 和 schema version；
-- Result Consumer 消费完成消息后，幂等写入 PostgreSQL 最终业务表；
-- 数据库事务成功后提交 Kafka Offset。
+- 小型结果，如 RAG 回答和 Summary，由 Generation Worker 在同一个事务内幂等 UPSERT `generation_runs`、更新 Conversation terminal projection 并写入 Redis/SSE terminal projection outbox；
+- 大型结果先原子写对象存储，PostgreSQL 保存 URI、checksum 和 schema version；
+- 数据库事务提交后即可提交原 Generation command Offset；即使 Worker 随后退出，outbox relay 仍会执行 Redis/SSE terminal projection；
+- `outbox-relay` 使用 Redis 原子幂等投影写 terminal snapshot、`output.final`/`run.error`/`run.cancelled` 和 TTL；成功后才标记 Outbox 行已发布；
+- 查询时 PostgreSQL terminal snapshot 优先于 Redis active snapshot，避免陈旧 `RUNNING` 遮住已提交终态。
 
-这样避免“先写最终数据库、再发送完成事件”的普通双写。Kafka 是过程事实源，PostgreSQL 是最终查询投影。
+不再通过 Kafka state topic 绕回同进程 Result Consumer。PostgreSQL 是 Generation 最终查询源；Redis terminal/SSE 只是由 Outbox Relay 构建的短期交付投影。
 
 ## 5. 基础设施由谁启动
 
@@ -190,7 +191,7 @@ backend/packages/
 - `observability-worker`：消费统计事件，批量 UPSERT PostgreSQL 查询投影；
 - `observability-api`：只查询统计投影。
 
-不创建 `redis-api`、`redis-worker` 或 `outbox-relay`。Redis Server 由基础设施启动；Redis 状态投影处理器运行在对应业务 Consumer 中，只有在扩缩容需要时才单独拆分。
+不创建通用 `redis-api` 或 `redis-worker`。`outbox-relay` 是独立进程，并为 `generation-state` channel 执行 durable terminal 的 Redis/SSE 投影；其他 channel 仍只负责 Kafka 投递。
 
 ## 7. Kafka 设计
 
@@ -199,7 +200,6 @@ backend/packages/
 ```text
 processing.commands
 processing.events
-processing.state
 processing.cancel
 processing.cancel.retry
 processing.cancel.dlq
@@ -211,14 +211,11 @@ compute.tasks.cpu
 compute.tasks.gpu-high
 compute.tasks.gpu-normal
 compute.results
-compute.state
 compute.cancel
 compute.retry
 compute.dlq
 
 generation.commands
-generation.events
-generation.state
 generation.retry
 generation.dlq
 
@@ -227,7 +224,7 @@ model.invocation-events
 observability.dlq
 ```
 
-`processing.state`、`compute.state` 和 `generation.state` 使用 Log Compaction，按实体 key 保存最新可恢复状态。普通 commands/events Topic 使用时间或容量 retention。
+所有 commands/events Topic 使用时间或容量 retention；Processing、Compute 和 Generation 状态只保存在 Redis，不再创建 compacted state topic。
 
 Compute Topic 按资源 lane 拆分，避免耗时 GPU 任务阻塞短 I/O 任务，并复用现有 `ResourceQueue`。
 
@@ -271,7 +268,7 @@ enable.idempotence=true
 retries>0
 ```
 
-API 等待 Broker ACK 后才返回成功。生产环境结合副本数配置 `min.insync.replicas`。
+直接 Kafka 路径等待 Broker ACK 后才返回成功；outbox-backed API 在 PostgreSQL 提交后返回，由 relay 等待 Broker ACK。生产环境结合副本数配置 `min.insync.replicas`。
 
 Consumer 采用“至少一次投递 + 幂等处理”：
 
@@ -365,7 +362,7 @@ pipeline_events
 | Pipeline 当前状态 | Redis `processing:{id}` |
 | Stage 当前状态 | Redis `processing:{id}:stages` |
 | 已完成 Stage 集合 | Redis `processing:{id}:completed` |
-| 状态恢复 | Kafka compacted `processing.state` |
+| Redis 丢失后的粗状态兜底 | PostgreSQL `recordings` 业务投影 |
 | 状态变化历史 | Kafka `processing.events` |
 | Stage 依赖 | 代码中的版本化 Pipeline Definition |
 | progress | Redis Stream/Hash |
@@ -373,7 +370,7 @@ pipeline_events
 
 Processing Worker 收到 `stage.succeeded` 或 `compute.completed` 后：
 
-1. 幂等更新 Kafka compacted state；
+1. 幂等更新 Redis 运行态；
 2. 将 Stage 加入 Redis completed Set；
 3. 从版本化 Pipeline Definition 获取下游依赖；
 4. 对 fan-in 节点检查全部依赖；
@@ -381,7 +378,7 @@ Processing Worker 收到 `stage.succeeded` 或 `compute.completed` 后：
 6. 发布到对应 `compute.tasks.*`；
 7. 重复结果不会产生重复调度副作用。
 
-Redis 丢失时，从 compacted `processing.state` 重建 Hash/Set；Redis completed Set 不是唯一 DAG 事实。
+Redis 丢失时不重建逐 Stage运行态；录音详情从 PostgreSQL `recordings` 合成粗粒度 Pipeline状态，正在执行的任务按失败或重新提交策略收敛。
 
 ## 10. Compute Worker
 
@@ -405,9 +402,9 @@ Redis 丢失时，从 compacted `processing.state` 重建 Hash/Set；Redis compl
 ```text
 逐 delta / progress       → Redis Streams
 累计 snapshot             → Redis Hash/String
-generation.completed      → Kafka
-最终小型文本结果           → Kafka payload → PostgreSQL projection
-最终大型结果               → Object Storage URI → Kafka → PostgreSQL projection
+Generation terminal       → PostgreSQL generation_runs
+终态 Redis/SSE 短期投影     → Transactional Outbox Relay
+最终大型结果               → Object Storage URI → PostgreSQL
 ```
 
 不得把 Redis 作为完整模型结果的唯一存储，也不把每个 token 发入 Kafka，以避免无业务价值的消息爆炸和磁盘写放大。
@@ -417,9 +414,9 @@ generation.completed      → Kafka
 1. Worker 将每个 delta 写入 Redis Stream；
 2. Worker 内存同时累积完整输出；
 3. 每 1 秒或约 1,000 字符更新 Redis 累计 snapshot；
-4. 完成后发布包含完整结果或结果 URI 的 `generation.completed`；
-5. Result Consumer 幂等写入 `conversation_messages`、`recording_summaries` 或最终 Generation 投影；
-6. 设置 Redis Stream 和状态 TTL。
+4. 完成后幂等写入 `generation_runs`，Conversation/Recording 业务投影按各自边界更新；
+5. 在同一事务写入 Redis/SSE terminal projection outbox，由 relay 可靠投影；
+6. 设置 Redis Stream 和状态 TTL，随后提交原 command Offset。
 
 ### 11.3 故障语义
 
@@ -427,7 +424,7 @@ generation.completed      → Kafka
 - Redis 重启：可能损失一小段观看过程，但 Kafka 任务和最终结果不丢；
 - Redis 丢失且 Worker 仍运行：Worker 重写累计 snapshot；
 - Worker 中途崩溃：不提交任务 Offset，重新消费并完整重做，不把半截文本作为最终结果；
-- 完成消息重复：Result Consumer 按 `generation_id` 幂等 UPSERT；
+- command 重投：Generation Worker 按终态检查跳过计算，并按 `generation_id` 幂等 UPSERT；
 - Stream 过期：API 返回 PostgreSQL 最终结果，而不是历史 token 切片。
 
 未来只有出现“必须审计每个原始 token 切片”的合规需求时，才单独设计批量 chunk 或对象存储日志。
@@ -439,9 +436,8 @@ Production API
   → Kafka rag.answer.requested
   → RAG Worker
   → Redis answer delta + phase/progress
-  → Kafka generation.completed/failed
-  → Result Consumer
-  → conversation_messages / final projection
+  → PostgreSQL generation_runs / conversation_messages
+  → Outbox Relay → Redis terminal/SSE projection
 ```
 
 RAG 原始统计事件进入 `rag.execution-events` 和 `model.invocation-events`。
@@ -470,7 +466,7 @@ artifacts
 
 独立 RAG Query、Summary regeneration 和通用 Generation 查询仍需要在 Redis 过期后读取最终结果。因此保留精简后的 `generation_runs`，但它不再承担 queued/running 调度、delta、progress、sequence 或取消状态，也不是任务事实源。
 
-它只作为终态查询投影，由 Kafka Result Consumer 写入：
+它只作为终态查询投影，由 Generation Worker 在终态事务中写入：
 
 ```text
 id
@@ -515,7 +511,7 @@ Kafka-first 下，Generation 关联 ID 可能先于最终投影行出现，因�
 
 ### 13.3 Recording 终态与 Artifact
 
-Processing 活跃状态只在 Kafka/Redis，但录音长期页面仍需要知道最终处理结果。`recordings` 只保存终态投影，不保存 Stage 过程：
+Processing 活跃状态只在 Redis，但录音长期页面仍需要知道最终处理结果。`recordings` 只保存终态投影，不保存 Stage 过程：
 
 ```text
 processing_status    succeeded / failed / cancelled，活跃时以 Redis 为准
@@ -559,18 +555,18 @@ inbox_events
 
 | 故障 | 处理 |
 | --- | --- |
-| Kafka 在命令创建时不可用 | API 返回 503，不制造数据库 queued 状态 |
+| Kafka 在 outbox-backed 命令创建时不可用 | API 正常接受，relay backlog 增长并告警；恢复后自动投递 |
 | Producer 超时但结果未知 | 使用相同 `event_id/task_id` 重试 |
 | Consumer 处理前崩溃 | Offset 未提交，消息重新消费 |
 | 数据库写成功、Offset 未提交 | 重复消费，UPSERT/唯一约束消除副作用 |
-| Redis 不可用 | 实时体验降级；Kafka 事实和最终结果不丢，恢复后重建投影 |
+| Redis 不可用 | 实时体验和运行态不可用；命令与最终业务结果不丢，录音详情回退 PostgreSQL粗状态 |
 | Worker 生成中崩溃 | 不提交 Offset，完整重做 |
 | Artifact 写完但完成事件未发 | 重试发布；孤立 Artifact 由 Cleanup 清理 |
 | retry 耗尽 | 原始 envelope、错误和尝试信息进入 DLQ |
 
 ## 15. 可观测性
 
-至少监控 Kafka Producer 成功率/超时/重试、Consumer lag/rebalance/耗时、Topic 速率、retry/DLQ、各资源 lane 排队与执行时间、Redis 内存/Stream 长度/eviction、SSE 连接与重连、Redis 状态重建、Observability 批量落库。
+至少监控 Kafka Producer 成功率/超时/重试、Consumer lag/rebalance/耗时、Topic 速率、retry/DLQ、各资源 lane 排队与执行时间、Redis 内存/Stream 长度/eviction、SSE 连接与重连、Observability 批量落库。
 
 日志统一携带：
 
@@ -593,10 +589,10 @@ attempt
 1. 增加 Docker Compose 中的 Kafka KRaft、Redis 和 healthcheck；
 2. 在 L1 实现 Kafka/Redis Client、envelope、序列化和生命周期；
 3. 定义 Processing、Compute、Generation、Observability Topic Contract；
-4. 实现 Consumer 幂等、retry、DLQ 和 compacted state；
+4. 实现 Consumer 幂等、retry 和 DLQ；
 5. 实现 Redis State/Stream Store 和基于 Stream ID 的 SSE；
 6. 将 Generation/RAG 提交改成 Kafka command，移除进程内 Runner；
-7. 将模型 delta/progress 改写 Redis，完整终态通过 Kafka 投影到数据库；
+7. 将模型 delta/progress 改写 Redis，完整终态通过业务事务写入数据库；
 8. 将 Compute Worker 主入口改成 Kafka lane Consumer；
 9. 将 Pipeline Coordinator 改成 Kafka 驱动的 Processing Worker；
 10. 将 Observability HTTP ingestion 改成 Kafka Consumer；
@@ -609,32 +605,32 @@ attempt
 - 已完成：Docker Compose、Kafka/Redis L1 适配器、统一 envelope/topic、Kafka topic 初始化；
 - 已完成：Generation delta/progress/SSE 迁入 Redis，删除 `GenerationStreamHub` 和 `generation_events`；
 - 已完成：RAG API 改发 `generation.commands`，新增独立 `generation_worker`，删除进程内 `RagWorkflowRunner`；
-- 已完成：Compute Worker 消费资源 lane topic，Redis 保存 live state/delta，Kafka 保存 state/result；Production API 与 Generation Worker 使用 Kafka/Redis Compute Client；
+- 已完成：Compute Worker 消费资源 lane topic，Redis 保存 live state/delta，Kafka 保存 result；Production API 与 Generation Worker 使用 Kafka/Redis Compute Client；
 - 已完成：RAG/模型统计改发 Kafka，新增 `observability_worker` 投影 PostgreSQL；
-- 已完成：删除 `outbox_events` 及所有写入、清理逻辑；
-- 已完成：Generation 提交以 Redis 活跃快照 + Kafka command 为起点，终态由 Kafka projector 幂等写入精简后的 `generation_runs`，不再创建数据库 queued 行；
+- 已完成：新增共享 `integration_outbox`、独立 relay、失败退避/耗尽和保留清理；Worker 不接入通用 inbox，继续依赖稳定任务 ID、终态检查和业务幂等；
+- 已完成：Generation 提交以 Redis 活跃快照 + Kafka command 为起点，终态由 Generation Worker 幂等写入精简后的 `generation_runs`，不再创建数据库 queued 行；
 - 已完成：新增独立 `processing-worker` 推进版本化 DAG，删除数据库 Pipeline Coordinator、Repository、运行时表及旧 E2E；
 - 已完成：Processing 使用独立 2 小时 `max.poll.interval`，终态 `processing_id` 重投直接跳过；删除录音会先发布 Kafka 可靠取消事件，由独立 Cancel Consumer 设置 Redis 快速标记并协作式停止 Processing；
 - 已完成：Compute Worker 删除 task/status/cancel/SSE HTTP API，只保留 health/readiness/metrics，任务改由 Kafka lane 消费；
 - 已完成：Generation 与 Compute 接入独立 Kafka Cancel Consumer；Compute task 使用通用 execution scope，Worker 同时覆盖取消先到与任务先到，并在 Handler 安全退出后释放模型；
-- 已完成：命令 Consumer 与 Generation/Observability 投影具备 retry/DLQ；提供 compacted state 回放脚本重建 Redis；
+- 已完成：命令 Consumer 与 Generation/Observability 投影具备 retry/DLQ；Generation终态通过 Outbox Relay直接投影 Redis/SSE；
 - 已完成：`db:init` 改为重建 `public` schema，旧表与历史数据不会残留；
-- 待验证：在可用 Docker 环境运行真实 Kafka/Redis/PostgreSQL 的重启、重复投递、DLQ、Redis 清空重建和音频端到端故障测试。
+- 待验证：在可用 Docker 环境运行真实 Kafka/Redis/PostgreSQL 的重启、重复投递、DLQ、Redis 清空和音频端到端故障测试。
 
 ## 17. 验收标准
 
 - Redis/Kafka 由基础设施启动，L3 只连接；
-- Production API 在 Kafka ACK 前不返回任务创建成功；
+- Outbox-backed Production API 在 PostgreSQL 业务行与消息意图原子提交后返回成功；
 - Kafka 不可用时不产生数据库 queued 孤儿；
 - Worker 重启后未确认任务可重新消费；
 - 重复任务和完成事件不产生重复副作用；
 - `generation_events`、Pipeline 运行时表、`artifacts` 和 `outbox_events` 不再存在；
 - delta/progress 不再写 PostgreSQL；
 - SSE 支持 Redis Stream ID 续传与累计 snapshot；
-- Redis 清空后可从 Kafka compacted state 重建；
+- Redis 清空后不丢最终业务数据，录音详情可回退 PostgreSQL粗状态；
 - Redis 丢失不会丢任务或最终模型输出；
 - 完整模型输出通过 Kafka结果或 Artifact URI 进入最终存储；
 - RAG 统计通过 Kafka 持续消费并幂等落库；
 - Processing DAG 不依赖数据库依赖表；
-- retry、DLQ、Consumer lag、Redis Stream 和状态重建均有监控；
+- retry、DLQ、Consumer lag 和 Redis Stream 均有监控；
 - `sql/base.sql` 只包含最终 Schema，不包含历史兼容迁移。

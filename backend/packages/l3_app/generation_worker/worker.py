@@ -3,26 +3,32 @@ from __future__ import annotations
 import asyncio
 import logging
 from typing import Protocol
-from uuid import UUID
+from uuid import NAMESPACE_URL, UUID, uuid5
 
-from l1_foundation.messaging import EventEnvelope, KafkaEventProducer, Topics, new_event
+from sqlalchemy import Connection
+
+from l1_foundation.messaging import EventEnvelope, KafkaEventProducer, OutboxRepository, Topics, new_event
 from l1_foundation.worker import ComputeCancelRequest, ExecutionScope, execution_scope
 from l2_core.audio_processing.contracts import RecordingId
 from l2_core.audio_processing.stages.summary.regeneration import RecordingSummaryRegenerationService
 from l2_core.generation.contracts import CreateGenerationCommand, GenerationSnapshot, GenerationStatus
 from l2_core.generation.service import GenerationService
-from l2_core.generation.store import GenerationEventStore
 from l2_core.rag.adjudication.contracts import ClaimConfirmationDecision
 from l2_core.rag.contracts import RagHistoryMessage
 from l2_core.rag.queue import GenerationCancelWorkItem, RagGenerationWorkItem, SummaryGenerationWorkItem
 
 logger = logging.getLogger("generation_worker")
+ConversationHistoryProjection = tuple[UUID, list[tuple[RagHistoryMessage, RagHistoryMessage]]]
 
 
 class ConversationGenerationProjection(Protocol):
     def mark_streaming(self, generation_run_id: UUID) -> None: ...
 
     def sync_generation(self, generation_run_id: UUID) -> None: ...
+
+    def sync_generation_in_transaction(self, connection: Connection, snapshot: GenerationSnapshot) -> ConversationHistoryProjection | None: ...
+
+    def apply_generation_history_cache(self, completed_history: ConversationHistoryProjection | None) -> None: ...
 
 
 class RagGenerationExecutor(Protocol):
@@ -37,7 +43,88 @@ class RagGenerationExecutor(Protocol):
         history: list[RagHistoryMessage] | None = None,
         resume_from_generation_id: UUID | None = None,
         adjudication_user_decision: ClaimConfirmationDecision | None = None,
-    ) -> None: ...
+    ) -> GenerationSnapshot: ...
+
+
+class GenerationTerminalCommitter:
+    """Atomically persist one terminal generation, its conversation projection and state outbox event."""
+
+    def __init__(
+        self,
+        generation_service: GenerationService,
+        conversations: ConversationGenerationProjection,
+        outbox: OutboxRepository | None = None,
+    ) -> None:
+        self._generation_service = generation_service
+        self._conversations = conversations
+        self._outbox = outbox or OutboxRepository()
+
+    async def commit(
+        self,
+        source: EventEnvelope,
+        snapshot: GenerationSnapshot,
+        command: CreateGenerationCommand,
+    ) -> None:
+        state_event = self._state_event(source, snapshot, command)
+        completed_history = await asyncio.to_thread(
+            self._commit_in_transaction,
+            snapshot,
+            command,
+            state_event,
+        )
+        if completed_history is not None:
+            self._conversations.apply_generation_history_cache(completed_history)
+
+    def _commit_in_transaction(
+        self,
+        snapshot: GenerationSnapshot,
+        command: CreateGenerationCommand,
+        state_event: EventEnvelope,
+    ) -> ConversationHistoryProjection | None:
+        completed_history: ConversationHistoryProjection | None = None
+        store = self._generation_service.store
+        with store.engine.begin() as connection:
+            inserted = store.project_terminal_in_transaction(connection, snapshot, command)
+            if not inserted:
+                return None
+            completed_history = self._conversations.sync_generation_in_transaction(connection, snapshot)
+            self._outbox.enqueue(
+                connection,
+                channel="generation-state",
+                topic="redis.generation-terminal",
+                partition_key=str(snapshot.id),
+                aggregate_type="generation",
+                aggregate_id=snapshot.id,
+                event=state_event,
+            )
+        return completed_history
+
+    @staticmethod
+    def _state_event(source: EventEnvelope, snapshot: GenerationSnapshot, command: CreateGenerationCommand) -> EventEnvelope:
+        terminal_type = {
+            GenerationStatus.SUCCEEDED: "generation.completed",
+            GenerationStatus.FAILED: "generation.failed",
+            GenerationStatus.CANCELLED: "generation.cancelled",
+        }[snapshot.status]
+        event = new_event(
+            "generation.state.changed",
+            "generation-worker",
+            correlation_id=source.correlation_id,
+            causation_id=source.event_id,
+            workspace_id=source.workspace_id,
+            generation_id=snapshot.id,
+            payload={
+                "terminal_event_type": terminal_type,
+                "snapshot": snapshot.model_dump(mode="json"),
+                "command": command.model_dump(mode="json"),
+                "preserve_checkpoints": snapshot.status != GenerationStatus.SUCCEEDED or bool((snapshot.output or {}).get("interaction")),
+            },
+        )
+        stable_id = uuid5(
+            NAMESPACE_URL,
+            f"generation-state:{snapshot.id}:{snapshot.status.value}:{snapshot.updated_at.isoformat()}",
+        )
+        return event.model_copy(update={"event_id": stable_id})
 
 
 class GenerationCommandHandler:
@@ -48,14 +135,14 @@ class GenerationCommandHandler:
         rag_service: RagGenerationExecutor,
         generation_service: GenerationService,
         conversations: ConversationGenerationProjection,
-        producer: KafkaEventProducer,
         summary_service: RecordingSummaryRegenerationService,
+        terminal_committer: GenerationTerminalCommitter | None = None,
     ) -> None:
         self._rag_service = rag_service
         self._generation_service = generation_service
         self._conversations = conversations
-        self._kafka_producer = producer
         self._summary_service = summary_service
+        self._terminal_committer = terminal_committer or GenerationTerminalCommitter(generation_service, conversations)
 
     async def handle(self, event: EventEnvelope) -> None:
         if event.event_type == "generation.summary.requested":
@@ -68,25 +155,17 @@ class GenerationCommandHandler:
         item = RagGenerationWorkItem.model_validate(event.payload)
         snapshot = self._generation_service.ensure(item.run_id, item.generation)
         if snapshot.status in {GenerationStatus.SUCCEEDED, GenerationStatus.FAILED, GenerationStatus.CANCELLED}:
-            if item.conversation_message_id is not None:
-                self._conversations.sync_generation(item.run_id)
-            await self._publish_terminal(event, snapshot)
+            await self._terminal_committer.commit(event, snapshot, item.generation)
             return
 
         if item.conversation_message_id is not None:
             self._conversations.mark_streaming(item.run_id)
-        try:
-            await self._execute_rag(item)
-        finally:
-            if item.conversation_message_id is not None:
-                self._conversations.sync_generation(item.run_id)
-            snapshot = self._generation_service.get(item.run_id)
-            if snapshot.status in {GenerationStatus.SUCCEEDED, GenerationStatus.FAILED, GenerationStatus.CANCELLED}:
-                await self._publish_terminal(event, snapshot)
+        snapshot = await self._execute_rag(item)
+        await self._terminal_committer.commit(event, snapshot, item.generation)
 
-    async def _execute_rag(self, item: RagGenerationWorkItem) -> None:
+    async def _execute_rag(self, item: RagGenerationWorkItem) -> GenerationSnapshot:
         with execution_scope(ExecutionScope(kind="generation", id=item.run_id)):
-            await self._rag_service.execute_answer_generation(
+            return await self._rag_service.execute_answer_generation(
                 self._generation_service,
                 item.run_id,
                 item.workspace_id,
@@ -102,36 +181,12 @@ class GenerationCommandHandler:
         item = SummaryGenerationWorkItem.model_validate(event.payload)
         snapshot = self._generation_service.ensure(item.run_id, item.generation)
         if not snapshot.status.is_terminal:
-            await self._execute_summary(item)
-            snapshot = self._generation_service.get(item.run_id)
-        await self._publish_terminal(event, snapshot)
+            snapshot = await self._execute_summary(item)
+        await self._terminal_committer.commit(event, snapshot, item.generation)
 
-    async def _execute_summary(self, item: SummaryGenerationWorkItem) -> None:
+    async def _execute_summary(self, item: SummaryGenerationWorkItem) -> GenerationSnapshot:
         with execution_scope(ExecutionScope(kind="generation", id=item.run_id)):
-            await self._summary_service.execute(item.run_id, RecordingId(item.recording_id))
-
-    async def _publish_terminal(self, command: EventEnvelope, snapshot: GenerationSnapshot) -> None:
-        event_type = {
-            GenerationStatus.SUCCEEDED: "generation.completed",
-            GenerationStatus.FAILED: "generation.failed",
-            GenerationStatus.CANCELLED: "generation.cancelled",
-        }[snapshot.status]
-        payload = {"snapshot": snapshot.model_dump(mode="json"), "command": self._generation_service.command(snapshot.id).model_dump(mode="json")}
-        terminal = new_event(
-            event_type,
-            "generation-worker",
-            correlation_id=command.correlation_id,
-            causation_id=command.event_id,
-            workspace_id=command.workspace_id,
-            generation_id=snapshot.id,
-            payload=payload,
-        )
-        await self._kafka_producer.publish(Topics.GENERATION_EVENTS, str(snapshot.id), terminal)
-        await self._kafka_producer.publish(
-            Topics.GENERATION_STATE,
-            str(snapshot.id),
-            terminal.model_copy(update={"event_type": "generation.state.changed"}),
-        )
+            return await self._summary_service.execute(item.run_id, RecordingId(item.recording_id))
 
 
 class GenerationCancelHandler:
@@ -142,10 +197,12 @@ class GenerationCancelHandler:
         generation_service: GenerationService,
         producer: KafkaEventProducer,
         conversations: ConversationGenerationProjection | None = None,
+        terminal_committer: GenerationTerminalCommitter | None = None,
     ) -> None:
         self._generation_service = generation_service
         self._kafka_producer = producer
         self._conversations = conversations
+        self._terminal_committer = terminal_committer or (GenerationTerminalCommitter(generation_service, conversations) if conversations is not None else None)
 
     async def handle(self, event: EventEnvelope) -> None:
         if event.event_type != "generation.cancel.requested":
@@ -168,10 +225,10 @@ class GenerationCancelHandler:
             event.event_id,
             event.correlation_id,
         )
-        snapshot = self._generation_service.cancel(item.generation_id)
-        if self._conversations is not None:
-            self._conversations.sync_generation(item.generation_id)
-        await self._publish_terminal(event, snapshot)
+        snapshot = self._generation_service.prepare_cancel(item.generation_id)
+        if self._terminal_committer is None:
+            raise RuntimeError("Generation terminal committer is required for cancellation")
+        await self._terminal_committer.commit(event, snapshot, self._generation_service.command(snapshot.id))
         cancel = ComputeCancelRequest(
             execution_scope=ExecutionScope(kind="generation", id=item.generation_id),
             reason="generation_cancelled",
@@ -194,38 +251,3 @@ class GenerationCancelHandler:
             item.generation_id,
             event.event_id,
         )
-
-    async def _publish_terminal(self, command: EventEnvelope, snapshot: GenerationSnapshot) -> None:
-        payload = {
-            "snapshot": snapshot.model_dump(mode="json"),
-            "command": self._generation_service.command(snapshot.id).model_dump(mode="json"),
-        }
-        terminal = new_event(
-            "generation.cancelled",
-            "generation-worker",
-            correlation_id=command.correlation_id,
-            causation_id=command.event_id,
-            workspace_id=command.workspace_id,
-            generation_id=snapshot.id,
-            payload=payload,
-        )
-        await self._kafka_producer.publish(Topics.GENERATION_EVENTS, str(snapshot.id), terminal)
-        await self._kafka_producer.publish(
-            Topics.GENERATION_STATE,
-            str(snapshot.id),
-            terminal.model_copy(update={"event_type": "generation.state.changed"}),
-        )
-
-
-class GenerationResultProjector:
-    """Idempotently persist terminal Generation events as PostgreSQL query projections."""
-
-    def __init__(self, store: GenerationEventStore) -> None:
-        self._postgres_store = store
-
-    async def handle(self, event: EventEnvelope) -> None:
-        if event.event_type not in {"generation.completed", "generation.failed", "generation.cancelled"}:
-            return
-        snapshot = GenerationSnapshot.model_validate(event.payload["snapshot"])
-        command = CreateGenerationCommand.model_validate(event.payload["command"])
-        await asyncio.to_thread(self._postgres_store.project_terminal, snapshot, command)

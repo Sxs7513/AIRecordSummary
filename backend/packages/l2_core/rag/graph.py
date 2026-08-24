@@ -94,7 +94,7 @@ logger = logging.getLogger("rag")
 
 MAX_ADJUDICATION_CASES = 2
 MAX_ADJUDICATION_ITERATIONS = 4
-MAX_ADJUDICATION_SEARCHES = 3
+MAX_ADJUDICATION_SEARCHES = 10
 INSUFFICIENT_EVIDENCE_ANSWER = "没有在录音中找到足够依据。"
 
 
@@ -874,7 +874,8 @@ class RagGraph:
                 json_schema=RetrievalTerms.model_json_schema(),
                 provider=self._provider_for_input(prompt.invoke(values).to_messages(), 1_000),
             )
-            terms = parser.parse(result.text)
+            parsed_terms = parser.parse(result.text)
+            terms = parsed_terms.with_faithful_anchors(state["content_query"])
         except Exception as error:
             log_event(
                 "node_warning",
@@ -918,6 +919,8 @@ class RagGraph:
             expanded_query_present=expanded_query is not None,
             extracted_terms=terms.terms,
             extracted_phrases=terms.phrases,
+            discarded_terms=[item for item in parsed_terms.terms if item.strip() not in terms.terms],
+            discarded_phrases=[item for item in parsed_terms.phrases if item.strip() not in terms.phrases],
             extracted_evidence_queries=evidence_queries,
             lexical_queries=lexical_queries,
             protected_lexical_queries=protected_lexical_queries,

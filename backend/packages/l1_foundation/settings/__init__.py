@@ -53,6 +53,12 @@ class Settings(BaseSettings):
         gt=0,
         validation_alias="PROCESSING_CONSUMER_MAX_POLL_INTERVAL_MS",
     )
+    outbox_relay_batch_size: int = Field(default=100, ge=1, le=1000, validation_alias="OUTBOX_RELAY_BATCH_SIZE")
+    outbox_relay_poll_seconds: float = Field(default=0.5, ge=0.05, le=60, validation_alias="OUTBOX_RELAY_POLL_SECONDS")
+    outbox_relay_lease_seconds: int = Field(default=60, ge=5, le=3600, validation_alias="OUTBOX_RELAY_LEASE_SECONDS")
+    outbox_relay_max_attempts: int = Field(default=20, ge=1, le=1000, validation_alias="OUTBOX_RELAY_MAX_ATTEMPTS")
+    outbox_relay_metrics_seconds: float = Field(default=30, ge=1, le=3600, validation_alias="OUTBOX_RELAY_METRICS_SECONDS")
+    outbox_retention_days: int = Field(default=14, ge=1, le=365, validation_alias="OUTBOX_RETENTION_DAYS")
     redis_url: str = Field(default="redis://127.0.0.1:6379/0", validation_alias="REDIS_URL")
     redis_stream_maxlen: int = Field(default=10_000, gt=0, validation_alias="REDIS_STREAM_MAXLEN")
     redis_terminal_ttl_seconds: int = Field(default=86_400, gt=0, validation_alias="REDIS_TERMINAL_TTL_SECONDS")
@@ -188,9 +194,7 @@ class Settings(BaseSettings):
     )
     rag_plan_local_input_tokens: int = Field(default=4_000, gt=0, validation_alias="RAG_PLAN_LOCAL_INPUT_TOKENS")
     rag_run_max_total_tokens: int = Field(default=50_000, gt=0, validation_alias="RAG_RUN_MAX_TOTAL_TOKENS")
-    rag_evaluation_stale_run_seconds: float = Field(
-        default=120.0, ge=30, validation_alias="RAG_EVALUATION_STALE_RUN_SECONDS"
-    )
+    rag_evaluation_stale_run_seconds: float = Field(default=120.0, ge=30, validation_alias="RAG_EVALUATION_STALE_RUN_SECONDS")
     rag_rerank_enabled: bool = Field(default=True, validation_alias="RAG_RERANK_ENABLED")
     rag_rerank_model: str = Field(default="Qwen/Qwen3-Reranker-0.6B", validation_alias="RAG_RERANK_MODEL")
     rag_rerank_model_cache_dir: Path = Field(default=Path("model-cache/rerank"), validation_alias="RAG_RERANK_MODEL_CACHE_DIR")

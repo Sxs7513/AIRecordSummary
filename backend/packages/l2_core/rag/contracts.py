@@ -322,6 +322,26 @@ class RetrievalTerms(BaseModel):
     phrases: list[str] = Field(default_factory=list, max_length=4)
     evidence_queries: list[str] = Field(default_factory=list, max_length=3)
 
+    def with_faithful_anchors(self, source_query: str) -> Self:
+        """Return a copy containing only anchors present in both trusted and prepared queries."""
+
+        prepared_query = self.content_query.strip()
+
+        def faithful(values: list[str]) -> list[str]:
+            normalized = (
+                value.strip()
+                for value in values
+                if value.strip() and value.strip() in source_query and value.strip() in prepared_query
+            )
+            return list(dict.fromkeys(normalized))
+
+        return self.model_copy(
+            update={
+                "terms": faithful(self.terms),
+                "phrases": faithful(self.phrases),
+            }
+        )
+
 
 StructuredFactKey = Literal["file_name", "duration_seconds", "created_at", "location", "speakers"]
 StructuredFactValue = str | int | float | bool | list[str] | list[dict[str, str | int | float]] | None

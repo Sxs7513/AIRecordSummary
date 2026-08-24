@@ -22,6 +22,10 @@ class _Sink:
         self.cancelled = self.cancel_requested
         return self.cancelled
 
+    def prepare_cancel_if_requested(self) -> object | None:
+        self.cancelled = self.cancel_requested
+        return object() if self.cancelled else None
+
     def phase(self, _name: str, _label: str, _progress: int | None = None) -> None:
         pass
 
@@ -30,6 +34,10 @@ class _Sink:
 
     def fail(self, code: str, message: str, retryable: bool = False) -> None:
         self.failed = (code, message, retryable)
+
+    def prepare_fail(self, code: str, message: str, retryable: bool = False) -> object:
+        self.failed = (code, message, retryable)
+        return object()
 
 
 class _GenerationService:

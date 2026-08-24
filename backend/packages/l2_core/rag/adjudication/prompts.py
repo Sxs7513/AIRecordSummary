@@ -147,6 +147,7 @@ def evidence_review_prompt(
                     "3. 把候选代入该 item 的 context_quote 及其所有匹配位置，检查技术对象、信号、动作、属性、数字、单位、条件和因果链是否更自洽、"
                     "是否减少额外假设、是否引入新矛盾；局部修正后，必须重新检查同一因果链。\n"
                     "4. 若候选仍依赖非字面解释、补充原文不存在的隐含术语或建立不自然关系，应检查相关 Audit item，并生成相互一致的关联候选。\n"
+                    "5. 为每个 proposal 输出 candidate_score，表示它相对同一 audit_item 其他候选更可能是正确修正的程度。\n"
                     "三、生成职责\n"
                     "- 你没有否定或省略 Audit items 的权限。必须逐项覆盖 items 里的每一项，每一项输出1至2个 proposal；"
                     "依据不足时也要给出最可能且可检验的候选，由后续裁决 Agent 决定，禁止静默省略。\n"
@@ -253,7 +254,6 @@ def adjudication_agent_prompt(
                     "Candidate 是待验证假设；你只做决策，不直接修改表达，也不遗漏任何 proposal_id。\n"
                     "对每个 Candidate，将 proposed_expression 代入其 context_quote 和 Target 全文，比较替换前后的技术角色、关系、条件、因果一致性及额外假设。"
                     "同时检查匹配的 Finding 与 Reference 是否真正支持完整含义，而非只匹配局部关键词。"
-                    "为每项输出 candidate_score，表示它相对同一 audit_item 其他候选更可能是正确修正的程度；不同候选必须独立判断。\n"
                     "动作规则："
                     "accept：当前上下文或证据已足以采用，替换明显改善原异常且不引入关键冲突；一经采用不再搜索或重建。"
                     "web_search：候选合理但缺少决定性外部证据，且步骤控制显示仍有搜索预算；后端使用 Candidate.search_query。"
@@ -261,7 +261,7 @@ def adjudication_agent_prompt(
                     "reject：当前候选不成立；后端记录 reason，且仅当同组没有 accept/web_search 时参与重建；可用 reconstruct_focus 补充重建方向。"
                     "搜索失败或 Reference 缺失不等于原表达正确；Candidate 能单独讲通也不等于应当 accept。"
                     "同一 audit_item 可能有多个候选：后端按组执行 accept 优先、其次 web_search、最后 reconstruct/reject；"
-                    "若多个候选 accept，只采用 candidate_score 最高者；没有 accept 时会执行组内全部 web_search。"
+                    "若多个候选 accept，只采用 Candidate 中 candidate_score 最高者；没有 accept 时会执行组内全部 web_search。"
                     "有匹配 Finding 时必须据此更新决策。仅按 schema 输出 decisions。",
                 ),
                 (

@@ -682,6 +682,31 @@ create table if not exists rag_adjudication_evaluation_correction_results (
 comment on table rag_adjudication_evaluation_correction_results is
     '单条 Gold 纠偏在一次 Case 评测中的匹配结果与通过状态。';
 
+create table if not exists rag_adjudication_evaluation_prediction_results (
+    id uuid primary key default gen_random_uuid(),
+    case_result_id uuid not null references rag_adjudication_evaluation_case_results(id) on delete cascade,
+    matched_gold_correction_id uuid references rag_adjudication_evaluation_corrections(id) on delete restrict,
+    proposal_id text not null,
+    evidence_index integer not null check (evidence_index > 0),
+    chunk_id text not null,
+    start_char integer not null check (start_char >= 0),
+    end_char integer not null check (end_char > start_char),
+    original_expression text not null,
+    resolved_expression text not null,
+    match_kind text not null check (match_kind in ('exact', 'fuzzy', 'unmatched')),
+    similarity numeric check (similarity is null or similarity between 0 and 100),
+    details jsonb not null default '{}'::jsonb,
+    created_at timestamptz not null default now(),
+    unique (case_result_id, proposal_id, evidence_index, chunk_id, start_char, end_char),
+    check (jsonb_typeof(details) = 'object')
+);
+
+comment on table rag_adjudication_evaluation_prediction_results is
+    'Agent 实际应用的逐 span 修改及其一对一 Gold 匹配结果；未匹配项用于统计误改。';
+
+create index if not exists rag_adjudication_prediction_results_case_idx
+    on rag_adjudication_evaluation_prediction_results (case_result_id, match_kind);
+
 create table if not exists rag_adjudication_evaluation_metric_values (
     evaluation_run_id uuid not null references evaluation_runs(id) on delete cascade,
     metric_name text not null,

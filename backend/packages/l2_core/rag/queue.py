@@ -3,8 +3,9 @@ from __future__ import annotations
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy import Connection
 
-from l1_foundation.messaging import KafkaEventProducer, Topics, new_event
+from l1_foundation.messaging import KafkaEventProducer, OutboxRepository, Topics, new_event
 from l2_core.generation.contracts import CreateGenerationCommand
 from l2_core.rag.adjudication.contracts import ClaimConfirmationDecision
 from l2_core.rag.contracts import RagHistoryMessage
@@ -52,11 +53,25 @@ class GenerationCancelWorkItem(BaseModel):
 class GenerationCommandPublisher:
     """Kafka-first submission boundary; success means the broker acknowledged the command."""
 
-    def __init__(self, producer: KafkaEventProducer) -> None:
+    def __init__(self, producer: KafkaEventProducer, outbox: OutboxRepository | None = None) -> None:
         self._kafka_producer = producer
+        self._outbox = outbox or OutboxRepository()
 
-    async def submit_rag(self, item: RagGenerationWorkItem) -> None:
-        event = new_event(
+    def enqueue_rag(self, connection: Connection, item: RagGenerationWorkItem) -> None:
+        event = self._rag_event(item)
+        self._outbox.enqueue(
+            connection,
+            channel="generation-command",
+            topic=Topics.GENERATION_COMMANDS,
+            partition_key=str(item.run_id),
+            aggregate_type="generation",
+            aggregate_id=item.run_id,
+            event=event,
+        )
+
+    @staticmethod
+    def _rag_event(item: RagGenerationWorkItem):
+        return new_event(
             "generation.rag.requested",
             "production-api",
             correlation_id=item.run_id,
@@ -64,6 +79,9 @@ class GenerationCommandPublisher:
             generation_id=item.run_id,
             payload=item.model_dump(mode="json"),
         )
+
+    async def submit_rag(self, item: RagGenerationWorkItem) -> None:
+        event = self._rag_event(item)
         await self._kafka_producer.publish(Topics.GENERATION_COMMANDS, str(item.run_id), event)
 
     async def submit_summary(self, item: SummaryGenerationWorkItem) -> None:

@@ -596,7 +596,13 @@ class RagAdjudicationEvaluationService:
                     {
                         "dataset_id": dataset_id,
                         "number": number,
-                        "definition": _json({"task_type": "rag_adjudication", "metric": "gold_correction_accuracy_v1"}),
+                        "definition": _json(
+                            {
+                                "task_type": "rag_adjudication",
+                                "metric_suite": "strict_relaxed_correction_prf_v2",
+                                "fuzzy_matcher": "rapidfuzz.fuzz.ratio",
+                            }
+                        ),
                         "count": len(payload),
                         "user_id": user.id,
                     },
@@ -853,20 +859,33 @@ class RagAdjudicationEvaluationService:
                         {"id": result["id"]},
                     ).mappings()
                 ]
-            metric = (
-                connection.execute(
+                result["predictions"] = [
+                    dict(row)
+                    for row in connection.execute(
+                        text(
+                            """
+                            select * from rag_adjudication_evaluation_prediction_results
+                            where case_result_id=:id
+                            order by evidence_index, start_char, end_char, proposal_id
+                            """
+                        ),
+                        {"id": result["id"]},
+                    ).mappings()
+                ]
+            metrics = [
+                dict(row)
+                for row in connection.execute(
                     text(
                         """
-                    select * from rag_adjudication_evaluation_metric_values
-                    where evaluation_run_id=:id and metric_name='gold_correction_accuracy'
-                    """
+                        select * from rag_adjudication_evaluation_metric_values
+                        where evaluation_run_id=:id
+                        order by metric_name, metric_version
+                        """
                     ),
                     {"id": run_id},
-                )
-                .mappings()
-                .one_or_none()
-            )
-            return {"run": dict(run), "metric": dict(metric) if metric else None, "cases": results}
+                ).mappings()
+            ]
+            return {"run": dict(run), "metrics": metrics, "cases": results}
 
     def cancel_run(self, user: CurrentUser, run_id: UUID) -> dict[str, Any]:
         with self._engine.begin() as connection:
@@ -991,8 +1010,10 @@ class RagAdjudicationEvaluationService:
 
     def _config_snapshot(self) -> dict[str, Any]:
         return {
-            "evaluator_version": "1",
-            "metric_version": "1",
+            "evaluator_version": "2",
+            "metric_version": "2",
+            "fuzzy_matcher": "rapidfuzz.fuzz.ratio",
+            "fuzzy_threshold": 90.0,
             "provider": self._settings.rag_answer_provider,
             "context_size": self._settings.rag_context_size,
             "max_iterations": 4,

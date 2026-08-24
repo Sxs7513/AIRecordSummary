@@ -15,6 +15,7 @@ from l2_core.audio_processing.stages.summary.generation import create_manual_sum
 from l2_core.audio_processing.stages.summary.stage import GenerateSummaryStage
 from l2_core.audio_processing.stages.summary_embedding_indexing import SummaryEmbeddingIndexer
 from l2_core.auth.contracts import CurrentUser
+from l2_core.generation.contracts import GenerationSnapshot
 from l2_core.generation.event_sink import GenerationEventSink
 from l2_core.generation.service import GenerationService
 from l2_core.rag.queue import GenerationCommandPublisher, SummaryGenerationWorkItem
@@ -48,7 +49,7 @@ class RecordingSummaryRegenerationService:
         self._stage = summary_stage
         self._summary_embedding_indexer = summary_embedding_indexer
         self._publisher = publisher
-        self._tasks: set[Task[None]] = set()
+        self._tasks: set[Task[GenerationSnapshot]] = set()
 
     async def regenerate(self, user: CurrentUser, recording_id: UUID) -> UUID:
         """Authorize, snapshot current utterances, and enqueue an interactive summary generation."""
@@ -89,21 +90,23 @@ class RecordingSummaryRegenerationService:
         if self._tasks:
             await gather(*self._tasks, return_exceptions=True)
 
-    async def execute(self, generation_id: UUID, recording_id: RecordingId, utterances: list[Utterance] | None = None) -> None:
+    async def execute(self, generation_id: UUID, recording_id: RecordingId, utterances: list[Utterance] | None = None) -> GenerationSnapshot:
         resolved_utterances = utterances if utterances is not None else self.load_utterances(recording_id)
         sink = self._generation_service.event_sink(generation_id)
         try:
             sink.start()
-            if sink.cancel_if_requested():
-                return
+            cancelled = sink.prepare_cancel_if_requested()
+            if cancelled is not None:
+                return cancelled
             output = await to_thread(
                 self._stage.generate,
                 resolved_utterances,
                 self._generation_progress(sink),
                 sink,
             )
-            if sink.cancel_if_requested():
-                return
+            cancelled = sink.prepare_cancel_if_requested()
+            if cancelled is not None:
+                return cancelled
             self._projections.project(recording_id, "generate_summary", output)
             if self._summary_embedding_indexer is not None:
                 try:
@@ -115,18 +118,21 @@ class RecordingSummaryRegenerationService:
                     self._projections.project(recording_id, "summary_embedding_indexing", embedding)
                 except Exception:
                     logger.warning("summary：重新生成后的向量化失败 recording_id=%s", recording_id, exc_info=True)
-            sink.succeed(output.model_dump(mode="json"))
+            terminal = sink.prepare_succeed(output.model_dump(mode="json"))
             logger.info("summary：手动重新生成完成，recording_id=%s generation_id=%s", recording_id, generation_id)
+            return terminal or self._generation_service.get(generation_id)
         except Exception as error:
-            if sink.cancel_if_requested():
+            cancelled = sink.prepare_cancel_if_requested()
+            if cancelled is not None:
                 logger.info(
                     "summary：手动重新生成已取消，recording_id=%s generation_id=%s",
                     recording_id,
                     generation_id,
                 )
-                return
+                return cancelled
             logger.exception("summary：手动重新生成失败，recording_id=%s generation_id=%s", recording_id, generation_id)
-            sink.fail("summary_regeneration_failed", str(error) or "录音总结重新生成失败", retryable=True)
+            terminal = sink.prepare_fail("summary_regeneration_failed", str(error) or "录音总结重新生成失败", retryable=True)
+            return terminal or self._generation_service.get(generation_id)
 
     def load_utterances(self, recording_id: UUID) -> list[Utterance]:
         with self._engine.connect() as connection:

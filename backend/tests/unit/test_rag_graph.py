@@ -302,6 +302,27 @@ def test_query_term_expansion_keeps_the_original_question_and_only_adds_anchors(
     assert update["retrieval_protected_lexical_queries"] == ["上线时间", "王总", "API v2", "负责人"]
 
 
+def test_query_term_expansion_discards_anchors_added_through_a_rewritten_content_query() -> None:
+    model = FakeModel()
+    model.set_responses(
+        [
+            '{"content_query":"王总说 API v3 的上线时间定了吗？","terms":["王总","API v3"],'
+            '"phrases":["上线时间"],"evidence_queries":[]}'
+        ]
+    )
+    graph = _graph(FakeRetriever(), model, query_term_expansion_enabled=True)
+    state = RagGraph._initial_state(  # pyright: ignore[reportPrivateUsage]
+        "test", "answer", "王总说 API v2 的上线时间定了吗？", 10, [], None
+    )
+    state["route"] = RagRoute(status="resolved", strategy_id="fact_lookup")
+    state["content_query"] = "王总说 API v2 的上线时间定了吗？"
+
+    update = asyncio.run(graph._expand_retrieval_terms(state))  # pyright: ignore[reportPrivateUsage]
+
+    assert update["retrieval_expanded_query"] == "上线时间 王总"
+    assert update["retrieval_lexical_queries"] == ["上线时间", "王总"]
+
+
 def test_route_removes_recording_time_scope_from_content_query() -> None:
     model = FakeModel()
     model.set_responses(
@@ -1086,6 +1107,7 @@ def test_fact_lookup_adjudication_reviews_each_final_evidence_in_isolated_contex
                             "original_expression": "RF 的最大时延是 5 秒",
                             "proposed_expression": "I²C 的最大时延是 5 微秒",
                             "expression_type": "compound",
+                            "candidate_score": 0.96,
                             "search_query": "I2C maximum latency 5 microseconds",
                             "reason": "上下文讨论总线信号",
                             "supporting_evidence_index": 2,
@@ -1101,7 +1123,6 @@ def test_fact_lookup_adjudication_reviews_each_final_evidence_in_isolated_contex
                             "proposal_id": "proposal-1",
                             "action": "accept",
                             "confidence": 0.96,
-                            "candidate_score": 0.96,
                             "reason": "上下文足以支持",
                             "reconstruct_focus": "",
                         }
@@ -1225,6 +1246,7 @@ def test_active_adjudication_reconsiders_candidate_after_web_search_without_conf
                             "original_expression": "RF 的最大时延是 5 秒",
                             "proposed_expression": "I²C 的最大时延是 5 微秒",
                             "expression_type": "compound",
+                            "candidate_score": 0.95,
                             "search_query": "I2C maximum latency",
                             "reason": "上下文指向总线协议",
                         }
@@ -1239,7 +1261,6 @@ def test_active_adjudication_reconsiders_candidate_after_web_search_without_conf
                             "proposal_id": "proposal-1",
                             "action": "web_search",
                             "confidence": 0.6,
-                            "candidate_score": 0.7,
                             "reason": "需要外部证据",
                             "reconstruct_focus": "",
                         }
@@ -1254,7 +1275,6 @@ def test_active_adjudication_reconsiders_candidate_after_web_search_without_conf
                             "proposal_id": "proposal-1",
                             "action": "accept",
                             "confidence": 0.95,
-                            "candidate_score": 0.95,
                             "reason": "搜索结果与上下文共同支持",
                             "reconstruct_focus": "",
                         }
@@ -1402,6 +1422,7 @@ def test_active_adjudication_auto_overlay_is_disclosed_in_answer_context_and_sou
                             "original_expression": "RF 的最大时延是 5 秒",
                             "proposed_expression": "I²C 的最大时延是 5 微秒",
                             "expression_type": "compound",
+                            "candidate_score": 0.98,
                             "search_query": "I2C maximum latency",
                             "reason": "上下文指向总线协议",
                         }
@@ -1416,7 +1437,6 @@ def test_active_adjudication_auto_overlay_is_disclosed_in_answer_context_and_sou
                             "proposal_id": "proposal-1",
                             "action": "web_search",
                             "confidence": 0.6,
-                            "candidate_score": 0.7,
                             "reason": "需要外部证据",
                             "reconstruct_focus": "",
                         }
@@ -1431,7 +1451,6 @@ def test_active_adjudication_auto_overlay_is_disclosed_in_answer_context_and_sou
                             "proposal_id": "proposal-1",
                             "action": "accept",
                             "confidence": 0.98,
-                            "candidate_score": 0.98,
                             "reason": "检索结果高置信度支持",
                             "reconstruct_focus": "",
                         }

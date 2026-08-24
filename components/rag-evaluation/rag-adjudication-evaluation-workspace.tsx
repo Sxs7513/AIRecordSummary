@@ -525,7 +525,7 @@ function TargetEditor({
       <div className="rag-adj-gold-list">
         {evidence.corrections.map((item) => (
           <div className="rag-adj-gold" key={item.id}>
-            <span><del>{item.original_expression}</del> → <strong>{item.accepted_expressions.join(" / ")}</strong></span>
+            <span><del>{item.original_expression}</del> → <AcceptedExpressionTags values={item.accepted_expressions} /></span>
             <small>[{item.start_char}, {item.end_char})</small>
             <button className="button danger" disabled={busy} onClick={() => deleteCorrection(item.id)}>删除</button>
           </div>
@@ -549,6 +549,16 @@ function HighlightedText({ text, corrections }: { text: string; corrections: Adj
   return <>{nodes}</>;
 }
 
+function AcceptedExpressionTags({ values }: { values: string[] }) {
+  return (
+    <span className="rag-adj-expression-tags">
+      {values.map((value, index) => (
+        <span className="rag-adj-expression-tag" key={`${value}-${index}`}>{value}</span>
+      ))}
+    </span>
+  );
+}
+
 function RunResults({
   runs,
   detail,
@@ -562,6 +572,16 @@ function RunResults({
   onOpen: (id: string) => void;
   onDelete: (run: AdjudicationRun) => Promise<void>;
 }) {
+  const metric = (name: string) => detail?.metrics.find((item) => item.metric_name === name);
+  const strictPrecision = metric("correction_precision_strict");
+  const strictRecall = metric("correction_recall_strict");
+  const strictF1 = metric("correction_f1_strict");
+  const relaxedPrecision = metric("correction_precision_relaxed");
+  const relaxedRecall = metric("correction_recall_relaxed");
+  const relaxedF1 = metric("correction_f1_relaxed");
+  const counts = relaxedRecall?.details;
+  const percentage = (value: number | string | undefined) => value === undefined ? "—" : `${(Number(value) * 100).toFixed(1)}%`;
+
   return (
     <section className="panel">
       <h2>评测 Run</h2>
@@ -580,9 +600,27 @@ function RunResults({
       </div>
       {detail && (
         <div className="rag-adj-run-detail">
-          <div className="stats">
-            <div><strong>{detail.metric ? `${(Number(detail.metric.value) * 100).toFixed(1)}%` : "—"}</strong><span>Gold Correction Accuracy</span></div>
-            <div><strong>{detail.metric?.passed_count ?? 0}/{detail.metric?.sample_count ?? 0}</strong><span>修改正确</span></div>
+          <div className="rag-adj-metric-groups">
+            <section className="rag-adj-metric-group">
+              <div className="rag-adj-metric-heading"><strong>Strict</strong><span>仅统计 Exact</span></div>
+              <div className="stats rag-adj-metrics">
+                <div className="stat card"><span className="subtle">Precision</span><strong>{percentage(strictPrecision?.value)}</strong></div>
+                <div className="stat card"><span className="subtle">Recall</span><strong>{percentage(strictRecall?.value)}</strong></div>
+                <div className="stat card"><span className="subtle">F1</span><strong>{percentage(strictF1?.value)}</strong></div>
+              </div>
+            </section>
+            <section className="rag-adj-metric-group">
+              <div className="rag-adj-metric-heading"><strong>Relaxed</strong><span>统计 Exact + Fuzzy</span></div>
+              <div className="stats rag-adj-metrics">
+                <div className="stat card"><span className="subtle">Precision</span><strong>{percentage(relaxedPrecision?.value)}</strong></div>
+                <div className="stat card"><span className="subtle">Recall</span><strong>{percentage(relaxedRecall?.value)}</strong></div>
+                <div className="stat card"><span className="subtle">F1</span><strong>{percentage(relaxedF1?.value)}</strong></div>
+              </div>
+            </section>
+            <div className="stats rag-adj-metric-summary">
+              <div className="stat card"><span className="subtle">Exact / Fuzzy</span><strong>{counts?.exact_count ?? 0}/{counts?.fuzzy_count ?? 0}</strong></div>
+              <div className="stat card"><span className="subtle">漏改 / 误改</span><strong>{counts?.false_negative ?? 0}/{counts?.false_positive ?? 0}</strong></div>
+            </div>
           </div>
           <div className="rag-eval-result-cases">
             {detail.cases.map((item) => (
@@ -591,9 +629,19 @@ function RunResults({
                 {item.error_message && <p className="error">{item.error_type}: {item.error_message}</p>}
                 <div className="rag-adj-result-gold">
                   {item.corrections.map((correction) => (
-                    <div className={correction.passed ? "passed" : "failed"} key={correction.gold_correction_id}>
-                      <span>{correction.original_expression} → {correction.accepted_expressions.join(" / ")}</span>
-                      <strong>{correction.passed ? `✓ ${correction.actual_expression}` : "未修改正确"}</strong>
+                    <div className={correction.details.match_kind === "fuzzy" ? "fuzzy" : correction.passed ? "passed" : "failed"} key={correction.gold_correction_id}>
+                      <span>{correction.original_expression} → <AcceptedExpressionTags values={correction.accepted_expressions} /></span>
+                      <strong>
+                        {correction.passed
+                          ? `✓ ${correction.actual_expression} · ${correction.details.match_kind}${correction.details.match_kind === "fuzzy" ? ` ${Number(correction.details.similarity).toFixed(1)}` : ""}`
+                          : "漏改"}
+                      </strong>
+                    </div>
+                  ))}
+                  {item.predictions.filter((prediction) => prediction.match_kind === "unmatched").map((prediction) => (
+                    <div className="failed" key={prediction.id}>
+                      <span>{prediction.original_expression} → {prediction.resolved_expression}</span>
+                      <strong>误改</strong>
                     </div>
                   ))}
                 </div>

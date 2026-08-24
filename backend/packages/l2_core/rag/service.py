@@ -71,9 +71,7 @@ class RagService:
             asr_adjudication_auto_resolve_confidence=settings.rag_asr_adjudication_auto_resolve_confidence,
             asr_adjudication_audit_prompt_variant=settings.rag_asr_adjudication_audit_prompt_variant,
             asr_adjudication_audit_model=settings.rag_asr_adjudication_audit_model,
-            asr_adjudication_audit_min_request_interval_seconds=(
-                settings.rag_asr_adjudication_audit_min_request_interval_seconds
-            ),
+            asr_adjudication_audit_min_request_interval_seconds=(settings.rag_asr_adjudication_audit_min_request_interval_seconds),
             grounded_search_client=grounded_search_client,
         )
 
@@ -124,7 +122,7 @@ class RagService:
         history: list[RagHistoryMessage] | None = None,
         resume_from_generation_id: UUID | None = None,
         adjudication_user_decision: ClaimConfirmationDecision | None = None,
-    ) -> None:
+    ) -> GenerationSnapshot:
         workflow_started = started_at()
         log_event(
             "workflow_started",
@@ -147,10 +145,11 @@ class RagService:
                 existing_original_answer = variants.get("original") or None
         try:
             sink.start()
-            if sink.cancel_if_requested():
+            cancelled = sink.prepare_cancel_if_requested()
+            if cancelled is not None:
                 log_event("generation_rag_cancelled", run_id, stage="before_graph")
                 log_event("workflow_completed", run_id, status="cancelled", stage="before_graph", elapsed_ms=elapsed_ms(workflow_started))
-                return
+                return cancelled
             with observation_scope(
                 self._observability_client,
                 ObservabilityScope(workspace_id=workspace_id, generation_run_id=run_id),
@@ -194,13 +193,14 @@ class RagService:
                         restored_state=restored_state,
                         adjudication_user_decision=adjudication_user_decision,
                     )
-            if sink.cancel_if_requested():
+            cancelled = sink.prepare_cancel_if_requested()
+            if cancelled is not None:
                 log_event("generation_rag_cancelled", run_id, stage="after_graph")
                 log_event("workflow_completed", run_id, status="cancelled", stage="after_graph", elapsed_ms=elapsed_ms(workflow_started))
-                return
+                return cancelled
             if confirmation is not None:
                 sink.block(confirmation)
-                sink.succeed(
+                terminal = sink.prepare_succeed(
                     {
                         "notEnoughEvidence": False,
                         "message": None,
@@ -211,7 +211,6 @@ class RagService:
                         },
                     },
                     [dict(source) for source in sources],
-                    preserve_checkpoints=True,
                 )
                 log_event(
                     "workflow_completed",
@@ -221,10 +220,10 @@ class RagService:
                     confirmation_items=len(confirmation.items),
                     elapsed_ms=elapsed_ms(workflow_started),
                 )
-                return
+                return terminal or generation_service.get(run_id)
             if not_enough_evidence:
                 sink.text(answer)
-            sink.succeed(
+            terminal = sink.prepare_succeed(
                 {"notEnoughEvidence": not_enough_evidence, "message": message},
                 [dict(source) for source in sources],
                 final_text=None if sink.has_aggregate_message else answer,
@@ -238,8 +237,10 @@ class RagService:
                 answer_chars=len(answer),
                 elapsed_ms=elapsed_ms(workflow_started),
             )
+            return terminal or generation_service.get(run_id)
         except RagExecutionCancelled:
-            if sink.cancel_if_requested():
+            cancelled = sink.prepare_cancel_if_requested()
+            if cancelled is not None:
                 log_event("generation_rag_cancelled", run_id, stage="graph_nodes", boundary="cooperative")
                 log_event(
                     "workflow_completed",
@@ -248,7 +249,7 @@ class RagService:
                     stage="graph_nodes",
                     elapsed_ms=elapsed_ms(workflow_started),
                 )
-                return
+                return cancelled
             raise
         except RagTokenBudgetExceeded as error:
             log_event(
@@ -260,10 +261,11 @@ class RagService:
                 elapsed_ms=elapsed_ms(workflow_started),
             )
             logger.info("rag token budget exceeded: run_id=%s details=%s", run_id, error)
-            sink.fail("rag_token_budget_exceeded", RAG_TOKEN_BUDGET_EXCEEDED_MESSAGE)
+            terminal = sink.prepare_fail("rag_token_budget_exceeded", RAG_TOKEN_BUDGET_EXCEEDED_MESSAGE)
+            return terminal or generation_service.get(run_id)
         except Exception as error:
             if generation_service.is_cancel_requested(run_id):
-                sink.cancel_if_requested()
+                cancelled = sink.prepare_cancel_if_requested()
                 log_event(
                     "generation_rag_cancelled",
                     run_id,
@@ -279,7 +281,7 @@ class RagService:
                     error_type=type(error).__name__,
                     elapsed_ms=elapsed_ms(workflow_started),
                 )
-                return
+                return cancelled or generation_service.get(run_id)
             log_event(
                 "workflow_completed",
                 run_id,
@@ -289,8 +291,8 @@ class RagService:
                 elapsed_ms=elapsed_ms(workflow_started),
             )
             logger.exception("rag answer generation failed: run_id=%s", run_id)
-            sink.fail("rag_answer_failed", str(error) or "录音问答执行失败")
-            raise
+            terminal = sink.prepare_fail("rag_answer_failed", str(error) or "录音问答执行失败")
+            return terminal or generation_service.get(run_id)
         finally:
             await self._release_retriever()
 

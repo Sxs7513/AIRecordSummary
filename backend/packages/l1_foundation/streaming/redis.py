@@ -117,6 +117,70 @@ class SyncRedisStreamStore:
         )
         return str(event_id)
 
+    def project_terminal(
+        self,
+        state_key: str,
+        stream_key: str,
+        *,
+        event_id: str,
+        event_type: str,
+        data: dict[str, Any],
+        state: dict[str, Any],
+        command: dict[str, Any],
+        ttl_seconds: int,
+    ) -> tuple[str, bool]:
+        """Atomically and idempotently project one terminal snapshot and SSE event."""
+        script = """
+        local current_raw = redis.call('GET', KEYS[1])
+        if current_raw then
+            local current = cjson.decode(current_raw)
+            if current['terminal_event_id'] == ARGV[1] then
+                return {current['cursor'] or '0-0', 0}
+            end
+            if current['status'] and current['updated_at'] and current['updated_at'] > ARGV[5] then
+                return {current['cursor'] or '0-0', 0}
+            end
+        end
+        local cursor = redis.call(
+            'XADD', KEYS[2], 'MAXLEN', '~', ARGV[6], '*',
+            'type', ARGV[2], 'data', ARGV[3]
+        )
+        local separator = string.find(cursor, '-')
+        local milliseconds = tonumber(string.sub(cursor, 1, separator - 1))
+        local ordinal = tonumber(string.sub(cursor, separator + 1))
+        local sequence = milliseconds * 1000 + ordinal
+        local snapshot_json = string.gsub(ARGV[4], '"__GENERATION_CURSOR__"', cjson.encode(cursor))
+        snapshot_json = string.gsub(snapshot_json, '"__GENERATION_SEQUENCE__"', tostring(sequence))
+        redis.call('SET', KEYS[1], snapshot_json, 'EX', ARGV[7])
+        redis.call('EXPIRE', KEYS[2], ARGV[7])
+        return {cursor, 1}
+        """
+        state_value = {
+            **state,
+            "command": command,
+            "cursor": "__GENERATION_CURSOR__",
+            "last_sequence": "__GENERATION_SEQUENCE__",
+            "terminal_event_id": event_id,
+        }
+        updated_at = str(state.get("updated_at", ""))
+        result = cast(
+            list[object],
+            self._client.eval(
+                script,
+                2,
+                state_key,
+                stream_key,
+                event_id,
+                event_type,
+                json.dumps(data, ensure_ascii=False, separators=(",", ":")),
+                json.dumps(state_value, ensure_ascii=False, separators=(",", ":")),
+                updated_at,
+                self._maxlen,
+                ttl_seconds,
+            ),
+        )
+        return str(result[0]), bool(result[1])
+
     def set_state(self, key: str, state: dict[str, Any], *, ttl_seconds: int | None = None) -> None:
         payload = json.dumps(state, ensure_ascii=False, separators=(",", ":"))
         if ttl_seconds is None:

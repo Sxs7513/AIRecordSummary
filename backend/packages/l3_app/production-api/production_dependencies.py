@@ -79,7 +79,12 @@ GenerationAccessServiceDependency = Annotated[GenerationAccessService, Depends(g
 
 
 def get_conversation_service(request: Request) -> ConversationService:
-    return ConversationService(request.app.state.database_engine, request.app.state.generation_service, request.app.state.conversation_history_store)
+    return ConversationService(
+        request.app.state.database_engine,
+        request.app.state.generation_service,
+        request.app.state.conversation_history_store,
+        request.app.state.generation_command_publisher,
+    )
 
 
 ConversationServiceDependency = Annotated[ConversationService, Depends(get_conversation_service)]

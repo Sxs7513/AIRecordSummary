@@ -10,7 +10,7 @@ from production_router import router as production_router
 
 from l1_foundation.infrastructure.db.session import create_database_engine
 from l1_foundation.infrastructure.storage.local import LocalStorage
-from l1_foundation.messaging import KafkaEventProducer, SyncKafkaEventProducer
+from l1_foundation.messaging import KafkaEventProducer, OutboxRepository, SyncKafkaEventProducer
 from l1_foundation.observability import ObservabilityClient
 from l1_foundation.pipeline.runtime.artifact_store import ArtifactStore
 from l1_foundation.settings import Settings, get_settings
@@ -106,9 +106,15 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         f"{app.state.settings.kafka_client_id}-production-api-generation",
         app.state.settings.kafka_request_timeout_ms,
     )
-    await app.state.generation_command_producer.start()
-    app.state.generation_command_publisher = GenerationCommandPublisher(app.state.generation_command_producer)
-    app.state.processing_command_publisher = ProcessingCommandPublisher(app.state.generation_command_producer)
+    try:
+        await app.state.generation_command_producer.start()
+    except Exception:
+        # PostgreSQL-backed command endpoints remain available; direct Kafka-only
+        # endpoints will fail until this process is restarted after Kafka recovers.
+        logger.warning("direct Kafka producer unavailable; outbox-backed commands remain available", exc_info=True)
+    app.state.outbox_repository = OutboxRepository(app.state.database_engine)
+    app.state.generation_command_publisher = GenerationCommandPublisher(app.state.generation_command_producer, app.state.outbox_repository)
+    app.state.processing_command_publisher = ProcessingCommandPublisher(app.state.generation_command_producer, app.state.outbox_repository)
     artifact_store = ArtifactStore(app.state.settings.resolved_local_storage_root)
     injected_worker_client = app.state.injected_worker_client
     app.state.worker_client = injected_worker_client or KafkaWorkerClient(
@@ -125,7 +131,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
             f"{app.state.settings.kafka_client_id}-production-api-sync-compute",
             app.state.settings.kafka_request_timeout_ms,
         )
-        sync_compute_producer.start()
+        try:
+            sync_compute_producer.start()
+        except Exception:
+            logger.warning("sync compute producer unavailable; direct compute requests are degraded", exc_info=True)
         app.state.sync_worker_client = SyncKafkaWorkerClient(
             sync_compute_producer,
             app.state.sync_redis_store,
@@ -147,7 +156,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         request_timeout_ms=app.state.settings.kafka_request_timeout_ms,
         enabled=app.state.settings.observability_enabled,
     )
-    await app.state.observability_client.start()
+    try:
+        await app.state.observability_client.start()
+    except Exception:
+        logger.warning("observability Kafka producer unavailable; telemetry is degraded", exc_info=True)
     app.state.rag_service = RagService(
         app.state.database_engine,
         app.state.settings,

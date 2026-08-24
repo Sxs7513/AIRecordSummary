@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 
 # pyright: reportUnknownMemberType=false, reportUnknownVariableType=false
 from collections.abc import Awaitable, Callable, Coroutine, Sequence
@@ -15,6 +16,7 @@ from aiokafka.structs import ConsumerRecord
 from l1_foundation.messaging.contracts import EventEnvelope
 
 EventHandler = Callable[[EventEnvelope], Awaitable[None]]
+logger = logging.getLogger("kafka")
 
 
 def _encode_event(event: EventEnvelope) -> bytes:
@@ -233,6 +235,13 @@ class KafkaEventConsumer:
                         raise
                     attempt = event.attempt + 1
                     target = retry_topic if attempt < max_attempts else dlq_topic
+                    logger.exception(
+                        "Kafka event handler failed; forwarding event_id=%s event_type=%s attempt=%d target=%s",
+                        event.event_id,
+                        event.event_type,
+                        attempt,
+                        target,
+                    )
                     failed = event.model_copy(update={"attempt": attempt, "last_error": (str(error) or type(error).__name__)[:2000]})
                     await producer.publish(target, self._event_key(event), failed)
             await self._consumer.commit()

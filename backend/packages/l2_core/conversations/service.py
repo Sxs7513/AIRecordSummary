@@ -5,7 +5,7 @@ import logging
 from typing import Any, Literal, cast
 from uuid import UUID
 
-from sqlalchemy import Engine, RowMapping, text
+from sqlalchemy import Connection, Engine, RowMapping, text
 
 from l2_core.access.conversations import ConversationAccessDeniedError, ConversationAccessService
 from l2_core.auth.contracts import CurrentUser
@@ -18,10 +18,19 @@ from l2_core.conversations.contracts import (
     ConversationNotFoundError,
 )
 from l2_core.conversations.history_store import ConversationHistoryStore
-from l2_core.generation.contracts import CreateGenerationCommand, GenerationAccessScope, GenerationKind, GenerationPriority, GenerationStatus, TextBlock
+from l2_core.generation.contracts import (
+    CreateGenerationCommand,
+    GenerationAccessScope,
+    GenerationKind,
+    GenerationPriority,
+    GenerationSnapshot,
+    GenerationStatus,
+    TextBlock,
+)
 from l2_core.generation.service import GenerationService
 from l2_core.rag.adjudication.contracts import AdjudicationConfirmationBlock, ClaimConfirmationDecision
 from l2_core.rag.contracts import RagHistoryMessage, RagHistorySource
+from l2_core.rag.queue import GenerationCommandPublisher, RagGenerationWorkItem
 
 logger = logging.getLogger(__name__)
 
@@ -29,10 +38,17 @@ logger = logging.getLogger(__name__)
 class ConversationService:
     """Transactional creation, pagination and Generation projection for chat conversations."""
 
-    def __init__(self, engine: Engine, generation_service: GenerationService, history_store: ConversationHistoryStore | None = None) -> None:
+    def __init__(
+        self,
+        engine: Engine,
+        generation_service: GenerationService,
+        history_store: ConversationHistoryStore | None = None,
+        command_publisher: GenerationCommandPublisher | None = None,
+    ) -> None:
         self._engine = engine
         self._generation_service = generation_service
         self._history_store = history_store
+        self._command_publisher = command_publisher
         self._access = ConversationAccessService(engine)
 
     def create(self, user: CurrentUser, title: str | None = None) -> Conversation:
@@ -172,7 +188,13 @@ class ConversationService:
         return ConversationMessagePage(items=items, next_before=next_before, has_more=len(rows) >= bounded_limit)
 
     def create_turn(
-        self, user: CurrentUser, conversation_id: UUID, blocks: list[TextBlock], client_message_id: UUID, limit: int
+        self,
+        user: CurrentUser,
+        conversation_id: UUID,
+        blocks: list[TextBlock],
+        client_message_id: UUID,
+        limit: int,
+        scope_recording_ids: list[UUID] | None = None,
     ) -> tuple[ConversationMessage, ConversationMessage, list[RagHistoryMessage]]:
         query = "".join(block.value for block in blocks).strip()
         if not query:
@@ -301,18 +323,16 @@ class ConversationService:
                 .mappings()
                 .one()
             )
-            generation = self._generation_service.create_in_transaction(
-                connection,
-                CreateGenerationCommand(
-                    kind=GenerationKind.TEXT,
-                    priority=GenerationPriority.INTERACTIVE,
-                    idempotency_key=f"conversation-message:{assistant_row['id']}",
-                    parent_type="conversation_message",
-                    parent_id=str(assistant_row["id"]),
-                    access_scope=GenerationAccessScope(owner_user_id=user.id),
-                    input={"query": query, "limit": limit, "conversation_id": str(conversation_id)},
-                ),
+            command = CreateGenerationCommand(
+                kind=GenerationKind.TEXT,
+                priority=GenerationPriority.INTERACTIVE,
+                idempotency_key=f"conversation-message:{assistant_row['id']}",
+                parent_type="conversation_message",
+                parent_id=str(assistant_row["id"]),
+                access_scope=GenerationAccessScope(owner_user_id=user.id),
+                input={"query": query, "limit": limit, "conversation_id": str(conversation_id)},
             )
+            generation = self._generation_service.create_in_transaction(connection, command)
             assistant_row = (
                 connection.execute(
                     text("update conversation_messages set generation_run_id = :run_id, updated_at = now() where id = :message_id returning *"),
@@ -327,11 +347,28 @@ class ConversationService:
                     {"id": conversation_id, "title": query[:80]},
                 )
             history = self._history(connection, conversation_id, sequence_end - 1)
+            self._enqueue_rag(
+                connection,
+                user,
+                generation.id,
+                cast(UUID, assistant_row["id"]),
+                query,
+                limit,
+                history,
+                scope_recording_ids or [],
+                command,
+            )
         self._delete_generation_runtime_data(conversation_id, superseded_generation_ids)
         return self._message(user_row), self._message(assistant_row), history
 
     def create_initial_turn(
-        self, user: CurrentUser, client_creation_id: UUID, blocks: list[TextBlock], client_message_id: UUID, limit: int
+        self,
+        user: CurrentUser,
+        client_creation_id: UUID,
+        blocks: list[TextBlock],
+        client_message_id: UUID,
+        limit: int,
+        scope_recording_ids: list[UUID] | None = None,
     ) -> tuple[Conversation, ConversationMessage, ConversationMessage, list[RagHistoryMessage], bool]:
         """Atomically create a conversation and its first generation-backed turn.
 
@@ -438,18 +475,16 @@ class ConversationService:
                 .mappings()
                 .one()
             )
-            generation = self._generation_service.create_in_transaction(
-                connection,
-                CreateGenerationCommand(
-                    kind=GenerationKind.TEXT,
-                    priority=GenerationPriority.INTERACTIVE,
-                    idempotency_key=f"conversation-message:{assistant_row['id']}",
-                    parent_type="conversation_message",
-                    parent_id=str(assistant_row["id"]),
-                    access_scope=GenerationAccessScope(owner_user_id=user.id),
-                    input={"query": query, "limit": limit, "conversation_id": str(conversation_id)},
-                ),
+            command = CreateGenerationCommand(
+                kind=GenerationKind.TEXT,
+                priority=GenerationPriority.INTERACTIVE,
+                idempotency_key=f"conversation-message:{assistant_row['id']}",
+                parent_type="conversation_message",
+                parent_id=str(assistant_row["id"]),
+                access_scope=GenerationAccessScope(owner_user_id=user.id),
+                input={"query": query, "limit": limit, "conversation_id": str(conversation_id)},
             )
+            generation = self._generation_service.create_in_transaction(connection, command)
             assistant_row = (
                 connection.execute(
                     text("update conversation_messages set generation_run_id = :run_id, updated_at = now() where id = :message_id returning *"),
@@ -457,6 +492,17 @@ class ConversationService:
                 )
                 .mappings()
                 .one()
+            )
+            self._enqueue_rag(
+                connection,
+                user,
+                generation.id,
+                cast(UUID, assistant_row["id"]),
+                query,
+                limit,
+                [],
+                scope_recording_ids or [],
+                command,
             )
         return self._conversation(conversation_row), self._message(user_row), self._message(assistant_row), [], True
 
@@ -474,6 +520,7 @@ class ConversationService:
         client_request_id: UUID,
         *,
         reuse_checkpoint: bool,
+        scope_recording_ids: list[UUID] | None = None,
     ) -> tuple[ConversationMessage, ConversationMessage, list[RagHistoryMessage]]:
         self._access.require_view(conversation_id, user)
         source = self._generation_service.get(source_generation_id)
@@ -552,6 +599,18 @@ class ConversationService:
                 .one()
             )
             history = self._history(connection, conversation_id, int(assistant_row["sequence"]) - 1)
+            self._enqueue_rag(
+                connection,
+                user,
+                generation.id,
+                cast(UUID, assistant_row["id"]),
+                str(command.input["query"]),
+                int(command.input.get("limit", 10)),
+                history,
+                scope_recording_ids or [],
+                command,
+                resume_from_generation_id=source_generation_id if reuse_checkpoint else None,
+            )
         return self._message(user_row), self._message(assistant_row), history
 
     def submit_adjudication_decision(
@@ -560,6 +619,7 @@ class ConversationService:
         conversation_id: UUID,
         source_generation_id: UUID,
         decision: ClaimConfirmationDecision,
+        scope_recording_ids: list[UUID] | None = None,
     ) -> tuple[ConversationMessage, ConversationMessage, list[RagHistoryMessage]]:
         self._access.require_view(conversation_id, user)
         source = self._generation_service.get(source_generation_id)
@@ -598,17 +658,25 @@ class ConversationService:
                     raw_current_decision = current_command.input.get("adjudication_user_decision")
                     current_decision = cast(dict[str, object], raw_current_decision) if isinstance(raw_current_decision, dict) else None
                     if current_decision is not None and str(current_decision.get("client_request_id")) == str(decision.client_request_id):
-                        user_row = connection.execute(
-                            text("select * from conversation_messages where id = :id"),
-                            {"id": assistant_row["reply_to_message_id"]},
-                        ).mappings().one()
+                        user_row = (
+                            connection.execute(
+                                text("select * from conversation_messages where id = :id"),
+                                {"id": assistant_row["reply_to_message_id"]},
+                            )
+                            .mappings()
+                            .one()
+                        )
                         history = self._history(connection, conversation_id, int(assistant_row["sequence"]) - 1)
                         return self._message(user_row), self._message(assistant_row), history
                 raise ValueError("Adjudication confirmation is stale or already consumed")
-            user_row = connection.execute(
-                text("select * from conversation_messages where id = :id"),
-                {"id": assistant_row["reply_to_message_id"]},
-            ).mappings().one()
+            user_row = (
+                connection.execute(
+                    text("select * from conversation_messages where id = :id"),
+                    {"id": assistant_row["reply_to_message_id"]},
+                )
+                .mappings()
+                .one()
+            )
             base_input = {
                 key: value
                 for key, value in source_command.input.items()
@@ -645,68 +713,139 @@ class ConversationService:
                 .one()
             )
             history = self._history(connection, conversation_id, int(assistant_row["sequence"]) - 1)
+            self._enqueue_rag(
+                connection,
+                user,
+                generation.id,
+                cast(UUID, assistant_row["id"]),
+                str(command.input["query"]),
+                int(command.input.get("limit", 10)),
+                history,
+                scope_recording_ids or [],
+                command,
+                resume_from_generation_id=source_generation_id,
+                adjudication_user_decision=decision,
+            )
         return self._message(user_row), self._message(assistant_row), history
 
-    def fail_generation_submission(self, generation_run_id: UUID, message: str) -> None:
-        """Compensate a conversation turn when Kafka rejects its generation command."""
-        self._generation_service.event_sink(generation_run_id).fail("kafka_unavailable", message, retryable=True)
-        self.sync_generation(generation_run_id)
+    def _enqueue_rag(
+        self,
+        connection: Connection,
+        user: CurrentUser,
+        run_id: UUID,
+        conversation_message_id: UUID,
+        query: str,
+        limit: int,
+        history: list[RagHistoryMessage],
+        scope_recording_ids: list[UUID],
+        command: CreateGenerationCommand,
+        *,
+        resume_from_generation_id: UUID | None = None,
+        adjudication_user_decision: ClaimConfirmationDecision | None = None,
+    ) -> None:
+        if self._command_publisher is None:
+            return
+        self._command_publisher.enqueue_rag(
+            connection,
+            RagGenerationWorkItem(
+                run_id=run_id,
+                workspace_id=user.current_workspace_id,
+                query=query,
+                limit=limit,
+                scope_recording_ids=scope_recording_ids,
+                history=history,
+                conversation_message_id=conversation_message_id,
+                resume_from_generation_id=resume_from_generation_id,
+                adjudication_user_decision=adjudication_user_decision,
+                generation=command,
+            ),
+        )
 
     def sync_generation(self, generation_run_id: UUID) -> None:
         snapshot = self._generation_service.get(generation_run_id)
+        self.sync_generation_snapshot(snapshot)
+
+    def sync_generation_snapshot(self, snapshot: GenerationSnapshot) -> None:
+        with self._engine.begin() as connection:
+            completed_history = self.sync_generation_in_transaction(connection, snapshot)
+        self.apply_generation_history_cache(completed_history)
+
+    def sync_generation_in_transaction(
+        self,
+        connection: Connection,
+        snapshot: GenerationSnapshot,
+    ) -> tuple[UUID, list[tuple[RagHistoryMessage, RagHistoryMessage]]] | None:
         status = {
             GenerationStatus.SUCCEEDED: ConversationMessageStatus.COMPLETED,
             GenerationStatus.FAILED: ConversationMessageStatus.FAILED,
             GenerationStatus.CANCELLED: ConversationMessageStatus.CANCELLED,
         }.get(snapshot.status, ConversationMessageStatus.STREAMING)
-        self._update_from_generation(generation_run_id, status)
-
-    def _update_from_generation(self, generation_run_id: UUID, status: ConversationMessageStatus) -> None:
-        snapshot = self._generation_service.get(generation_run_id)
         completed_history: tuple[UUID, list[tuple[RagHistoryMessage, RagHistoryMessage]]] | None = None
-        with self._engine.begin() as connection:
-            row = (
-                connection.execute(
-                    text(
-                        """
+        row = (
+            connection.execute(
+                text(
+                    """
                     update conversation_messages set status = :status, content_blocks = cast(:blocks as jsonb), sources = cast(:sources as jsonb),
                         error_message = :error_message, updated_at = now()
                     where generation_run_id = :generation_run_id
                     returning conversation_id
                     """
-                    ),
-                    {
-                        "generation_run_id": generation_run_id,
-                        "status": status.value,
-                        "blocks": json.dumps([block.model_dump(mode="json") for block in snapshot.blocks]),
-                        "sources": json.dumps(self._persistent_sources(snapshot.sources)),
-                        "error_message": snapshot.error_message,
-                    },
-                )
-                .mappings()
-                .one_or_none()
+                ),
+                {
+                    "generation_run_id": snapshot.id,
+                    "status": status.value,
+                    "blocks": json.dumps([block.model_dump(mode="json") for block in snapshot.blocks]),
+                    "sources": json.dumps(self._persistent_sources(snapshot.sources)),
+                    "error_message": snapshot.error_message,
+                },
             )
-            if status == ConversationMessageStatus.COMPLETED and row is not None:
-                rows = (
-                    connection.execute(
-                        text(
-                            """
+            .mappings()
+            .one_or_none()
+        )
+        if status == ConversationMessageStatus.COMPLETED and row is not None:
+            rows = (
+                connection.execute(
+                    text(
+                        """
                         select role, content_blocks, sources from conversation_messages
                         where conversation_id = :conversation_id and status = 'completed'
                         order by sequence desc limit :limit
                         """
-                        ),
-                        {"conversation_id": row["conversation_id"], "limit": ConversationHistoryStore.MAX_TURNS * 2},
-                    )
-                    .mappings()
-                    .all()
+                    ),
+                    {"conversation_id": row["conversation_id"], "limit": ConversationHistoryStore.MAX_TURNS * 2},
                 )
-                history = self._bounded_history(
-                    [self._history_message(history_row) for history_row in reversed(rows) if str(history_row["role"]) in {"user", "assistant"}]
-                )
-                completed_history = (cast(UUID, row["conversation_id"]), self._history_turns(history))
+                .mappings()
+                .all()
+            )
+            history = self._bounded_history(
+                [self._history_message(history_row) for history_row in reversed(rows) if str(history_row["role"]) in {"user", "assistant"}]
+            )
+            completed_history = (cast(UUID, row["conversation_id"]), self._history_turns(history))
+        return completed_history
+
+    def apply_generation_history_cache(
+        self,
+        completed_history: tuple[UUID, list[tuple[RagHistoryMessage, RagHistoryMessage]]] | None,
+    ) -> None:
         if completed_history is not None:
             self._put_history_cache(*completed_history)
+
+    def _update_from_generation(self, generation_run_id: UUID, status: ConversationMessageStatus) -> None:
+        snapshot = self._generation_service.get(generation_run_id)
+        with self._engine.begin() as connection:
+            completed_history = self.sync_generation_in_transaction(
+                connection,
+                snapshot.model_copy(update={"status": self._generation_status(status)}),
+            )
+        self.apply_generation_history_cache(completed_history)
+
+    @staticmethod
+    def _generation_status(status: ConversationMessageStatus) -> GenerationStatus:
+        return {
+            ConversationMessageStatus.COMPLETED: GenerationStatus.SUCCEEDED,
+            ConversationMessageStatus.FAILED: GenerationStatus.FAILED,
+            ConversationMessageStatus.CANCELLED: GenerationStatus.CANCELLED,
+        }.get(status, GenerationStatus.RUNNING)
 
     @staticmethod
     def _persistent_sources(sources: list[dict[str, Any]]) -> list[dict[str, object]]:

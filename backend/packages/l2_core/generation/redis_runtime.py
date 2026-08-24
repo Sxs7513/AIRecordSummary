@@ -33,6 +33,31 @@ class GenerationRedisRuntime:
         cursor = self._redis_store.append(generation_stream_key(run_id), event_type, data)
         return cursor, redis_stream_sequence(cursor)
 
+    def project_terminal(
+        self,
+        event_id: UUID,
+        snapshot: GenerationSnapshot,
+        command: CreateGenerationCommand,
+        event_type: str,
+        data: dict[str, Any],
+        *,
+        preserve_checkpoints: bool = False,
+    ) -> bool:
+        if not snapshot.status.is_terminal:
+            raise ValueError("Only terminal generation snapshots can be projected")
+        _cursor, projected = self._redis_store.project_terminal(
+            generation_state_key(snapshot.id),
+            generation_stream_key(snapshot.id),
+            event_id=str(event_id),
+            event_type=event_type,
+            data=data,
+            state=snapshot.model_dump(mode="json"),
+            command=command.model_dump(mode="json"),
+            ttl_seconds=GENERATION_TERMINAL_DELIVERY_TTL_SECONDS,
+        )
+        self.expire_terminal_generation(snapshot.id, preserve_checkpoints=preserve_checkpoints)
+        return projected
+
     def create_generation(self, command: CreateGenerationCommand, run_id: UUID | None = None) -> GenerationSnapshot:
         existing = self._redis_store.get_state(f"generation:idempotency:{command.idempotency_key}")
         if existing is not None:

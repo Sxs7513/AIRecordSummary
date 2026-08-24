@@ -129,6 +129,11 @@ class AdjudicationProposal(BaseModel):
     expression_type: Literal["number", "proper_noun", "compound"] = Field(
         description="修正类型：number 为数字或单位，proper_noun 为专名或术语，compound 为复合表达"
     )
+    candidate_score: float = Field(
+        description="候选在同一 Audit item 中作为最佳修正的相对评分，0 最差、1 最佳",
+        ge=0,
+        le=1,
+    )
     search_query: str = Field(description="用于公开资料核验该候选的精确搜索词", min_length=1, max_length=240)
     reason: str = Field(default="", description="候选代回全文后比原表达更自洽的理由及现有 Evidence 依据", max_length=500)
     supporting_evidence_index: int | None = Field(
@@ -136,6 +141,17 @@ class AdjudicationProposal(BaseModel):
         description="最能独立支持该候选的 Reference Evidence index；没有独立支持时为 null，不得填写 Target 自身的 index",
         ge=1,
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_candidate_score(cls, value: object) -> object:
+        if not isinstance(value, Mapping):
+            return value
+        if "candidate_score" in value:
+            return cast(object, value)
+        payload = dict(cast(Mapping[str, object], value))
+        payload["candidate_score"] = 0.0
+        return payload
 
     @model_validator(mode="after")
     def validate_change(self) -> AdjudicationProposal:
@@ -158,11 +174,6 @@ class CandidateDecision(BaseModel):
         description="对该候选的本轮动作：采用、联网核验、定向重建，或拒绝当前候选并重建"
     )
     confidence: float = Field(description="当前决策置信度，0 表示完全不可信，1 表示完全确定", ge=0, le=1)
-    candidate_score: float = Field(
-        description="候选本身作为该 Audit item 最佳修正的相对评分；用于同组候选排序，0 最差、1 最佳",
-        ge=0,
-        le=1,
-    )
     reason: str = Field(
         description="选择该动作的上下文、证据和一致性依据；action=reject 时同时作为下轮重建反馈",
         min_length=1,
@@ -175,13 +186,11 @@ class CandidateDecision(BaseModel):
 
     @model_validator(mode="before")
     @classmethod
-    def migrate_candidate_score(cls, value: object) -> object:
-        if not isinstance(value, Mapping):
+    def discard_legacy_candidate_score(cls, value: object) -> object:
+        if not isinstance(value, Mapping) or "candidate_score" not in value:
             return value
-        if "candidate_score" in value:
-            return cast(object, value)
         payload = dict(cast(Mapping[str, object], value))
-        payload["candidate_score"] = payload.get("confidence", 0.0)
+        payload.pop("candidate_score", None)
         return payload
 
     @model_validator(mode="after")

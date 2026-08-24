@@ -38,12 +38,24 @@ class GenerationService:
         return command if command is not None else self._postgres_store.get_command(run_id)
 
     def ensure(self, run_id: UUID, command: CreateGenerationCommand) -> GenerationSnapshot:
+        try:
+            return self._postgres_store.get_snapshot(run_id)
+        except GenerationNotFoundError:
+            pass
         active = self._redis_runtime.get_snapshot(run_id)
-        return active[0] if active is not None else self._redis_runtime.create_generation(command, run_id)
+        if active is not None:
+            return active[0]
+        return self._redis_runtime.create_generation(command, run_id)
 
     def get(self, run_id: UUID) -> GenerationSnapshot:
+        try:
+            return self._postgres_store.get_snapshot(run_id)
+        except GenerationNotFoundError:
+            pass
         active = self._redis_runtime.get_snapshot(run_id)
-        return active[0] if active is not None else self._postgres_store.get_snapshot(run_id)
+        if active is None:
+            raise GenerationNotFoundError(str(run_id))
+        return active[0]
 
     def cursor(self, run_id: UUID) -> str:
         active = self._redis_runtime.get_snapshot(run_id)
@@ -55,6 +67,11 @@ class GenerationService:
             return snapshot
         self._redis_runtime.request_cancel(run_id)
         return self.event_sink(run_id).cancel()
+
+    def prepare_cancel(self, run_id: UUID) -> GenerationSnapshot:
+        """Build a durable cancellation snapshot without projecting it to Redis first."""
+        self._redis_runtime.request_cancel(run_id)
+        return self.event_sink(run_id).prepare_cancel()
 
     def is_cancel_requested(self, run_id: UUID) -> bool:
         return self._redis_runtime.is_cancel_requested(run_id)

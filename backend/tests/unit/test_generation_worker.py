@@ -27,6 +27,11 @@ class _GenerationService:
             priority=GenerationPriority.INTERACTIVE,
             idempotency_key="test",
         )
+        self.terminal_store = _TerminalStore()
+
+    @property
+    def store(self) -> _TerminalStore:
+        return self.terminal_store
 
     def get(self, _run_id: UUID) -> object:
         return self.snapshot
@@ -36,8 +41,19 @@ class _GenerationService:
         self.snapshot = self.snapshot.model_copy(update={"status": GenerationStatus.CANCELLED})
         return self.snapshot
 
+    def prepare_cancel(self, run_id: UUID) -> object:
+        return self.cancel(run_id)
+
     def command(self, _run_id: UUID) -> CreateGenerationCommand:
         return self.generation_command
+
+
+class _TerminalStore:
+    def __init__(self) -> None:
+        self.projected: list[tuple[GenerationSnapshot, CreateGenerationCommand]] = []
+
+    def project_terminal(self, snapshot: GenerationSnapshot, command: CreateGenerationCommand) -> None:
+        self.projected.append((snapshot, command))
 
 
 class _Producer:
@@ -59,16 +75,39 @@ class _Conversations:
         del generation_run_id
         return
 
+    def sync_generation_in_transaction(self, connection: object, snapshot: GenerationSnapshot) -> None:
+        del connection, snapshot
+        return None
+
+    def apply_generation_history_cache(self, completed_history: object) -> None:
+        del completed_history
+        return None
+
+
+class _TerminalCommitter:
+    def __init__(self) -> None:
+        self.committed: list[GenerationSnapshot] = []
+
+    async def commit(
+        self,
+        _source: EventEnvelope,
+        snapshot: GenerationSnapshot,
+        _command: CreateGenerationCommand,
+    ) -> None:
+        self.committed.append(snapshot)
+
 
 def test_generation_cancel_handler_marks_generation_and_propagates_compute_scope() -> None:
     generation_id = uuid4()
     service = _GenerationService(generation_id)
     producer = _Producer()
     conversations = _Conversations()
+    terminal_committer = _TerminalCommitter()
     handler = GenerationCancelHandler(
         cast(GenerationService, service),
         cast(KafkaEventProducer, producer),
         conversations,
+        terminal_committer,  # type: ignore[arg-type]
     )
     event = new_event(
         "generation.cancel.requested",
@@ -80,8 +119,9 @@ def test_generation_cancel_handler_marks_generation_and_propagates_compute_scope
     asyncio.run(handler.handle(event))
 
     assert service.cancelled == [generation_id]
-    assert conversations.synced == [generation_id]
-    assert [message[0] for message in producer.messages] == ["generation.events", "generation.state", "compute.cancel"]
+    assert conversations.synced == []
+    assert [snapshot.status for snapshot in terminal_committer.committed] == [GenerationStatus.CANCELLED]
+    assert [message[0] for message in producer.messages] == ["compute.cancel"]
     topic, key, propagated = producer.messages[-1]
     assert topic == "compute.cancel"
     assert key == str(generation_id)

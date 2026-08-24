@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
+from dataclasses import dataclass
 from time import perf_counter
 from typing import Any, cast
 from uuid import UUID
@@ -21,7 +22,16 @@ from l2_core.rag.adjudication.web_research import (
 )
 from l2_core.rag.contracts import Evidence, EvidenceChunk, EvidenceRecording, RagGraphState
 from l2_core.rag.token_budget import RagTokenBudgetMiddleware
-from l2_core.rag_adjudication_evaluation.scoring import GoldCorrection, score_corrections
+from l2_core.rag_adjudication_evaluation.scoring import CorrectionScoringResult, GoldCorrection, score_corrections
+
+
+@dataclass(frozen=True, slots=True)
+class _CaseScoreCounts:
+    exact: int
+    fuzzy: int
+    gold: int
+    predictions: int
+    succeeded: bool
 
 
 class RagAdjudicationEvaluationRunner:
@@ -52,21 +62,27 @@ class RagAdjudicationEvaluationRunner:
                     {"version": run["dataset_version_id"]},
                 ).mappings()
             ]
-        passed_total = 0
+        exact_total = 0
+        fuzzy_total = 0
         gold_total = 0
+        prediction_total = 0
         completed = 0
         failed = 0
+        config = cast(Mapping[str, Any], run.get("config_snapshot") or {})
+        fuzzy_threshold = float(config.get("fuzzy_threshold", 90.0))
         search_client = self._grounded_search_client()
         try:
             for case in cases:
                 if self._cancel_requested(run_id):
                     self._finish_cancelled(run_id)
                     return
-                case_passed, case_total, succeeded = await self._execute_case(run_id, case, search_client)
-                passed_total += case_passed
-                gold_total += case_total
-                completed += int(succeeded)
-                failed += int(not succeeded)
+                counts = await self._execute_case(run_id, case, search_client, fuzzy_threshold)
+                exact_total += counts.exact
+                fuzzy_total += counts.fuzzy
+                gold_total += counts.gold
+                prediction_total += counts.predictions
+                completed += int(counts.succeeded)
+                failed += int(not counts.succeeded)
                 with self._engine.begin() as connection:
                     connection.execute(
                         text(
@@ -81,24 +97,24 @@ class RagAdjudicationEvaluationRunner:
         finally:
             if search_client is not None:
                 await search_client.close()
-        accuracy = passed_total / gold_total if gold_total else 0.0
         with self._engine.begin() as connection:
-            connection.execute(
-                text(
-                    """
-                    insert into rag_adjudication_evaluation_metric_values (
-                        evaluation_run_id, metric_name, metric_version, value,
-                        passed_count, sample_count
-                    ) values (
-                        :id, 'gold_correction_accuracy', '1', :value, :passed, :total
-                    )
-                    on conflict (evaluation_run_id, metric_name, metric_version)
-                    do update set value=excluded.value, passed_count=excluded.passed_count,
-                                  sample_count=excluded.sample_count
-                    """
-                ),
-                {"id": run_id, "value": accuracy, "passed": passed_total, "total": gold_total},
-            )
+            for metric in build_metric_rows(exact_total, fuzzy_total, gold_total, prediction_total):
+                connection.execute(
+                    text(
+                        """
+                        insert into rag_adjudication_evaluation_metric_values (
+                            evaluation_run_id, metric_name, metric_version, value,
+                            passed_count, sample_count, details
+                        ) values (
+                            :id, :name, '2', :value, :passed, :total, cast(:details as jsonb)
+                        )
+                        on conflict (evaluation_run_id, metric_name, metric_version)
+                        do update set value=excluded.value, passed_count=excluded.passed_count,
+                                      sample_count=excluded.sample_count, details=excluded.details
+                        """
+                    ),
+                    {"id": run_id, **metric},
+                )
             connection.execute(
                 text(
                     """
@@ -115,7 +131,8 @@ class RagAdjudicationEvaluationRunner:
         run_id: UUID,
         case: Mapping[str, Any],
         search_client: GroundedSearchClient | None,
-    ) -> tuple[int, int, bool]:
+        fuzzy_threshold: float,
+    ) -> _CaseScoreCounts:
         case_id = cast(UUID, case["id"])
         evidence_rows, gold_rows = self._load_case(case_id)
         result_id = self._start_case(run_id, case_id)
@@ -159,7 +176,13 @@ class RagAdjudicationEvaluationRunner:
                 )
                 for row in gold_rows
             ]
-            scores = score_corrections(gold, agent_state.overlays)
+            source_texts = {(index + 1, str(row["source_chunk_id"] or row["id"])): str(row["text"]) for index, row in enumerate(evidence_rows)}
+            scores = score_corrections(
+                gold,
+                agent_state.overlays,
+                fuzzy_threshold=fuzzy_threshold,
+                source_texts=source_texts,
+            )
             self._finish_case(
                 result_id,
                 round((perf_counter() - started) * 1000),
@@ -167,7 +190,13 @@ class RagAdjudicationEvaluationRunner:
                 output.get("token_usage", 0),
                 scores,
             )
-            return sum(score.passed for score in scores), len(scores), True
+            return _CaseScoreCounts(
+                exact=scores.exact_count,
+                fuzzy=scores.fuzzy_count,
+                gold=len(scores.corrections),
+                predictions=len(scores.predictions),
+                succeeded=True,
+            )
         except Exception as error:
             self._fail_case(
                 result_id,
@@ -175,7 +204,7 @@ class RagAdjudicationEvaluationRunner:
                 error,
                 [cast(UUID, row["id"]) for row in gold_rows],
             )
-            return 0, len(gold_rows), False
+            return _CaseScoreCounts(exact=0, fuzzy=0, gold=len(gold_rows), predictions=0, succeeded=False)
 
     def _load_case(self, case_id: UUID) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         with self._engine.connect() as connection:
@@ -292,7 +321,14 @@ class RagAdjudicationEvaluationRunner:
                 ).scalar_one(),
             )
 
-    def _finish_case(self, result_id: UUID, latency_ms: int, state: AdjudicationAgentState, token_usage: int, scores: list[Any]) -> None:
+    def _finish_case(
+        self,
+        result_id: UUID,
+        latency_ms: int,
+        state: AdjudicationAgentState,
+        token_usage: int,
+        scores: CorrectionScoringResult,
+    ) -> None:
         with self._engine.begin() as connection:
             connection.execute(
                 text(
@@ -317,14 +353,18 @@ class RagAdjudicationEvaluationRunner:
                 text("delete from rag_adjudication_evaluation_correction_results where case_result_id=:id"),
                 {"id": result_id},
             )
-            for score in scores:
+            connection.execute(
+                text("delete from rag_adjudication_evaluation_prediction_results where case_result_id=:id"),
+                {"id": result_id},
+            )
+            for score in scores.corrections:
                 connection.execute(
                     text(
                         """
                         insert into rag_adjudication_evaluation_correction_results (
                             case_result_id, gold_correction_id, matched_proposal_id,
-                            passed, actual_expression
-                        ) values (:result, :gold, :proposal, :passed, :actual)
+                            passed, actual_expression, details
+                        ) values (:result, :gold, :proposal, :passed, :actual, cast(:details as jsonb))
                         """
                     ),
                     {
@@ -333,6 +373,44 @@ class RagAdjudicationEvaluationRunner:
                         "proposal": score.matched_proposal_id,
                         "passed": score.passed,
                         "actual": score.actual_expression,
+                        "details": _json(
+                            {
+                                "match_kind": score.match_kind,
+                                "similarity": score.similarity,
+                                "matched_accepted_expression": score.matched_accepted_expression,
+                                "actual_local_text": score.actual_local_text,
+                                "expected_local_text": score.expected_local_text,
+                            }
+                        ),
+                    },
+                )
+            for score in scores.predictions:
+                prediction = score.prediction
+                connection.execute(
+                    text(
+                        """
+                        insert into rag_adjudication_evaluation_prediction_results (
+                            case_result_id, matched_gold_correction_id, proposal_id,
+                            evidence_index, chunk_id, start_char, end_char,
+                            original_expression, resolved_expression, match_kind, similarity
+                        ) values (
+                            :result, :gold, :proposal, :evidence_index, :chunk_id,
+                            :start_char, :end_char, :original, :resolved, :match_kind, :similarity
+                        )
+                        """
+                    ),
+                    {
+                        "result": result_id,
+                        "gold": score.matched_gold_id,
+                        "proposal": prediction.proposal_id,
+                        "evidence_index": prediction.evidence_index,
+                        "chunk_id": prediction.chunk_id,
+                        "start_char": prediction.start_char,
+                        "end_char": prediction.end_char,
+                        "original": prediction.original_expression,
+                        "resolved": prediction.resolved_expression,
+                        "match_kind": score.match_kind,
+                        "similarity": score.similarity,
                     },
                 )
 
@@ -350,6 +428,10 @@ class RagAdjudicationEvaluationRunner:
             )
             connection.execute(
                 text("delete from rag_adjudication_evaluation_correction_results where case_result_id=:id"),
+                {"id": result_id},
+            )
+            connection.execute(
+                text("delete from rag_adjudication_evaluation_prediction_results where case_result_id=:id"),
                 {"id": result_id},
             )
             for gold_id in gold_ids:
@@ -406,6 +488,37 @@ class RagAdjudicationEvaluationRunner:
 
 def _json(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
+
+
+def build_metric_rows(exact: int, fuzzy: int, gold: int, predictions: int) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for scope, true_positive in (("strict", exact), ("relaxed", exact + fuzzy)):
+        false_positive = predictions - true_positive
+        false_negative = gold - true_positive
+        precision = true_positive / predictions if predictions else 0.0
+        recall = true_positive / gold if gold else 0.0
+        f1_denominator = 2 * true_positive + false_positive + false_negative
+        f1 = 2 * true_positive / f1_denominator if f1_denominator else 0.0
+        details = _json(
+            {
+                "scope": scope,
+                "true_positive": true_positive,
+                "false_positive": false_positive,
+                "false_negative": false_negative,
+                "exact_count": exact,
+                "fuzzy_count": fuzzy,
+                "gold_count": gold,
+                "prediction_count": predictions,
+            }
+        )
+        rows.extend(
+            [
+                {"name": f"correction_precision_{scope}", "value": precision, "passed": true_positive, "total": predictions, "details": details},
+                {"name": f"correction_recall_{scope}", "value": recall, "passed": true_positive, "total": gold, "details": details},
+                {"name": f"correction_f1_{scope}", "value": f1, "passed": true_positive, "total": f1_denominator, "details": details},
+            ]
+        )
+    return rows
 
 
 def _node_started(state: RagGraphState, node: str) -> float:

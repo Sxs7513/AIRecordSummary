@@ -5,7 +5,7 @@ from datetime import datetime
 from typing import Any, cast
 from uuid import UUID
 
-from sqlalchemy import Engine, RowMapping, text
+from sqlalchemy import Connection, Engine, RowMapping, text
 
 from l2_core.generation.contracts import (
     CreateGenerationCommand,
@@ -73,12 +73,21 @@ class GenerationEventStore:
 
     def project_terminal(self, snapshot: GenerationSnapshot, command: CreateGenerationCommand) -> None:
         """Idempotently materialize one terminal Kafka event for long-term queries."""
+        with self._engine.begin() as connection:
+            self.project_terminal_in_transaction(connection, snapshot, command)
+
+    def project_terminal_in_transaction(
+        self,
+        connection: Connection,
+        snapshot: GenerationSnapshot,
+        command: CreateGenerationCommand,
+    ) -> bool:
+        """Materialize a terminal snapshot inside the caller's transaction."""
         if not snapshot.status.is_terminal:
             raise ValueError("Only terminal generation snapshots can be projected")
-        with self._engine.begin() as connection:
-            connection.execute(
-                text(
-                    """
+        inserted = connection.execute(
+            text(
+                """
                     insert into generation_runs (
                         id, kind, priority, idempotency_key, parent_type, parent_id, owner_user_id,
                         subject_type, subject_id, status, input_payload, output_payload,
@@ -88,33 +97,32 @@ class GenerationEventStore:
                         :subject_type, :subject_id, :status, cast(:input_payload as jsonb), cast(:output_payload as jsonb),
                         :error_code, :error_message, :created_at, :started_at, :finished_at, :updated_at
                     )
-                    on conflict (id) do update set
-                        status = excluded.status, output_payload = excluded.output_payload,
-                        error_code = excluded.error_code, error_message = excluded.error_message,
-                        started_at = excluded.started_at, finished_at = excluded.finished_at, updated_at = excluded.updated_at
+                    on conflict (id) do nothing
+                    returning id
                     """
-                ),
-                {
-                    "id": snapshot.id,
-                    "kind": snapshot.kind.value,
-                    "priority": snapshot.priority.value,
-                    "idempotency_key": command.idempotency_key,
-                    "parent_type": command.parent_type,
-                    "parent_id": command.parent_id,
-                    "owner_user_id": command.access_scope.owner_user_id,
-                    "subject_type": command.access_scope.subject_type,
-                    "subject_id": command.access_scope.subject_id,
-                    "status": snapshot.status.value,
-                    "input_payload": json.dumps(command.input),
-                    "output_payload": json.dumps(snapshot.output),
-                    "error_code": snapshot.error_code,
-                    "error_message": snapshot.error_message,
-                    "created_at": snapshot.created_at,
-                    "started_at": snapshot.started_at,
-                    "finished_at": snapshot.finished_at,
-                    "updated_at": snapshot.updated_at,
-                },
-            )
+            ),
+            {
+                "id": snapshot.id,
+                "kind": snapshot.kind.value,
+                "priority": snapshot.priority.value,
+                "idempotency_key": command.idempotency_key,
+                "parent_type": command.parent_type,
+                "parent_id": command.parent_id,
+                "owner_user_id": command.access_scope.owner_user_id,
+                "subject_type": command.access_scope.subject_type,
+                "subject_id": command.access_scope.subject_id,
+                "status": snapshot.status.value,
+                "input_payload": json.dumps(command.input),
+                "output_payload": json.dumps(snapshot.output),
+                "error_code": snapshot.error_code,
+                "error_message": snapshot.error_message,
+                "created_at": snapshot.created_at,
+                "started_at": snapshot.started_at,
+                "finished_at": snapshot.finished_at,
+                "updated_at": snapshot.updated_at,
+            },
+        )
+        return inserted.scalar_one_or_none() is not None
 
     @staticmethod
     def _snapshot(row: RowMapping) -> GenerationSnapshot:

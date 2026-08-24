@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 from typing import cast
+from unittest.mock import MagicMock
 from uuid import uuid4, uuid5
 
 from l1_foundation.infrastructure.storage.local import LocalStorage
@@ -109,16 +110,16 @@ def test_queued_processing_state_is_immediately_renderable_by_recording_detail()
 def test_recording_deletion_requests_processing_cancellation() -> None:
     recording_id = uuid4()
     producer = _Producer()
-    service = object.__new__(RecordingService)
-    service._processing_publisher = ProcessingCommandPublisher(producer)  # type: ignore[arg-type]  # pyright: ignore[reportPrivateUsage]
+    publisher = ProcessingCommandPublisher(producer)  # type: ignore[arg-type]
+    connection = MagicMock()
 
-    asyncio.run(service._request_processing_cancel(recording_id))  # pyright: ignore[reportPrivateUsage]
+    publisher.enqueue_cancel(connection, recording_id)
 
-    [(topic, key, event)] = producer.messages
-    assert topic == "processing.cancel"
-    assert key == str(recording_id)
-    assert event.event_type == "processing.cancel.requested"
-    assert event.payload == {"subject_type": "recording", "subject_id": str(recording_id)}
+    assert producer.messages == []
+    parameters = connection.execute.call_args.args[1]
+    assert parameters["topic"] == "processing.cancel"
+    assert parameters["partition_key"] == str(recording_id)
+    assert '"event_type":"processing.cancel.requested"' in parameters["payload"]
 
 
 def test_embedding_retry_publishes_a_dedicated_command_with_existing_chunks() -> None:
@@ -177,9 +178,14 @@ def test_embedding_retry_reuses_the_current_processing_chunk_artifact(tmp_path: 
     service._storage = storage  # pyright: ignore[reportPrivateUsage]
     service._processing_publisher = ProcessingCommandPublisher(producer)  # type: ignore[arg-type]  # pyright: ignore[reportPrivateUsage]
     service._processing_state_store = cast(SyncRedisStreamStore, state_store)  # pyright: ignore[reportPrivateUsage]
+    connection = MagicMock()
+    engine = MagicMock()
+    engine.begin.return_value.__enter__.return_value = connection
+    service._engine = engine  # pyright: ignore[reportPrivateUsage]
 
     stage_run_id = asyncio.run(service.retry_embedding_indexing(cast(CurrentUser, object()), recording_id))
 
     assert stage_run_id == uuid5(processing_id, "embedding_indexing")
-    [(_, _, event)] = producer.messages
-    assert event.event_type == "processing.embedding-index.requested"
+    assert producer.messages == []
+    parameters = connection.execute.call_args.args[1]
+    assert parameters["event_type"] == "processing.embedding-index.requested"

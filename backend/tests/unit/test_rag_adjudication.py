@@ -53,19 +53,21 @@ def test_adjudication_proposal_requires_a_search_query() -> None:
         )
 
 
-def test_candidate_decision_migrates_old_checkpoint_score_but_schema_requires_new_score() -> None:
+def test_candidate_score_belongs_to_proposal_and_legacy_decision_score_is_discarded() -> None:
     decision = CandidateDecision.model_validate(
         {
             "proposal_id": "proposal-1",
             "action": "accept",
             "confidence": 0.82,
+            "candidate_score": 0.7,
             "reason": "旧 checkpoint",
             "reconstruct_focus": "",
         }
     )
 
-    assert decision.candidate_score == 0.82
-    assert "candidate_score" in CandidateDecision.model_json_schema()["required"]
+    assert "candidate_score" not in decision.model_dump()
+    assert "candidate_score" not in CandidateDecision.model_json_schema()["properties"]
+    assert "candidate_score" in AdjudicationProposal.model_json_schema()["required"]
 
 
 def test_reject_decision_may_include_reconstruction_focus() -> None:
@@ -522,6 +524,7 @@ def test_candidate_actions_keep_highest_scoring_non_overlapping_accept(caplog: p
             original_expression="USB20",
             proposed_expression="USB 2.0",
             expression_type="proper_noun",
+            candidate_score=0.9,
             search_query="USB 2.0",
         ),
         AdjudicationProposal(
@@ -532,6 +535,7 @@ def test_candidate_actions_keep_highest_scoring_non_overlapping_accept(caplog: p
             original_expression="20",
             proposed_expression="2.0",
             expression_type="proper_noun",
+            candidate_score=0.95,
             search_query="USB 2.0",
         ),
     ]
@@ -563,6 +567,7 @@ def test_candidate_actions_keep_highest_scoring_non_overlapping_accept(caplog: p
     )
     agent = object.__new__(EvidenceAdjudicationAgent)
     agent._max_searches = 3  # pyright: ignore[reportPrivateUsage]
+    agent._auto_resolve_confidence = 0.9  # pyright: ignore[reportPrivateUsage]
     agent._grounded_search_client = None  # pyright: ignore[reportPrivateUsage]
 
     async def reconstruct(*_: object) -> LlmGenerateResult:
@@ -708,6 +713,7 @@ def test_candidate_actions_accept_reject_and_run_search_with_reconstruction_in_p
     agent = object.__new__(EvidenceAdjudicationAgent)
     agent._grounded_search_client = SearchClient()  # type: ignore[assignment]  # pyright: ignore[reportPrivateUsage]
     agent._max_searches = 2  # pyright: ignore[reportPrivateUsage]
+    agent._auto_resolve_confidence = 0.95  # pyright: ignore[reportPrivateUsage]
 
     transition = asyncio.run(agent.execute_candidate_actions(state, context, reconstruct=reconstruct))
     updated = transition.state.cases[0]
@@ -744,7 +750,13 @@ def test_candidate_actions_choose_by_audit_group_priority_and_score() -> None:
         ]
     )
 
-    def proposal(proposal_id: str, audit_item_id: str, original: str, replacement: str) -> AdjudicationProposal:
+    def proposal(
+        proposal_id: str,
+        audit_item_id: str,
+        original: str,
+        replacement: str,
+        candidate_score: float,
+    ) -> AdjudicationProposal:
         return AdjudicationProposal(
             id=proposal_id,
             audit_item_id=audit_item_id,
@@ -753,16 +765,17 @@ def test_candidate_actions_choose_by_audit_group_priority_and_score() -> None:
             original_expression=original,
             proposed_expression=replacement,
             expression_type="number" if audit_item_id == "audit-time" else "proper_noun",
+            candidate_score=candidate_score,
             search_query=f"{replacement} specification",
         )
 
     proposals = [
-        proposal("rf-low", "audit-rf", "RF", "AUX"),
-        proposal("rf-high", "audit-rf", "RF", "I2C"),
-        proposal("time-reject", "audit-time", "五秒", "五毫秒"),
-        proposal("time-search", "audit-time", "五秒", "五微秒"),
-        proposal("name-search-1", "audit-name", "名称", "MIPI"),
-        proposal("name-search-2", "audit-name", "名称", "LVDS"),
+        proposal("rf-low", "audit-rf", "RF", "AUX", 0.4),
+        proposal("rf-high", "audit-rf", "RF", "I2C", 0.95),
+        proposal("time-reject", "audit-time", "五秒", "五毫秒", 0.2),
+        proposal("time-search", "audit-time", "五秒", "五微秒", 0.85),
+        proposal("name-search-1", "audit-name", "名称", "MIPI", 0.6),
+        proposal("name-search-2", "audit-name", "名称", "LVDS", 0.7),
     ]
     decisions = CandidateDecisionBatch(
         decisions=[
@@ -824,6 +837,7 @@ def test_candidate_actions_choose_by_audit_group_priority_and_score() -> None:
     agent = object.__new__(EvidenceAdjudicationAgent)
     agent._grounded_search_client = SearchClient()  # type: ignore[assignment]  # pyright: ignore[reportPrivateUsage]
     agent._max_searches = 3  # pyright: ignore[reportPrivateUsage]
+    agent._auto_resolve_confidence = 0.9  # pyright: ignore[reportPrivateUsage]
 
     transition = asyncio.run(agent.execute_candidate_actions(state, context, reconstruct=reconstruct))
     updated = transition.state.cases[0]
@@ -833,7 +847,7 @@ def test_candidate_actions_choose_by_audit_group_priority_and_score() -> None:
     assert searched == ["time-search", "name-search-1", "name-search-2"]
     assert [finding.proposal_id for finding in updated.findings] == searched
     assert updated.accepted_proposal_ids == ["rf-high"]
-    assert updated.rejected_proposal_ids == ["time-reject"]
+    assert updated.rejected_proposal_ids == ["rf-low", "time-reject"]
     assert updated.decision_history == [decisions]
 
 

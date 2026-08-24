@@ -321,8 +321,3 @@ class ProcessingCommandHandler:
             payload=state,
         )
         await self._kafka_producer.publish(Topics.PROCESSING_EVENTS, str(item.processing_id), envelope)
-        await self._kafka_producer.publish(
-            Topics.PROCESSING_STATE,
-            str(item.processing_id),
-            envelope.model_copy(update={"event_type": "processing.state.changed"}),
-        )

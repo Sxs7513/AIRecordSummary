@@ -4,7 +4,7 @@ import asyncio
 import logging
 
 from l1_foundation.infrastructure.db.session import create_database_engine
-from l1_foundation.messaging import KafkaEventConsumer, KafkaEventProducer, SyncKafkaEventProducer, Topics
+from l1_foundation.messaging import KafkaEventConsumer, KafkaEventProducer, OutboxRepository, SyncKafkaEventProducer, Topics
 from l1_foundation.observability import ObservabilityClient
 from l1_foundation.pipeline.runtime.artifact_store import ArtifactStore
 from l1_foundation.settings import get_settings
@@ -16,9 +16,8 @@ from l2_core.conversations.history_store import ConversationHistoryStore
 from l2_core.conversations.service import ConversationService
 from l2_core.generation.redis_runtime import GenerationRedisRuntime
 from l2_core.generation.service import GenerationService
-from l2_core.generation.store import GenerationEventStore
 from l2_core.rag.service import RagService
-from l3_app.generation_worker.worker import GenerationCancelHandler, GenerationCommandHandler, GenerationResultProjector
+from l3_app.generation_worker.worker import GenerationCancelHandler, GenerationCommandHandler, GenerationTerminalCommitter
 
 
 async def run() -> None:
@@ -71,13 +70,6 @@ async def run() -> None:
         client_id=f"{settings.kafka_client_id}-generation-worker",
         max_poll_interval_ms=settings.kafka_consumer_max_poll_interval_ms,
     )
-    projector_consumer = KafkaEventConsumer(
-        [Topics.GENERATION_EVENTS, Topics.GENERATION_PROJECTION_RETRY],
-        bootstrap_servers=settings.kafka_bootstrap_servers,
-        group_id="generation-postgres-projector-v1",
-        client_id=f"{settings.kafka_client_id}-generation-projector",
-        max_poll_interval_ms=settings.kafka_consumer_max_poll_interval_ms,
-    )
     cancel_consumer = KafkaEventConsumer(
         [Topics.GENERATION_CANCEL, Topics.GENERATION_CANCEL_RETRY],
         bootstrap_servers=settings.kafka_bootstrap_servers,
@@ -97,15 +89,15 @@ async def run() -> None:
         summary_embedding_indexer=build_summary_embedding_indexer(settings, sync_worker_client),
     )
     conversation_service = ConversationService(engine, generation_service, conversation_history_store)
+    terminal_committer = GenerationTerminalCommitter(generation_service, conversation_service, OutboxRepository())
     handler = GenerationCommandHandler(
         rag_service,
         generation_service,
         conversation_service,
-        compute_producer,
         summary_service,
+        terminal_committer,
     )
     await consumer.start()
-    await projector_consumer.start()
     await cancel_consumer.start()
     command_task = asyncio.create_task(
         consumer.run(
@@ -116,17 +108,7 @@ async def run() -> None:
         ),
         name="generation-command-consumer",
     )
-    projector = GenerationResultProjector(GenerationEventStore(engine))
-    projector_task = asyncio.create_task(
-        projector_consumer.run(
-            projector.handle,
-            producer=compute_producer,
-            retry_topic=Topics.GENERATION_PROJECTION_RETRY,
-            dlq_topic=Topics.GENERATION_PROJECTION_DLQ,
-        ),
-        name="generation-result-projector",
-    )
-    cancel_handler = GenerationCancelHandler(generation_service, compute_producer, conversation_service)
+    cancel_handler = GenerationCancelHandler(generation_service, compute_producer, conversation_service, terminal_committer)
     cancel_task = asyncio.create_task(
         cancel_consumer.run(
             cancel_handler.handle,
@@ -137,14 +119,12 @@ async def run() -> None:
         name="generation-cancel-consumer",
     )
     try:
-        await asyncio.gather(command_task, projector_task, cancel_task)
+        await asyncio.gather(command_task, cancel_task)
     finally:
         command_task.cancel()
-        projector_task.cancel()
         cancel_task.cancel()
-        await asyncio.gather(command_task, projector_task, cancel_task, return_exceptions=True)
+        await asyncio.gather(command_task, cancel_task, return_exceptions=True)
         await consumer.stop()
-        await projector_consumer.stop()
         await cancel_consumer.stop()
         await observability.close()
         await worker_client.close()

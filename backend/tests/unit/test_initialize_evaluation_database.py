@@ -46,6 +46,7 @@ def test_evaluation_schema_is_additive_and_separate_from_base_schema() -> None:
     assert "create table if not exists rag_adjudication_evaluation_correction_drafts" in schema
     assert "create table if not exists rag_adjudication_evaluation_cases" in schema
     assert "create table if not exists rag_adjudication_evaluation_case_results" in schema
+    assert "create table if not exists rag_adjudication_evaluation_prediction_results" in schema
     assert "create table if not exists rag_adjudication_evaluation_metric_values" in schema
     assert "model_version_ids uuid[]" not in schema
     assert "rag_evaluation_evidence_drafts_source_recording_id_fkey" in schema

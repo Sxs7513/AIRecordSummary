@@ -21,7 +21,6 @@ from l2_core.conversations.contracts import Conversation, ConversationBusyError,
 from l2_core.generation.contracts import GenerationEvent, GenerationSnapshot, TextBlock
 from l2_core.generation.service import GenerationService
 from l2_core.rag.adjudication.contracts import ClaimConfirmationDecision
-from l2_core.rag.queue import GenerationCommandPublisher, RagGenerationWorkItem
 from l2_core.rag.service import RagService
 from production_dependencies import (
     ConversationServiceDependency,
@@ -66,10 +65,6 @@ def _rag_service(request: Request) -> RagService:
     return request.app.state.rag_service
 
 
-def _generation_publisher(request: Request) -> GenerationCommandPublisher:
-    return request.app.state.generation_command_publisher
-
-
 @router.get("", response_model=list[Conversation])
 def list_conversations(service: ConversationServiceDependency, user: CurrentUserDependency) -> list[Conversation]:
     return service.list(user)
@@ -95,32 +90,16 @@ async def start_conversation_turn(
 ) -> StreamingResponse:
     """Create the first turn atomically and stream its generation on this response."""
     try:
-        conversation, user_message, assistant_message, history, created = conversation_service.create_initial_turn(
+        conversation, user_message, assistant_message, _history, _created = conversation_service.create_initial_turn(
             user,
             payload.client_conversation_id,
             payload.content_blocks,
             payload.client_message_id,
             payload.limit,
+            _rag_service(request).accessible_recording_ids(user),
         )
         if assistant_message.generation_run_id is None:
             raise RuntimeError("Assistant message is missing its generation run")
-        if created:
-            rag_service = _rag_service(request)
-            try:
-                await _generation_publisher(request).submit_rag(
-                    RagGenerationWorkItem(
-                        run_id=assistant_message.generation_run_id,
-                        workspace_id=user.current_workspace_id,
-                        query="".join(block.value for block in payload.content_blocks),
-                        limit=payload.limit,
-                        scope_recording_ids=rag_service.accessible_recording_ids(user),
-                        history=history,
-                        conversation_message_id=assistant_message.id,
-                        generation=conversation_service.generation_command(assistant_message.generation_run_id),
-                    )
-                )
-            except Exception as error:
-                conversation_service.fail_generation_submission(assistant_message.generation_run_id, str(error) or type(error).__name__)
         resume_after = _resume_after(None, last_event_id)
         cursor = resume_after if resume_after is not None else generation_service.cursor(assistant_message.generation_run_id)
         snapshot = generation_service.get(assistant_message.generation_run_id)
@@ -210,35 +189,16 @@ async def resume_conversation_generation(
     user: CurrentUserDependency,
 ) -> ConversationTurnResponse:
     try:
-        user_message, assistant_message, history = service.resume_generation(
+        user_message, assistant_message, _history = service.resume_generation(
             user,
             conversation_id,
             generation_run_id,
             payload.client_request_id,
             reuse_checkpoint=payload.mode == "resume",
+            scope_recording_ids=_rag_service(request).accessible_recording_ids(user),
         )
         if assistant_message.generation_run_id is None:
             raise RuntimeError("Assistant message is missing its resumed generation run")
-        command = service.generation_command(assistant_message.generation_run_id)
-        query = str(command.input["query"])
-        limit = int(command.input.get("limit", 10))
-        try:
-            await _generation_publisher(request).submit_rag(
-                RagGenerationWorkItem(
-                    run_id=assistant_message.generation_run_id,
-                    workspace_id=user.current_workspace_id,
-                    query=query,
-                    limit=limit,
-                    scope_recording_ids=_rag_service(request).accessible_recording_ids(user),
-                    history=history,
-                    conversation_message_id=assistant_message.id,
-                    resume_from_generation_id=generation_run_id if payload.mode == "resume" else None,
-                    generation=command,
-                )
-            )
-        except Exception as error:
-            service.fail_generation_submission(assistant_message.generation_run_id, str(error) or type(error).__name__)
-            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Generation queue unavailable") from error
         return ConversationTurnResponse(
             user_message=user_message,
             assistant_message=assistant_message,
@@ -267,35 +227,15 @@ async def submit_adjudication_decision(
 ) -> ConversationTurnResponse:
     try:
         decision = ClaimConfirmationDecision.model_validate(payload.model_dump())
-        user_message, assistant_message, history = service.submit_adjudication_decision(
+        user_message, assistant_message, _history = service.submit_adjudication_decision(
             user,
             conversation_id,
             generation_run_id,
             decision,
+            _rag_service(request).accessible_recording_ids(user),
         )
         if assistant_message.generation_run_id is None:
             raise RuntimeError("Assistant message is missing its adjudication generation run")
-        command = service.generation_command(assistant_message.generation_run_id)
-        query = str(command.input["query"])
-        limit = int(command.input.get("limit", 10))
-        try:
-            await _generation_publisher(request).submit_rag(
-                RagGenerationWorkItem(
-                    run_id=assistant_message.generation_run_id,
-                    workspace_id=user.current_workspace_id,
-                    query=query,
-                    limit=limit,
-                    scope_recording_ids=_rag_service(request).accessible_recording_ids(user),
-                    history=history,
-                    conversation_message_id=assistant_message.id,
-                    resume_from_generation_id=generation_run_id,
-                    adjudication_user_decision=decision,
-                    generation=command,
-                )
-            )
-        except Exception as error:
-            service.fail_generation_submission(assistant_message.generation_run_id, str(error) or type(error).__name__)
-            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Generation queue unavailable") from error
         return ConversationTurnResponse(
             user_message=user_message,
             assistant_message=assistant_message,
@@ -329,26 +269,16 @@ async def send_message(
     user: CurrentUserDependency,
 ) -> ConversationTurnResponse:
     try:
-        user_message, assistant_message, history = service.create_turn(user, conversation_id, payload.content_blocks, payload.client_message_id, payload.limit)
+        user_message, assistant_message, _history = service.create_turn(
+            user,
+            conversation_id,
+            payload.content_blocks,
+            payload.client_message_id,
+            payload.limit,
+            _rag_service(request).accessible_recording_ids(user),
+        )
         if assistant_message.generation_run_id is None:
             raise RuntimeError("Assistant message is missing its generation run")
-        rag_service = _rag_service(request)
-        try:
-            await _generation_publisher(request).submit_rag(
-                RagGenerationWorkItem(
-                    run_id=assistant_message.generation_run_id,
-                    workspace_id=user.current_workspace_id,
-                    query="".join(block.value for block in payload.content_blocks),
-                    limit=payload.limit,
-                    scope_recording_ids=rag_service.accessible_recording_ids(user),
-                    history=history,
-                    conversation_message_id=assistant_message.id,
-                    generation=service.generation_command(assistant_message.generation_run_id),
-                )
-            )
-        except Exception as error:
-            service.fail_generation_submission(assistant_message.generation_run_id, str(error) or type(error).__name__)
-            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Generation queue unavailable") from error
         return ConversationTurnResponse(
             user_message=user_message,
             assistant_message=assistant_message,

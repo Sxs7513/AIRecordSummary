@@ -630,7 +630,7 @@ class EvidenceAdjudicationAgent:
         selected_accepted_ids = {decision.proposal_id for decision in selected_accepted}
         if overlap_rejected_ids:
             logger.warning(
-                "Evidence 裁决 Agent 接受候选重叠，保留更高 candidate_score run_id=%s case=%d discarded_proposal_ids=%s",
+                "Evidence 裁决 Agent 接受候选重叠，保留更高 candidate_score（来自构建阶段） run_id=%s case=%d discarded_proposal_ids=%s",
                 context.run_id,
                 state.current_case,
                 sorted(overlap_rejected_ids),
@@ -662,10 +662,12 @@ class EvidenceAdjudicationAgent:
         rejected = [
             decision
             for decision in batch.decisions
-            if decision.action == "reject" or decision.proposal_id in overlap_rejected_ids
+            if decision.action == "reject"
+            or decision.proposal_id in overlap_rejected_ids
+            or (decision.action == "accept" and decision.confidence < self._auto_resolve_confidence)
         ]
         accepted_ids = {decision.proposal_id for decision in accepted}
-        rejected_ids = {decision.proposal_id for decision in rejected}
+        rejected_ids = [decision.proposal_id for decision in rejected]
 
         overlays = list(state.overlays)
         for decision in accepted:
@@ -914,24 +916,32 @@ class EvidenceAdjudicationAgent:
             if not spans:
                 raise ValueError("accepted candidate has no valid target spans")
 
-    @staticmethod
     def _select_non_overlapping_accepted(
+        self,
         state: AdjudicationAgentState,
         case: EvidenceAdjudicationCaseState,
         batch: CandidateDecisionBatch,
         context: AdjudicationCaseContext,
     ) -> tuple[list[CandidateDecision], set[str]]:
-        """Keep the highest-scoring accepted candidate when overlays target overlapping spans."""
+        """Keep confident accepts, preferring the proposal score for overlaps."""
 
         proposals_by_id = {proposal.id: proposal for proposal in case.proposals}
         by_audit: dict[str, list[CandidateDecision]] = {}
         for decision in batch.decisions:
-            if decision.action != "accept":
+            if decision.action != "accept" or decision.confidence < self._auto_resolve_confidence:
                 continue
             by_audit.setdefault(proposals_by_id[decision.proposal_id].audit_item_id, []).append(decision)
-        winners = [max(group, key=lambda decision: decision.candidate_score) for group in by_audit.values()]
+        winners = [
+            max(group, key=lambda decision: proposals_by_id[decision.proposal_id].candidate_score)
+            for group in by_audit.values()
+        ]
         decision_order = {decision.proposal_id: index for index, decision in enumerate(batch.decisions)}
-        winners.sort(key=lambda decision: (-decision.candidate_score, decision_order[decision.proposal_id]))
+        winners.sort(
+            key=lambda decision: (
+                -proposals_by_id[decision.proposal_id].candidate_score,
+                decision_order[decision.proposal_id],
+            )
+        )
 
         occupied: dict[tuple[int, str], list[tuple[int, int]]] = {}
         for overlay in state.overlays:
@@ -942,7 +952,7 @@ class EvidenceAdjudicationAgent:
         discarded_ids: set[str] = set()
         for decision in winners:
             proposal = proposals_by_id[decision.proposal_id]
-            spans = EvidenceAdjudicationAgent._proposal_target_spans(context.evidence, case, proposal)
+            spans = self._proposal_target_spans(context.evidence, case, proposal)
             if not spans:
                 raise ValueError("accepted candidate has no valid target spans")
             key = (proposal.evidence_index, proposal.chunk_id)

@@ -40,6 +40,10 @@ class GenerationEventSink:
     def has_aggregate_message(self) -> bool:
         return self._aggregate_block() is not None
 
+    @property
+    def snapshot(self) -> GenerationSnapshot:
+        return self._snapshot
+
     def start_aggregate_message(self) -> None:
         if self._is_fenced():
             return
@@ -68,8 +72,7 @@ class GenerationEventSink:
                     "sub_message": existing.sub_message.model_copy(
                         update={
                             "sub_message_list": [
-                                item.model_copy(update={"status": "streaming", "error": None})
-                                for item in existing.sub_message.sub_message_list
+                                item.model_copy(update={"status": "streaming", "error": None}) for item in existing.sub_message.sub_message_list
                             ]
                         }
                     )
@@ -157,9 +160,7 @@ class GenerationEventSink:
             block = TextBlock(value=self._pending_text)
             self._pending_text = ""
             self._blocks.append(block)
-            self._snapshot = self._snapshot.model_copy(
-                update={"blocks": list(self._blocks), "updated_at": datetime.now(UTC)}
-            )
+            self._snapshot = self._snapshot.model_copy(update={"blocks": list(self._blocks), "updated_at": datetime.now(UTC)})
             self._publish("content.delta", {"blocks": [block.model_dump(mode="json")]})
         for sub_message_id in list(self._pending_aggregate_text):
             self._flush_aggregate_text(sub_message_id)
@@ -173,8 +174,22 @@ class GenerationEventSink:
         final_text: str | None = None,
         preserve_checkpoints: bool = False,
     ) -> None:
-        if self._is_fenced():
+        snapshot = self.prepare_succeed(output, sources, final_text=final_text)
+        if snapshot is None:
             return
+        self._publish("output.final", {"output": snapshot.output, "sources": snapshot.sources})
+        self._redis_runtime.expire_terminal_generation(self._run_id, preserve_checkpoints=preserve_checkpoints)
+
+    def prepare_succeed(
+        self,
+        output: dict[str, object],
+        sources: list[dict[str, object]] | None = None,
+        *,
+        final_text: str | None = None,
+    ) -> GenerationSnapshot | None:
+        """Build a succeeded terminal snapshot without making it visible in Redis."""
+        if self._is_fenced():
+            return None
         if final_text is None:
             self.flush()
         else:
@@ -193,12 +208,19 @@ class GenerationEventSink:
                 "updated_at": now,
             }
         )
-        self._publish("output.final", {"output": self._snapshot.output, "sources": self._snapshot.sources})
-        self._redis_runtime.expire_terminal_generation(self._run_id, preserve_checkpoints=preserve_checkpoints)
+        return self._snapshot
 
     def fail(self, code: str, message: str, retryable: bool = False) -> None:
-        if self._is_fenced():
+        snapshot = self.prepare_fail(code, message, retryable)
+        if snapshot is None:
             return
+        self._publish("run.error", {"code": code, "message": message, "retryable": retryable})
+        self._redis_runtime.expire_terminal_generation(self._run_id, preserve_checkpoints=True)
+
+    def prepare_fail(self, code: str, message: str, retryable: bool = False) -> GenerationSnapshot | None:
+        """Build a failed terminal snapshot without making it visible in Redis."""
+        if self._is_fenced():
+            return None
         self.flush()
         self._mark_streaming_aggregate_variants("failed")
         now = datetime.now(UTC)
@@ -213,8 +235,16 @@ class GenerationEventSink:
                 "updated_at": now,
             }
         )
-        self._publish("run.error", {"code": code, "message": message, "retryable": retryable})
-        self._redis_runtime.expire_terminal_generation(self._run_id, preserve_checkpoints=True)
+        return self._snapshot
+
+    def prepare_cancel_if_requested(self) -> GenerationSnapshot | None:
+        active = self._redis_runtime.get_snapshot(self._run_id)
+        if active is not None and active[0].status == GenerationStatus.CANCELLED:
+            self._snapshot = active[0]
+            return self._snapshot
+        if not self._redis_runtime.is_cancel_requested(self._run_id):
+            return None
+        return self.prepare_cancel()
 
     def cancel_if_requested(self) -> bool:
         active = self._redis_runtime.get_snapshot(self._run_id)
@@ -227,6 +257,20 @@ class GenerationEventSink:
 
     def cancel(self, reason: str = "user_requested") -> GenerationSnapshot:
         """Immediately project an irreversible cancelled terminal state to Redis."""
+        active = self._redis_runtime.get_snapshot(self._run_id)
+        if active is not None and active[0].status.is_terminal:
+            self._snapshot = active[0]
+            return self._snapshot
+        snapshot = self.prepare_cancel(reason)
+        if snapshot.status != GenerationStatus.CANCELLED:
+            return snapshot
+        self._publish("run.cancelled", {"reason": reason}, allow_cancel_projection=True)
+        self._redis_runtime.expire_terminal_generation(self._run_id, preserve_checkpoints=True)
+        return self._snapshot
+
+    def prepare_cancel(self, reason: str = "user_requested") -> GenerationSnapshot:
+        """Build a cancelled terminal snapshot without making it visible in Redis."""
+        del reason
         active = self._redis_runtime.get_snapshot(self._run_id)
         if active is not None and active[0].status.is_terminal:
             self._snapshot = active[0]
@@ -244,8 +288,6 @@ class GenerationEventSink:
                 "updated_at": now,
             }
         )
-        self._publish("run.cancelled", {"reason": reason}, allow_cancel_projection=True)
-        self._redis_runtime.expire_terminal_generation(self._run_id, preserve_checkpoints=True)
         return self._snapshot
 
     def _publish(self, event_type: str, data: dict[str, object], *, allow_cancel_projection: bool = False) -> None:
@@ -292,11 +334,7 @@ class GenerationEventSink:
 
     def _store_aggregate_sub_message(self, block: AggreMessageBlock, updated: SubMessage) -> None:
         sub_messages = [updated if item.id == updated.id else item for item in block.sub_message.sub_message_list]
-        self._store_aggregate_block(
-            block.model_copy(
-                update={"sub_message": block.sub_message.model_copy(update={"sub_message_list": sub_messages})}
-            )
-        )
+        self._store_aggregate_block(block.model_copy(update={"sub_message": block.sub_message.model_copy(update={"sub_message_list": sub_messages})}))
 
     def _store_aggregate_block(self, block: AggreMessageBlock) -> None:
         replaced = False
@@ -345,8 +383,7 @@ class GenerationEventSink:
                 "sub_message": block.sub_message.model_copy(
                     update={
                         "sub_message_list": [
-                            item.model_copy(update={"status": status}) if item.status == "streaming" else item
-                            for item in block.sub_message.sub_message_list
+                            item.model_copy(update={"status": status}) if item.status == "streaming" else item for item in block.sub_message.sub_message_list
                         ]
                     }
                 )

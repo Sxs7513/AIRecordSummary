@@ -7,7 +7,7 @@ from typing import Any, cast
 from uuid import UUID, uuid4, uuid5
 
 from fastapi import UploadFile
-from sqlalchemy import Engine, RowMapping, text
+from sqlalchemy import Connection, Engine, RowMapping, text
 
 from l1_foundation.infrastructure.storage.local import LocalStorage
 from l1_foundation.pipeline.contracts import ArtifactRef, PipelineRunId, StageRunId
@@ -69,54 +69,46 @@ class RecordingService:
         )
         recording_created = False
         try:
-            recording, recording_created = self._insert_recording(
-                recording_id=recording_id,
-                workspace_id=user.current_workspace_id,
-                owner_user_id=user.id,
-                title=title.strip() if title and title.strip() else file_name,
-                file_name=file_name,
-                storage_path=storage_path,
-                location=location.strip() if location and location.strip() else None,
-                mime_type=upload.content_type or "application/octet-stream",
-                file_size_bytes=file_size_bytes,
-                content_md5=content_md5,
-                processing_id=processing_id,
-                pipeline_name=self._processing_definition.name,
-                pipeline_version=self._processing_definition.version,
-            )
+            with self._engine.begin() as connection:
+                recording, recording_created = self._insert_recording(
+                    connection=connection,
+                    recording_id=recording_id,
+                    workspace_id=user.current_workspace_id,
+                    owner_user_id=user.id,
+                    title=title.strip() if title and title.strip() else file_name,
+                    file_name=file_name,
+                    storage_path=storage_path,
+                    location=location.strip() if location and location.strip() else None,
+                    mime_type=upload.content_type or "application/octet-stream",
+                    file_size_bytes=file_size_bytes,
+                    content_md5=content_md5,
+                    processing_id=processing_id,
+                    pipeline_name=self._processing_definition.name,
+                    pipeline_version=self._processing_definition.version,
+                )
+                if recording_created:
+                    if self._processing_publisher is None:
+                        raise RuntimeError("Processing outbox publisher is unavailable")
+                    self._processing_publisher.enqueue_recording(
+                        connection,
+                        recording_id,
+                        self._processing_definition.name,
+                        self._processing_definition.version,
+                        self._source_audio_artifact(recording),
+                        processing_id=processing_id,
+                        workspace_id=user.current_workspace_id,
+                    )
             if not recording_created:
                 self._storage.remove_tree(f"recordings/{recording_id}")
                 return recording, PipelineRunId(processing_id)
-            source = self._source_audio_artifact(recording)
-            if self._processing_publisher is None:
-                raise RuntimeError("Processing Kafka publisher is unavailable")
-            run_id = PipelineRunId(
-                await self._processing_publisher.submit_recording(
-                    recording_id,
-                    self._processing_definition.name,
-                    self._processing_definition.version,
-                    source,
-                    processing_id=processing_id,
-                    workspace_id=user.current_workspace_id,
-                )
-            )
-            self._mark_processing(recording_id)
+            run_id = PipelineRunId(processing_id)
             self._remember_processing(recording_id, run_id)
         except Exception:
-            if recording_created:
-                self._delete_recording(recording_id)
             destination.unlink(missing_ok=True)
             raise
         finally:
             await upload.close()
         return recording, run_id
-
-    def _mark_processing(self, recording_id: RecordingId) -> None:
-        with self._engine.begin() as connection:
-            connection.execute(
-                text("update recordings set status = 'processing', error_message = null, updated_at = now() where id = :recording_id"),
-                {"recording_id": recording_id},
-            )
 
     def _remember_processing(self, recording_id: UUID, processing_id: UUID) -> None:
         if self._processing_state_store is None:
@@ -134,11 +126,6 @@ class RecordingService:
             f"recording:{recording_id}:processing",
             {"processing_id": str(processing_id)},
         )
-
-    async def _request_processing_cancel(self, recording_id: UUID) -> None:
-        if self._processing_publisher is None:
-            raise RuntimeError("Processing Kafka publisher is unavailable")
-        await self._processing_publisher.cancel_recording(recording_id)
 
     def list_recordings(self, user: CurrentUser, status: str | None, page: int, page_size: int) -> tuple[list[DatabaseRow], int, dict[str, int]]:
         normalized_status = status if status and status != "all" else None
@@ -272,7 +259,7 @@ class RecordingService:
                     .mappings()
                     .all()
                 ],
-                "pipeline_runs": self._runtime_pipeline_runs(recording_id),
+                "pipeline_runs": self._runtime_pipeline_runs(recording),
             }
 
     def get_recording_audio(self, user: CurrentUser, recording_id: UUID) -> DatabaseRow:
@@ -298,14 +285,36 @@ class RecordingService:
         self._access.require_view(recording_id, user)
         return {"run": self._runtime_run(state), "stages": self._runtime_stages(state)}
 
-    def _runtime_pipeline_runs(self, recording_id: UUID) -> list[DatabaseRow]:
-        if self._processing_state_store is None:
-            return []
-        mapping = self._processing_state_store.get_state(f"recording:{recording_id}:processing")
-        if mapping is None:
-            return []
-        state = self._processing_state_store.get_state(f"processing:{mapping['processing_id']}:state")
-        return [] if state is None else [self._runtime_run(state)]
+    def _runtime_pipeline_runs(self, recording: DatabaseRow) -> list[DatabaseRow]:
+        if self._processing_state_store is not None:
+            mapping = self._processing_state_store.get_state(f"recording:{recording['id']}:processing")
+            if mapping is not None and mapping.get("processing_id") is not None:
+                state = self._processing_state_store.get_state(f"processing:{mapping['processing_id']}:state")
+                if state is not None:
+                    return [self._runtime_run(state)]
+        return [self._database_pipeline_run(recording)]
+
+    @staticmethod
+    def _database_pipeline_run(recording: DatabaseRow) -> DatabaseRow:
+        status = {
+            "uploaded": "queued",
+            "processing": "running",
+            "completed": "succeeded",
+            "failed": "failed",
+        }[cast(str, recording["status"])]
+        terminal = status in {"succeeded", "failed"}
+        return {
+            "id": UUID(str(recording["processing_id"])),
+            "recording_id": UUID(str(recording["id"])),
+            "pipeline_name": recording["processing_pipeline_name"],
+            "pipeline_version": recording["processing_pipeline_version"],
+            "status": status,
+            "started_at": None if status == "queued" else recording["created_at"],
+            "finished_at": recording["updated_at"] if terminal else None,
+            "error_message": recording.get("error_message"),
+            "created_at": recording["created_at"],
+            "updated_at": recording["updated_at"],
+        }
 
     @staticmethod
     def _runtime_run(state: dict[str, Any]) -> DatabaseRow:
@@ -359,26 +368,36 @@ class RecordingService:
 
     async def retry_failed_recording(self, user: CurrentUser, recording_id: UUID) -> PipelineRunId:
         self._access.require_edit(recording_id, user)
-        with self._engine.connect() as connection:
+        processing_id = uuid4()
+        with self._engine.begin() as connection:
             row = (
                 connection.execute(
-                    text("select status, storage_path, file_name, mime_type from recordings where id = :recording_id"), {"recording_id": recording_id}
+                    text("select status, storage_path, file_name, mime_type from recordings where id = :recording_id for update"),
+                    {"recording_id": recording_id},
                 )
                 .mappings()
                 .one_or_none()
             )
-        if row is None:
-            raise RecordingNotFoundError(str(recording_id))
-        status = cast(str, row["status"])
-        if status != "failed":
-            raise RecordingNotRetryableError(f"Recording {recording_id} has status {status!r}, not 'failed'")
-        source = self._source_audio_artifact(dict(row))
-        if self._processing_publisher is None:
-            raise RuntimeError("Processing Kafka publisher is unavailable")
-        processing_id = await self._processing_publisher.submit_recording(
-            recording_id, self._processing_definition.name, self._processing_definition.version, source
-        )
-        self._mark_processing(RecordingId(recording_id))
+            if row is None:
+                raise RecordingNotFoundError(str(recording_id))
+            status = cast(str, row["status"])
+            if status != "failed":
+                raise RecordingNotRetryableError(f"Recording {recording_id} has status {status!r}, not 'failed'")
+            if self._processing_publisher is None:
+                raise RuntimeError("Processing outbox publisher is unavailable")
+            connection.execute(
+                text("update recordings set status = 'processing', error_message = null, updated_at = now() where id = :recording_id"),
+                {"recording_id": recording_id},
+            )
+            self._processing_publisher.enqueue_recording(
+                connection,
+                recording_id,
+                self._processing_definition.name,
+                self._processing_definition.version,
+                self._source_audio_artifact(dict(row)),
+                processing_id=processing_id,
+                workspace_id=user.current_workspace_id,
+            )
         self._remember_processing(recording_id, processing_id)
         return PipelineRunId(processing_id)
 
@@ -410,7 +429,8 @@ class RecordingService:
         )
         if chunk_ref is None or not self._storage.resolve(chunk_ref.uri).is_file():
             raise RecordingStageNotRetryableError("Search chunk artifact is no longer available")
-        await self._processing_publisher.retry_embedding_index(processing_id, recording_id, chunk_ref)
+        with self._engine.begin() as connection:
+            self._processing_publisher.enqueue_embedding_retry(connection, processing_id, recording_id, chunk_ref)
         return StageRunId(uuid5(processing_id, "embedding_indexing"))
 
     def update_recording(
@@ -513,8 +533,10 @@ class RecordingService:
     async def delete_recording(self, user: CurrentUser, recording_id: UUID) -> None:
         """Delete a recording, its database results, and all recording-owned storage trees."""
         self._access.require_edit(recording_id, user)
-        await self._request_processing_cancel(recording_id)
         with self._engine.begin() as connection:
+            if self._processing_publisher is None:
+                raise RuntimeError("Processing outbox publisher is unavailable")
+            self._processing_publisher.enqueue_cancel(connection, recording_id)
             exists = connection.execute(
                 text("delete from recordings where id = :recording_id returning id"), {"recording_id": recording_id}
             ).scalar_one_or_none()
@@ -526,6 +548,7 @@ class RecordingService:
 
     def _insert_recording(
         self,
+        connection: Connection,
         recording_id: RecordingId,
         workspace_id: UUID,
         owner_user_id: UUID,
@@ -540,11 +563,10 @@ class RecordingService:
         pipeline_name: str,
         pipeline_version: str,
     ) -> tuple[DatabaseRow, bool]:
-        with self._engine.begin() as connection:
-            inserted = (
-                connection.execute(
-                    text(
-                        """
+        inserted = (
+            connection.execute(
+                text(
+                    """
                     insert into recordings (
                         id, workspace_id, owner_user_id, title, file_name, storage_path, location,
                         mime_type, file_size_bytes, content_md5, processing_id,
@@ -552,46 +574,42 @@ class RecordingService:
                     ) values (
                         :id, :workspace_id, :owner_user_id, :title, :file_name, :storage_path, :location,
                         :mime_type, :file_size_bytes, :content_md5, :processing_id,
-                        :pipeline_name, :pipeline_version, 'uploaded'
+                        :pipeline_name, :pipeline_version, 'processing'
                     )
                     on conflict (processing_id) do nothing
                     returning *
                     """
-                    ),
-                    {
-                        "id": recording_id,
-                        "workspace_id": workspace_id,
-                        "owner_user_id": owner_user_id,
-                        "title": title,
-                        "file_name": file_name,
-                        "storage_path": storage_path,
-                        "location": location,
-                        "mime_type": mime_type,
-                        "file_size_bytes": file_size_bytes,
-                        "content_md5": content_md5,
-                        "processing_id": processing_id,
-                        "pipeline_name": pipeline_name,
-                        "pipeline_version": pipeline_version,
-                    },
-                )
-                .mappings()
-                .one_or_none()
+                ),
+                {
+                    "id": recording_id,
+                    "workspace_id": workspace_id,
+                    "owner_user_id": owner_user_id,
+                    "title": title,
+                    "file_name": file_name,
+                    "storage_path": storage_path,
+                    "location": location,
+                    "mime_type": mime_type,
+                    "file_size_bytes": file_size_bytes,
+                    "content_md5": content_md5,
+                    "processing_id": processing_id,
+                    "pipeline_name": pipeline_name,
+                    "pipeline_version": pipeline_version,
+                },
             )
-            if inserted is not None:
-                return dict(inserted), True
-            existing = (
-                connection.execute(
-                    text("select * from recordings where processing_id = :processing_id"),
-                    {"processing_id": processing_id},
-                )
-                .mappings()
-                .one()
+            .mappings()
+            .one_or_none()
+        )
+        if inserted is not None:
+            return dict(inserted), True
+        existing = (
+            connection.execute(
+                text("select * from recordings where processing_id = :processing_id"),
+                {"processing_id": processing_id},
             )
-            return dict(existing), False
-
-    def _delete_recording(self, recording_id: RecordingId) -> None:
-        with self._engine.begin() as connection:
-            connection.execute(text("delete from recordings where id = :recording_id"), {"recording_id": recording_id})
+            .mappings()
+            .one()
+        )
+        return dict(existing), False
 
     @staticmethod
     def _source_audio_artifact(recording: DatabaseRow) -> ArtifactRef:

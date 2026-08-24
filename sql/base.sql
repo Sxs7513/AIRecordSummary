@@ -178,6 +178,38 @@ create index if not exists recordings_created_at_idx on recordings (created_at d
 create index if not exists recordings_content_md5_idx on recordings (workspace_id, owner_user_id, content_md5);
 create index if not exists recordings_location_trgm_idx on recordings using gin (location gin_trgm_ops);
 
+-- Transactional outbox shared by business domains that atomically enqueue Kafka commands.
+create table if not exists integration_outbox (
+    event_id uuid primary key,
+    channel text not null check (channel in ('processing-command', 'generation-command', 'generation-state')),
+    topic text not null,
+    partition_key text not null,
+    event_type text not null,
+    aggregate_type text not null,
+    aggregate_id text not null,
+    payload jsonb not null,
+    occurred_at timestamptz not null,
+    available_at timestamptz not null default now(),
+    attempt_count integer not null default 0 check (attempt_count >= 0),
+    locked_by text,
+    locked_until timestamptz,
+    published_at timestamptz,
+    exhausted_at timestamptz,
+    last_error text,
+    created_at timestamptz not null default now(),
+    check ((locked_by is null) = (locked_until is null))
+);
+
+create index if not exists integration_outbox_pending_idx
+    on integration_outbox (available_at, created_at, event_id)
+    where published_at is null and exhausted_at is null;
+create index if not exists integration_outbox_channel_pending_idx
+    on integration_outbox (channel, available_at, created_at)
+    where published_at is null and exhausted_at is null;
+create index if not exists integration_outbox_aggregate_pending_idx
+    on integration_outbox (aggregate_type, aggregate_id, created_at, event_id)
+    where published_at is null and exhausted_at is null;
+
 -- 例外录音分享；不用于表达同一工作区成员的默认访问权。
 create table if not exists recording_memberships (
     recording_id uuid not null references recordings(id) on delete cascade,
@@ -646,7 +678,7 @@ create index if not exists recording_search_chunks_embedding_hnsw_idx
     on recording_search_chunks using hnsw (embedding halfvec_cosine_ops);
 
 -- Generation terminal query projection
--- 活跃状态和流式事件位于 Redis；该表只由 Kafka 终态投影器写入。
+-- 活跃状态和流式事件位于 Redis；该表由 Generation Worker 的终态事务写入。
 create table if not exists generation_runs (
     id uuid primary key default gen_random_uuid(),
     kind text not null check (kind in ('text')),
@@ -672,7 +704,7 @@ create table if not exists generation_runs (
 comment on table generation_runs is
     '通用生成任务终态查询投影；不承担排队、运行时状态或流式事件存储。';
 comment on column generation_runs.id is
-    '生成任务关联 ID，由命令入口生成，并由 Kafka 终态投影器幂等写入。';
+    '生成任务关联 ID，由命令入口生成，并由 Generation Worker 的终态事务幂等写入。';
 comment on column generation_runs.kind is
     '生成内容类型。当前统一为 text，业务模块可在通用运行时之上定义自己的生成用例。';
 comment on column generation_runs.priority is
@@ -690,7 +722,7 @@ comment on column generation_runs.subject_type is
 comment on column generation_runs.subject_id is
     '受保护业务对象主键；不建立跨领域外键，以保持 generation runtime 通用。';
 comment on column generation_runs.status is
-    'Kafka 终态投影：succeeded、failed 或 cancelled；活跃状态只存在于 Redis/Kafka。';
+    'Generation 终态：succeeded、failed 或 cancelled；活跃状态只存在于 Redis。';
 comment on column generation_runs.input_payload is
     '创建时冻结的类型化输入 JSON，例如问答 query、过滤条件和 artifact 引用；不承担授权范围。';
 comment on column generation_runs.output_payload is

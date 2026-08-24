@@ -104,6 +104,27 @@ export type CorrectionResult = {
   end_char: number;
   original_expression: string;
   accepted_expressions: string[];
+  details: {
+    match_kind?: "exact" | "fuzzy" | "unmatched";
+    similarity?: number | string | null;
+    matched_accepted_expression?: string | null;
+    actual_local_text?: string | null;
+    expected_local_text?: string | null;
+  };
+};
+
+export type PredictionResult = {
+  id: string;
+  matched_gold_correction_id: string | null;
+  proposal_id: string;
+  evidence_index: number;
+  chunk_id: string;
+  start_char: number;
+  end_char: number;
+  original_expression: string;
+  resolved_expression: string;
+  match_kind: "exact" | "fuzzy" | "unmatched";
+  similarity: number | string | null;
 };
 
 export type AdjudicationCaseResult = {
@@ -116,18 +137,34 @@ export type AdjudicationCaseResult = {
   error_type: string | null;
   error_message: string | null;
   corrections: CorrectionResult[];
+  predictions: PredictionResult[];
 };
 
-export type AccuracyMetric = {
-  metric_name: "gold_correction_accuracy";
+export type AdjudicationMetric = {
+  metric_name:
+    | "correction_precision_strict"
+    | "correction_recall_strict"
+    | "correction_f1_strict"
+    | "correction_precision_relaxed"
+    | "correction_recall_relaxed"
+    | "correction_f1_relaxed";
   value: number | string;
   passed_count: number;
   sample_count: number;
+  details: {
+    scope: "strict" | "relaxed";
+    true_positive: number;
+    false_positive: number;
+    false_negative: number;
+    exact_count: number;
+    fuzzy_count: number;
+    gold_count: number;
+    prediction_count: number;
+  };
 };
 
 export type AdjudicationRunDetail = {
   run: AdjudicationRun;
-  metric: AccuracyMetric | null;
+  metrics: AdjudicationMetric[];
   cases: AdjudicationCaseResult[];
 };
-

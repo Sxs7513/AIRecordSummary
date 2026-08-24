@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime
-from time import monotonic
 
 from l1_foundation.messaging import EventEnvelope, KafkaEventProducer, Topics, new_event
 from l1_foundation.streaming import RedisStreamStore
@@ -15,8 +14,6 @@ from l1_foundation.worker.contracts import (
     ExecutionScope,
 )
 from l3_app.compute_worker.runtime import ComputeWorkerRuntime
-
-PROGRESS_STATE_INTERVAL_SECONDS = 1.0
 
 
 def compute_state_key(task_id: object) -> str:
@@ -51,9 +48,8 @@ class KafkaComputeTaskHandler:
         await self._runtime.submit(request)
         if await self._is_cancel_requested(request):
             self._runtime.cancel(request.task_id)
-        await self._publish_state(request, "queued", envelope)
+        await self._publish_state(request, "queued")
         cancel_monitor = asyncio.create_task(self._monitor_cancel(request), name=f"compute-cancel-{request.task_id}")
-        last_progress_state_at: float | None = None
         try:
             async for event in self._runtime.events(request.task_id):
                 event_data = event.model_dump(mode="json")
@@ -61,11 +57,6 @@ class KafkaComputeTaskHandler:
                 if event.type not in {"delta", "heartbeat"}:
                     snapshot = self._runtime.status(request.task_id).model_dump(mode="json")
                     await self._redis_event_store.set_state(compute_state_key(request.task_id), snapshot)
-                    now = monotonic()
-                    if should_publish_compute_state(event.type, last_progress_state_at, now):
-                        await self._publish_kafka_state(request, envelope, snapshot)
-                        if event.type == "progress":
-                            last_progress_state_at = now
                 if not isinstance(event, ComputeDeltaEvent | ComputeHeartbeatEvent):
                     await self._kafka_producer.publish(
                         Topics.COMPUTE_RESULTS,
@@ -98,31 +89,11 @@ class KafkaComputeTaskHandler:
             return True
         return request.execution_scope is not None and await self._redis_event_store.is_cancel_requested(execution_scope_cancel_id(request.execution_scope))
 
-    async def _publish_state(self, request: ComputeTaskRequest, status: str, command: EventEnvelope) -> None:
+    async def _publish_state(self, request: ComputeTaskRequest, status: str) -> None:
         snapshot = self._runtime.status(request.task_id).model_dump(mode="json")
         await self._redis_event_store.set_state(compute_state_key(request.task_id), snapshot)
         queued = ComputeQueuedEvent(task_id=request.task_id, at=datetime.now(UTC))
         await self._redis_event_store.append(compute_stream_key(request.task_id), status, queued.model_dump(mode="json"))
-        await self._publish_kafka_state(request, command, snapshot)
-
-    async def _publish_kafka_state(
-        self,
-        request: ComputeTaskRequest,
-        command: EventEnvelope,
-        snapshot: dict[str, object],
-    ) -> None:
-        await self._kafka_producer.publish(
-            Topics.COMPUTE_STATE,
-            str(request.task_id),
-            new_event(
-                "compute.task.state.changed",
-                "compute-worker",
-                correlation_id=command.correlation_id,
-                causation_id=command.event_id,
-                task_id=request.task_id,
-                payload=snapshot,
-            ),
-        )
 
 
 class KafkaComputeCancelHandler:
@@ -148,12 +119,3 @@ class KafkaComputeCancelHandler:
             raise ValueError("Compute scope cancellation is missing execution_scope")
         await self._redis_event_store.request_cancel(execution_scope_cancel_id(scope))
         self._runtime.cancel_scope(scope)
-
-
-def should_publish_compute_state(event_type: str, last_progress_at: float | None, now: float) -> bool:
-    """Keep the compacted state durable without mirroring high-volume live events."""
-    if event_type in {"delta", "heartbeat"}:
-        return False
-    if event_type == "progress":
-        return last_progress_at is None or now - last_progress_at >= PROGRESS_STATE_INTERVAL_SECONDS
-    return True

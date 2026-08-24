@@ -89,6 +89,7 @@ npm run dev:production-api
 npm run dev:compute-worker
 npm run dev:generation-worker
 npm run dev:processing-worker
+npm run dev:outbox-relay
 npm run dev:observability-api
 npm run dev:observability-worker
 npm run dev:evaluation-api
@@ -96,12 +97,10 @@ npm run dev:rag-evaluation-worker
 npm run dev:training-api
 ```
 
-If Redis is cleared, stop command processing temporarily and replay the compacted Kafka state topics with `npm run infra:rebuild-redis` before resuming traffic.
-
 The Production API, Compute Worker, Evaluation API, and Training API listen on ports 8000, 8010, 8001, and 8002 respectively.
 `npm run dev:python-web` remains as an alias for the production API.
 
-Generation, recording Processing, and atomic Compute work are submitted through Kafka. `generation-worker`, `processing-worker`, and `compute-worker` consume them independently; the Production API does not run an in-process task coordinator.
+Generation and recording Processing commands that originate with PostgreSQL business writes are committed to the shared `integration_outbox` table in the same transaction. Generation terminal rows, Conversation terminal projections, and the Redis/SSE terminal projection use that same boundary. `outbox-relay` publishes command channels to Kafka and idempotently projects Generation terminal events directly to Redis/SSE before marking the Outbox row published. Kafka-only Compute and other worker-internal events continue to publish directly.
 `training-api` likewise starts the single-GPU ASR evaluation/training worker,
 so no separate worker process is required.
 

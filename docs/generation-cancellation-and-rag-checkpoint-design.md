@@ -2,7 +2,7 @@
 
 > 文档状态：Phase 1、Phase 2 与 Phase 3 已实现。
 >
-> 依赖架构：Generation、Compute 和 Processing 使用 Kafka 承载可靠命令与终态，Redis 承载活跃状态、取消快速标记和流式事件，PostgreSQL 保存最终业务投影。整体架构参见 [`redis-kafka-architecture-refactor.md`](./redis-kafka-architecture-refactor.md)。
+> 依赖架构：Generation、Compute 和 Processing 使用 Kafka 承载可靠命令与必要的生命周期事件，Redis 承载活跃状态、取消快速标记和流式事件，PostgreSQL 保存最终业务投影。整体架构参见 [`redis-kafka-architecture-refactor.md`](./redis-kafka-architecture-refactor.md)。
 
 ## 1. 背景
 
@@ -183,7 +183,7 @@ Compute 取消命令同时支持 task 和 scope：
 }
 ```
 
-Kafka 事件不可修改。取消后应追加事件并更新 compacted state：
+Kafka 事件不可修改。取消后应追加取消事件并更新 Redis 取消标记：
 
 ```text
 compute.task.started
@@ -224,17 +224,9 @@ task.cancel.requested
 
 不同 Topic 之间没有全局顺序保证，因此两条路径都必须正确。
 
-## 8. Compacted State 与 Redis Cancel Key
+## 8. Redis Cancel Key
 
-项目已有 compacted state topic：
-
-```text
-processing.state
-compute.state
-generation.state
-```
-
-Compacted topic 是按消息 key 保存最新状态的 Kafka 日志。例如同一个 Generation 依次写入 `running`、`cancel_requested`、`cancelled`，后台压缩后长期保留的主要是最后状态。它不是即时删除，也不替代实时事件流。
+当前实现不再使用 Processing、Compute 或 Generation 的 compacted state topic；运行态与取消快速检查位于 Redis，最终业务结果位于 PostgreSQL。
 
 Redis Cancel Key 提供低延迟检查：
 
@@ -250,7 +242,7 @@ task:{task_id}:cancel
 - 相关 Kafka command 不再可能重投；
 - Worker 重建状态时仍能识别该执行已经取消。
 
-第一版优先将取消状态写入现有 `generation.state`、`processing.state` 和 `compute.state`。Compute Worker 若需要独立重建所有上游 scope 的取消屏障，可后续引入统一的 `execution.state` compacted topic；第一版不必立即增加该抽象。
+取消命令本身保存在 Kafka，Consumer 将其投影为 Redis marker。Redis 被清空后不会从 Kafka state topic 重建运行态；仍在执行的任务依靠后续取消命令或 Worker 自身生命周期收敛。
 
 ## 9. Consumer 竞态处理
 

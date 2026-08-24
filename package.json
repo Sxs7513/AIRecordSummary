@@ -5,7 +5,6 @@
   "scripts": {
     "infra:up": "docker-compose up -d --wait && npm run infra:init",
     "infra:init": "cd backend && PYTHONPATH=packages .venv/bin/python scripts/initialize_kafka.py",
-    "infra:rebuild-redis": "cd backend && PYTHONPATH=packages .venv/bin/python scripts/rebuild_redis_state.py",
     "infra:down": "docker compose down",
     "infra:status": "docker compose ps",
     "infra:logs": "docker compose logs -f kafka redis",
@@ -16,6 +15,7 @@
     "dev:observability-worker": "cd backend && PYTHONPATH=packages:packages/l3_app/observability-api .venv/bin/python -m l3_app.observability_worker.main",
     "dev:generation-worker": "cd backend && PYTHONPATH=packages .venv/bin/python -m l3_app.generation_worker.main",
     "dev:processing-worker": "cd backend && PYTHONPATH=packages .venv/bin/python -m l3_app.processing_worker.main",
+    "dev:outbox-relay": "cd backend && PYTHONPATH=packages .venv/bin/python -m l3_app.outbox_relay.main",
     "dev:observability-api": "cd backend && PYTHONPATH=packages:packages/l3_app/observability-api .venv/bin/uvicorn main:app --app-dir packages/l3_app/observability-api --reload --no-access-log --port 8003",
     "dev:evaluation-api": "cd backend && PYTHONPATH=packages .venv/bin/uvicorn main:app --app-dir packages/l3_app/evaluation-api --reload --no-access-log --port 8001",
     "dev:rag-evaluation-worker": "cd backend && PYTHONPATH=packages .venv/bin/python -m l3_app.rag_evaluation_worker.main",

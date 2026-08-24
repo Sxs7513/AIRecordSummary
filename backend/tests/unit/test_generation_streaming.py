@@ -120,6 +120,20 @@ def test_final_output_replaces_streamed_blocks_with_canonical_text() -> None:
     assert output["content_blocks"] == [{"type": "text", "value": "最终引用[1]"}]
 
 
+def test_prepare_success_builds_terminal_snapshot_without_publishing_redis_terminal() -> None:
+    run_id = uuid4()
+    runtime = _SinkRuntime(_snapshot(run_id))
+    sink = GenerationEventSink(run_id, runtime)  # type: ignore[arg-type]
+
+    terminal = sink.prepare_succeed({"message": None}, final_text="最终回答")
+
+    assert terminal is not None
+    assert terminal.status == GenerationStatus.SUCCEEDED
+    assert runtime.snapshot.status == GenerationStatus.RUNNING
+    assert runtime.events == []
+    assert not runtime.expired
+
+
 def test_aggregate_message_streams_two_variants_and_persists_one_final_block() -> None:
     run_id = uuid4()
     runtime = _SinkRuntime(_snapshot(run_id))
