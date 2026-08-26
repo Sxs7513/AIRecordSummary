@@ -200,4 +200,8 @@ def _llm_model_name(settings: Settings, provider: LlmProvider) -> str:
         return settings.resolved_local_llm_model_path.name
     if provider == LlmProvider.ZHIPU:
         return settings.zhipu_model
-    return settings.gemini_model
+    if provider == LlmProvider.GEMINI:
+        return settings.gemini_model
+    if provider == LlmProvider.QWEN:
+        return settings.qwen_llm_model
+    raise ValueError(f"Unsupported LLM provider: {provider}")

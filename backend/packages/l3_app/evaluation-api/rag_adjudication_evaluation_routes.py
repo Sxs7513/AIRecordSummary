@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Never
+from typing import Any, Literal, Never
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, status
@@ -54,6 +54,7 @@ class AddCorrectionRequest(BaseModel):
     end_char: int = Field(gt=0)
     original_expression: str = Field(min_length=1, max_length=300)
     accepted_expressions: list[str] = Field(min_length=1, max_length=10)
+    importance: Literal["important", "minor"] = "important"
 
 
 class RevisionRequest(BaseModel):

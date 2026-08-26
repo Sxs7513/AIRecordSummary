@@ -20,6 +20,7 @@ from l1_foundation.llm import (
     ResponseFormatType,
     build_llm_generate_command,
 )
+from l1_foundation.model_ref import OnlineModelRef
 from l1_foundation.observability import (
     InstrumentedModelClient,
     finish_span,
@@ -92,10 +93,13 @@ class AggregateAnswerStream(Protocol):
 
 logger = logging.getLogger("rag")
 
-MAX_ADJUDICATION_CASES = 2
+MAX_ADJUDICATION_CASES = 3
 MAX_ADJUDICATION_ITERATIONS = 4
 MAX_ADJUDICATION_SEARCHES = 10
 INSUFFICIENT_EVIDENCE_ANSWER = "没有在录音中找到足够依据。"
+GRADE_MAX_OUTPUT_TOKENS = 500
+GRADE_CONTEXT_SAFETY_TOKENS = 256
+GRADE_EVIDENCE_TRUNCATION_MARKER = "\n\n[后续证据因上下文长度限制已截断]"
 
 
 class RagGraph:
@@ -105,7 +109,7 @@ class RagGraph:
         self,
         retriever: RagRetriever,
         model_client: InstrumentedModelClient,
-        online_provider: LlmProvider,
+        online_model: OnlineModelRef,
         context_size: int,
         *,
         plan_local_input_tokens: int = 4_000,
@@ -117,13 +121,16 @@ class RagGraph:
         asr_adjudication_web_search_enabled: bool = False,
         asr_adjudication_auto_resolve_confidence: float = 0.95,
         asr_adjudication_audit_prompt_variant: AuditPromptVariant = "relation_rules",
-        asr_adjudication_audit_model: str | None = None,
+        asr_adjudication_audit_model: OnlineModelRef | None = None,
+        asr_adjudication_construct_model: OnlineModelRef | None = None,
+        asr_adjudication_decision_model: OnlineModelRef | None = None,
         asr_adjudication_audit_min_request_interval_seconds: float | None = None,
         grounded_search_client: GroundedSearchClient | None = None,
     ) -> None:
         self._retriever = retriever
         self._model_client = model_client
-        self._online_provider = online_provider
+        self._online_provider = LlmProvider(online_model.provider)
+        self._online_model = online_model.model
         self._context_size = context_size
         self._plan_local_input_tokens = plan_local_input_tokens
         self._route_model_profile: Literal["default", "rag"] = route_model_profile
@@ -134,7 +141,7 @@ class RagGraph:
         self._token_budget = RagTokenBudgetMiddleware(max_total_tokens)
         self._adjudication_agent = EvidenceAdjudicationAgent(
             model_client=model_client,
-            online_provider=online_provider,
+            online_model=online_model,
             context_size=context_size,
             token_budget=self._token_budget,
             grounded_search_client=grounded_search_client,
@@ -144,7 +151,9 @@ class RagGraph:
             max_iterations=MAX_ADJUDICATION_ITERATIONS,
             max_searches=MAX_ADJUDICATION_SEARCHES,
             audit_prompt_variant=asr_adjudication_audit_prompt_variant,
-            audit_model=asr_adjudication_audit_model,
+            audit_model=asr_adjudication_audit_model or online_model,
+            construct_model=asr_adjudication_construct_model or online_model,
+            decision_model=asr_adjudication_decision_model or online_model,
             audit_min_request_interval_seconds=asr_adjudication_audit_min_request_interval_seconds,
             node_started=self._node_started,
             node_completed=self._node_completed,
@@ -236,6 +245,7 @@ class RagGraph:
         aggregate_stream: AggregateAnswerStream | None = None,
         restored_state: RagGraphState | None = None,
         adjudication_user_decision: ClaimConfirmationDecision | None = None,
+        force_correction: bool = False,
     ) -> tuple[str, list[EvidenceSource], bool, str | None, AdjudicationConfirmationBlock | None]:
         with rag_execution_hook_scope(hook):
             return await self._run(
@@ -251,6 +261,7 @@ class RagGraph:
                 aggregate_stream,
                 restored_state,
                 adjudication_user_decision,
+                force_correction,
             )
 
     async def _run(
@@ -267,6 +278,7 @@ class RagGraph:
         aggregate_stream: AggregateAnswerStream | None = None,
         restored_state: RagGraphState | None = None,
         adjudication_user_decision: ClaimConfirmationDecision | None = None,
+        force_correction: bool = False,
     ) -> tuple[str, list[EvidenceSource], bool, str | None, AdjudicationConfirmationBlock | None]:
         trace_id = str(run_id) if run_id is not None else "standalone"
         graph_started = started_at()
@@ -275,12 +287,21 @@ class RagGraph:
             trace_id,
             query_chars=len(query),
             limit=limit,
+            force_correction=force_correction,
             scope_recording_count=len(scope_recording_ids),
             history_messages=len(history or []),
         )
         on_phase("routing", "正在理解问题", 10)
         try:
-            initial_state = self._initial_state(trace_id, "answer", query, limit, scope_recording_ids, history)
+            initial_state = self._initial_state(
+                trace_id,
+                "answer",
+                query,
+                limit,
+                scope_recording_ids,
+                history,
+                force_correction=force_correction,
+            )
             if restored_state is not None:
                 initial_state.update(restored_state)
                 initial_state.update(
@@ -290,6 +311,7 @@ class RagGraph:
                     history=history or [],
                     limit=limit,
                     scope_recording_ids=[str(item) for item in scope_recording_ids],
+                    force_correction=force_correction,
                     adjudication_user_decision=adjudication_user_decision,
                 )
             elif adjudication_user_decision is not None:
@@ -640,6 +662,8 @@ class RagGraph:
         limit: int,
         scope_recording_ids: list[UUID],
         history: list[RagHistoryMessage] | None,
+        *,
+        force_correction: bool = False,
     ) -> RagGraphState:
         return RagGraphState(
             run_id=trace_id,
@@ -669,6 +693,7 @@ class RagGraph:
             corrected_grade=None,
             planning_required=False,
             answer_plan=None,
+            force_correction=force_correction,
             query_correction_risk=False,
             adjudication_agent_state=None,
             adjudication_user_decision=None,
@@ -943,8 +968,20 @@ class RagGraph:
                 node_started,
                 enabled=False,
                 has_risk=False,
+                risk_source="disabled",
             )
             return {"query_correction_risk": False, "adjudication_agent_state": None}
+        if state.get("force_correction", False):
+            self._node_completed(
+                state,
+                "classify_query_correction_risk",
+                node_started,
+                enabled=True,
+                has_risk=True,
+                risk_source="forced",
+                model_execution="none",
+            )
+            return {"query_correction_risk": True}
         prompt, values = correction_risk_prompt(state["query"])
         messages = prompt.invoke(values).to_messages()
         try:
@@ -972,6 +1009,7 @@ class RagGraph:
                 node_started,
                 enabled=True,
                 has_risk=False,
+                risk_source="classification_fallback",
                 fallback=True,
             )
             return {"query_correction_risk": False}
@@ -981,6 +1019,7 @@ class RagGraph:
             node_started,
             enabled=True,
             has_risk=assessment.has_risk,
+            risk_source="classified",
             fallback=False,
         )
         return {
@@ -1327,14 +1366,23 @@ class RagGraph:
                     provider=None,
                 )
                 return grade, 0
-        prompt, values, parser = grade_prompt(grade_query, self._grade_evidence_text(evidence))
+        grade_evidence_text, evidence_truncated = self._truncate_grade_evidence(
+            grade_query,
+            self._grade_evidence_text(evidence),
+            max_input_tokens=max(
+                1,
+                self._context_size - GRADE_MAX_OUTPUT_TOKENS - GRADE_CONTEXT_SAFETY_TOKENS,
+            ),
+        )
+        prompt, values, parser = grade_prompt(grade_query, grade_evidence_text)
         messages = prompt.invoke(values).to_messages()
+        estimated_input_tokens = self._token_budget.estimate_input_tokens(self._worker_messages(messages))
         provider = LlmProvider.LOCAL
         result = await self._complete(
             state,
             node,
             messages,
-            max_tokens=500,
+            max_tokens=GRADE_MAX_OUTPUT_TOKENS,
             json_schema=EvidenceGrade.model_json_schema(),
             provider=provider,
             enable_thinking=True
@@ -1368,10 +1416,43 @@ class RagGraph:
             evidence_count=len(evidence),
             evidence_refs=self._grade_evidence_refs(evidence),
             response_chars=len(raw),
+            estimated_input_tokens=estimated_input_tokens,
+            evidence_truncated=evidence_truncated,
             model_execution="local" if provider == LlmProvider.LOCAL else "online",
             provider=provider.value,
         )
         return grade, self._token_budget.actual_usage(result)
+
+    def _truncate_grade_evidence(
+        self,
+        query: str,
+        evidence_text: str,
+        *,
+        max_input_tokens: int,
+    ) -> tuple[str, bool]:
+        """Fit grade evidence into the prompt budget while retaining strongest evidence first."""
+
+        def estimated_tokens(candidate: str) -> int:
+            prompt, values, _ = grade_prompt(query, candidate)
+            messages = prompt.invoke(values).to_messages()
+            return self._token_budget.estimate_input_tokens(self._worker_messages(messages))
+
+        if estimated_tokens(evidence_text) <= max_input_tokens:
+            return evidence_text, False
+
+        low = 0
+        high = len(evidence_text)
+        best = ""
+        while low <= high:
+            middle = (low + high) // 2
+            prefix = evidence_text[:middle].rstrip()
+            candidate = f"{prefix}{GRADE_EVIDENCE_TRUNCATION_MARKER}" if prefix else GRADE_EVIDENCE_TRUNCATION_MARKER.strip()
+            if estimated_tokens(candidate) <= max_input_tokens:
+                best = candidate
+                low = middle + 1
+            else:
+                high = middle - 1
+        return best, True
 
     @staticmethod
     def _grade_evidence_refs(evidence: list[Evidence]) -> list[dict[str, str]]:
@@ -1645,6 +1726,7 @@ class RagGraph:
         self._token_budget.before_model(state.get("token_usage", 0), node)
         options = CompletionOptions(
             max_tokens=max_tokens,
+            model=self._online_model if provider != LlmProvider.LOCAL else None,
             response_format=ResponseFormat(
                 type=ResponseFormatType.JSON_SCHEMA,
                 json_schema=json_schema,
@@ -1689,7 +1771,11 @@ class RagGraph:
                 build_llm_generate_command(
                     provider,
                     self._worker_messages(cast(list[BaseMessage], messages)),
-                    CompletionOptions(max_tokens=max_tokens, temperature=0.1),
+                    CompletionOptions(
+                        max_tokens=max_tokens,
+                        temperature=0.1,
+                        model=self._online_model if provider != LlmProvider.LOCAL else None,
+                    ),
                     context_size=self._context_size,
                     stream=True,
                 ),

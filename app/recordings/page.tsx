@@ -1,4 +1,5 @@
 import Link from "next/link";
+import { redirect } from "next/navigation";
 import { AutoRefresh } from "@/components/auto-refresh";
 import { DeleteRecordingButton } from "@/components/delete-recording-button";
 import { RecordingUploadForm } from "@/components/recording-upload-form";
@@ -8,6 +9,16 @@ import { formatDate, formatDurationMs } from "@/app/shared/format";
 
 export const dynamic = "force-dynamic";
 
+const PAGE_SIZE = 10;
+
+function recordingListHref(status: string, page: number) {
+  const query = new URLSearchParams();
+  if (status !== "all") query.set("status", status);
+  if (page > 1) query.set("page", String(page));
+  const search = query.toString();
+  return search ? `/recordings?${search}` : "/recordings";
+}
+
 export default async function RecordingsPage({
   searchParams
 }: {
@@ -15,8 +26,11 @@ export default async function RecordingsPage({
 }) {
   const params = await searchParams;
   const status = params.status || "all";
-  const page = Number(params.page || 1);
-  const data = await listPythonRecordings({ status, page, pageSize: 10 });
+  const parsedPage = Number(params.page);
+  const page = Number.isInteger(parsedPage) && parsedPage > 0 ? parsedPage : 1;
+  const data = await listPythonRecordings({ status, page, pageSize: PAGE_SIZE });
+  const totalPages = Math.max(1, Math.ceil(data.total / data.pageSize));
+  if (data.total > 0 && page > totalPages) redirect(recordingListHref(status, totalPages));
   const hasActiveJobs = data.items.some((item) => item.status === "uploaded" || item.status === "processing");
 
   return (
@@ -103,6 +117,38 @@ export default async function RecordingsPage({
             </tbody>
           </table>
         )}
+
+        {data.total > 0 ? (
+          <nav
+            aria-label="录音列表分页"
+            className="toolbar"
+            style={{ justifyContent: "space-between", marginTop: 14 }}
+          >
+            <span className="subtle">
+              共 {data.total} 条，第 {page} / {totalPages} 页
+            </span>
+            <div className="toolbar">
+              {page > 1 ? (
+                <Link className="button secondary" href={recordingListHref(status, page - 1)} rel="prev">
+                  上一页
+                </Link>
+              ) : (
+                <span aria-disabled="true" className="button secondary" style={{ cursor: "default", opacity: 0.5 }}>
+                  上一页
+                </span>
+              )}
+              {page < totalPages ? (
+                <Link className="button secondary" href={recordingListHref(status, page + 1)} rel="next">
+                  下一页
+                </Link>
+              ) : (
+                <span aria-disabled="true" className="button secondary" style={{ cursor: "default", opacity: 0.5 }}>
+                  下一页
+                </span>
+              )}
+            </div>
+          </nav>
+        ) : null}
       </section>
     </>
   );

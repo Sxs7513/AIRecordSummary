@@ -193,7 +193,7 @@ class GenerateSummaryInput(BaseModel):
 
 
 class RecordingSummaryOutput(BaseModel):
-    provider: Literal["local", "zhipu", "gemini"]
+    provider: Literal["local", "zhipu", "gemini", "qwen"]
     model_name: str
     summary_text: str
 

@@ -30,6 +30,7 @@ class RagGenerationWorkItem(BaseModel):
     limit: int = Field(ge=1, le=20)
     scope_recording_ids: list[UUID] = Field(default_factory=_uuid_list)
     history: list[RagHistoryMessage] = Field(default_factory=_history_list)
+    force_correction: bool = False
     conversation_message_id: UUID | None = None
     resume_from_generation_id: UUID | None = None
     adjudication_user_decision: ClaimConfirmationDecision | None = None

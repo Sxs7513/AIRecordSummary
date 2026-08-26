@@ -3,7 +3,6 @@ from __future__ import annotations
 import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from time import perf_counter
 from typing import Any, TypedDict, cast
 from uuid import UUID
 
@@ -30,7 +29,6 @@ from l2_core.rag.contracts import (
 )
 from l2_core.rag.evidence_overlays import apply_evidence_overlays, render_correction_notices
 from l2_core.rag.normalization import normalize_search_text
-from l2_core.rag.observability import log_event
 from l2_core.rag.worker_tasks import RerankCandidateInput, RerankResult, rerank_command
 
 MAX_SCOPE_RECORDINGS = 50
@@ -471,14 +469,21 @@ class RagRetriever:
         """Fuse each retrieval query's ranked list with RRF before applying Top-N."""
 
         candidates: dict[UUID, RankedCandidate] = {}
-        for rows in vector_lists:
+        expanded_list_count = max(1, len(vector_lists) - 1)
+        for list_index, rows in enumerate(vector_lists):
+            list_weight = (
+                self._settings.rag_original_vector_weight
+                if list_index == 0
+                else self._settings.rag_expanded_vector_weight / expanded_list_count
+            )
             for rank, row in enumerate(rows, start=1):
                 chunk_id = row["chunk_id"]
                 candidate = candidates.setdefault(chunk_id, RankedCandidate(row=row))
                 candidate.vector_rank = min(candidate.vector_rank, rank) if candidate.vector_rank is not None else rank
                 score = row["score"]
                 candidate.vector_score = max(candidate.vector_score, score) if candidate.vector_score is not None else score
-                candidate.fused_score += self._settings.rag_vector_weight / (self._settings.rag_rrf_k + rank)
+                candidate.fused_score += list_weight / (self._settings.rag_rrf_k + rank)
+        lexical_list_weight = self._settings.rag_lexical_weight / max(1, len(lexical_lists))
         for rows in lexical_lists:
             for rank, row in enumerate(rows, start=1):
                 chunk_id = row["chunk_id"]
@@ -486,7 +491,7 @@ class RagRetriever:
                 candidate.lexical_rank = min(candidate.lexical_rank, rank) if candidate.lexical_rank is not None else rank
                 score = row["score"]
                 candidate.lexical_score = max(candidate.lexical_score, score) if candidate.lexical_score is not None else score
-                candidate.fused_score += self._settings.rag_lexical_weight / (self._settings.rag_rrf_k + rank)
+                candidate.fused_score += lexical_list_weight / (self._settings.rag_rrf_k + rank)
         ordered = sorted(
             candidates.values(),
             key=lambda item: (
@@ -601,67 +606,6 @@ class RagRetriever:
             if overlapping.get("match_type") != row.get("match_type"):
                 overlapping["match_type"] = "hybrid"
         return merged
-
-    def retrieve_chunks(
-        self,
-        topic: str,
-        filters: ResolvedFilters,
-        limit: int,
-        run_id: str = "standalone",
-    ) -> list[Evidence]:
-        if not self._settings.rag_hybrid_search_enabled:
-            return self.expand_candidates(self.retrieve_candidates(topic, filters, limit))
-
-        started = perf_counter()
-        vector_rows: list[RetrievalCandidateRow] = []
-        lexical_rows: list[RetrievalCandidateRow] = []
-        vector_error: Exception | None = None
-        lexical_error: Exception | None = None
-        try:
-            embedding = self.generate_query_embedding(topic)
-            vector_rows = self.retrieve_vector_candidates(embedding, filters)
-        except Exception as error:
-            vector_error = error
-            log_event(
-                "retrieval_branch_failed",
-                run_id,
-                level=logging.WARNING,
-                exc_info=True,
-                branch="vector",
-                error_type=type(error).__name__,
-            )
-        try:
-            lexical_rows = self.retrieve_lexical_candidates(topic, filters)
-        except Exception as error:
-            lexical_error = error
-            log_event(
-                "retrieval_branch_failed",
-                run_id,
-                level=logging.WARNING,
-                exc_info=True,
-                branch="lexical",
-                error_type=type(error).__name__,
-            )
-        if vector_error is not None and lexical_error is not None:
-            raise RuntimeError("Both RAG hybrid retrieval branches failed") from vector_error
-        fused = self.fuse_candidates(vector_rows, lexical_rows, limit)
-        evidence = self.expand_candidates(fused)
-        overlap = len({row["chunk_id"] for row in vector_rows} & {row["chunk_id"] for row in lexical_rows})
-        log_event(
-            "hybrid_retrieval_completed",
-            run_id,
-            query_chars=len(topic),
-            scope_recording_count=len(filters.recording_ids),
-            vector_candidates=len(vector_rows),
-            lexical_candidates=len(lexical_rows),
-            overlap=overlap,
-            fused_candidates=len(fused),
-            evidence_count=len(evidence),
-            vector_degraded=vector_error is not None,
-            lexical_degraded=lexical_error is not None,
-            elapsed_ms=round((perf_counter() - started) * 1_000, 2),
-        )
-        return evidence
 
     def retrieve_candidates(self, topic: str, filters: ResolvedFilters, limit: int) -> list[RetrievalCandidateRow]:
         embedding = self.generate_query_embedding(topic)

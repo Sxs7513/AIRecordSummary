@@ -155,7 +155,7 @@ class ChunkEvidencePipeline:
 
         started = started_at()
         vector_queries: list[str] = list(dict.fromkeys([query, *([expanded_query] if expanded_query is not None else [])]))
-        lexical_searches: list[str] = list(dict.fromkeys([query, *(lexical_queries or [])]))
+        lexical_searches: list[str] = list(dict.fromkeys(lexical_queries or []))
         protected_searches = set(protected_lexical_queries or [])
         log_event(
             "retrieval_queries_selected",
@@ -165,8 +165,56 @@ class ChunkEvidencePipeline:
             protected_lexical_queries=sorted(protected_searches),
         )
 
-        async def vector_search(embedding: list[float]) -> list[RetrievalCandidateRow]:
-            return await asyncio.to_thread(self._retriever.retrieve_vector_candidates, embedding, filters)
+        async def vector_search(
+            embedding: list[float],
+            variant: Literal["original", "expanded"],
+            variant_query: str,
+        ) -> list[RetrievalCandidateRow]:
+            operation_started = started_at()
+            operation = f"retrieve.vector.{variant}"
+            try:
+                rows = await asyncio.to_thread(self._retriever.retrieve_vector_candidates, embedding, filters)
+            except Exception as error:
+                self._operation_completed(
+                    "retrieve",
+                    operation,
+                    [],
+                    operation_started,
+                    status="failed",
+                    details={"query_variant": variant, "query": variant_query, "error_type": type(error).__name__},
+                )
+                raise
+            self._operation_completed(
+                "retrieve",
+                operation,
+                rows,
+                operation_started,
+                details={"query_variant": variant, "query": variant_query},
+            )
+            return rows
+
+        async def lexical_search(variant_query: str) -> list[RetrievalCandidateRow]:
+            operation_started = started_at()
+            try:
+                rows = await asyncio.to_thread(self._retriever.retrieve_lexical_candidates, variant_query, filters)
+            except Exception as error:
+                self._operation_completed(
+                    "retrieve",
+                    "retrieve.lexical.term",
+                    [],
+                    operation_started,
+                    status="failed",
+                    details={"query_variant": "term", "query": variant_query, "error_type": type(error).__name__},
+                )
+                raise
+            self._operation_completed(
+                "retrieve",
+                "retrieve.lexical.term",
+                rows,
+                operation_started,
+                details={"query_variant": "term", "query": variant_query},
+            )
+            return rows
 
         async def semantic_searches() -> tuple[list[list[RetrievalCandidateRow] | BaseException], list[RetrievalCandidateRow], BaseException | None]:
             try:
@@ -210,7 +258,17 @@ class ChunkEvidencePipeline:
                 return scoped_rows
 
             raw_vector_results, raw_profile_results = await asyncio.gather(
-                asyncio.gather(*(vector_search(item) for item in embeddings), return_exceptions=True),
+                asyncio.gather(
+                    *(
+                        vector_search(
+                            embedding,
+                            "original" if index == 0 else "expanded",
+                            vector_queries[index],
+                        )
+                        for index, embedding in enumerate(embeddings)
+                    ),
+                    return_exceptions=True,
+                ),
                 recording_profile_search(),
                 return_exceptions=True,
             )
@@ -219,12 +277,10 @@ class ChunkEvidencePipeline:
                 return vector_results, [], raw_profile_results
             return vector_results, raw_profile_results, None
 
-        vector_started = started_at()
-        lexical_started = started_at()
         semantic_result, lexical_results = await asyncio.gather(
             semantic_searches(),
             asyncio.gather(
-                *(asyncio.to_thread(self._retriever.retrieve_lexical_candidates, item, filters) for item in lexical_searches),
+                *(lexical_search(item) for item in lexical_searches),
                 return_exceptions=True,
             ),
         )
@@ -236,7 +292,9 @@ class ChunkEvidencePipeline:
                 level=logging.WARNING,
                 error_type=type(profile_error).__name__,
             )
-        vector_lists = [item for item in vector_results if isinstance(item, list)]
+        # Preserve the original/expanded vector-list positions so a failed
+        # original query cannot accidentally promote the expanded query to its weight.
+        vector_lists = [item if isinstance(item, list) else [] for item in vector_results]
         lexical_lists = [item for item in lexical_results if isinstance(item, list)]
         vector_errors = [item for item in vector_results if isinstance(item, BaseException)]
         lexical_errors = [item for item in lexical_results if isinstance(item, BaseException)]
@@ -248,23 +306,8 @@ class ChunkEvidencePipeline:
             vector_results=_candidate_results(vector_queries, vector_results),
             lexical_results=_candidate_results(lexical_searches, lexical_results),
         )
-        self._operation_completed(
-            "retrieve",
-            "retrieve.vector",
-            vector_rows,
-            vector_started,
-            status="degraded" if vector_errors else "succeeded",
-            details={"query_count": len(vector_queries), "failed_query_count": len(vector_errors)},
-        )
-        self._operation_completed(
-            "retrieve",
-            "retrieve.lexical",
-            lexical_rows,
-            lexical_started,
-            status="degraded" if lexical_errors else "succeeded",
-            details={"query_count": len(lexical_searches), "failed_query_count": len(lexical_errors)},
-        )
-        if not vector_lists and not lexical_lists:
+        vector_succeeded = any(isinstance(item, list) for item in vector_results)
+        if not vector_succeeded and not lexical_lists:
             raise RuntimeError("All RAG hybrid retrieval queries failed") from (vector_errors[0] if vector_errors else lexical_errors[0])
         if vector_errors or lexical_errors:
             log_event(
@@ -502,11 +545,20 @@ def _retain_protected_lexical_candidates(
         protected_rows[chunk_id] = fused_by_chunk.get(chunk_id, exact_match)
         protected_by_chunk.setdefault(chunk_id, set()).add(lexical_query)
     retained: list[RetrievalCandidateRow] = []
+    retained_ids: set[str] = set()
+    for row in fused:
+        chunk_id = str(row["chunk_id"])
+        retained_row = row.copy()
+        if chunk_id in protected_by_chunk:
+            retained_row["protected_lexical_terms"] = sorted(protected_by_chunk[chunk_id])
+        retained.append(retained_row)
+        retained_ids.add(chunk_id)
     for chunk_id, row in protected_rows.items():
+        if chunk_id in retained_ids:
+            continue
         retained_row = row.copy()
         retained_row["protected_lexical_terms"] = sorted(protected_by_chunk[chunk_id])
         retained.append(retained_row)
-    retained.extend(row for row in fused if str(row["chunk_id"]) not in protected_rows)
     return retained
 
 
@@ -517,14 +569,20 @@ def _retain_recording_profile_candidates(
     """Reserve the recording-profile lane without duplicating global candidates."""
 
     profile_by_chunk = {str(row["chunk_id"]): row for row in profile_rows}
-    retained = list(profile_by_chunk.values())
+    retained: list[RetrievalCandidateRow] = []
+    retained_ids: set[str] = set()
     for row in fused:
         chunk_id = str(row["chunk_id"])
-        if chunk_id in profile_by_chunk:
-            retained_row = profile_by_chunk[chunk_id]
-            retained_row["match_type"] = row.get("match_type", retained_row.get("match_type", "vector"))
-            continue
-        retained.append(row)
+        retained_row = row.copy()
+        profile_row = profile_by_chunk.get(chunk_id)
+        if profile_row is not None:
+            retained_row["retrieved_via_recording_profile"] = True
+            profile_score = profile_row.get("recording_profile_score")
+            if profile_score is not None:
+                retained_row["recording_profile_score"] = profile_score
+        retained.append(retained_row)
+        retained_ids.add(chunk_id)
+    retained.extend(row for row in profile_rows if str(row["chunk_id"]) not in retained_ids)
     return retained
 
 
@@ -535,7 +593,7 @@ def _retain_protected_evidence(
 ) -> list[Evidence]:
     protected_ids = set(protected_chunk_ids)
     protected = [item for item in original if str(item.chunk.id) in protected_ids]
-    combined = [*protected, *reranked]
+    combined = [*reranked, *protected]
     unique: list[Evidence] = []
     seen: set[str] = set()
     for item in combined:

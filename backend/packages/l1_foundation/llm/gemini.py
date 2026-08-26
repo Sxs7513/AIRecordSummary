@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from l1_foundation.llm.contracts import JsonObject, JsonValue, LlmProvider
+from collections.abc import Sequence
+
+from l1_foundation.llm.contracts import ChatMessage, CompletionOptions, JsonObject, JsonValue, LlmProvider
 from l1_foundation.llm.openai_compatible import OpenAiCompatibleLanguageModel, SynchronousRequestRateLimiter
 
 _SUPPORTED_SCHEMA_SCALAR_KEYS = (
@@ -37,13 +39,18 @@ class GeminiLanguageModel(OpenAiCompatibleLanguageModel):
             strict_json_schema=True,
             max_temperature=2,
             include_temperature=False,
-            reasoning_effort="minimal",
             stream_include_usage=True,
             rate_limit_max_attempts=3,
             rate_limit_retry_seconds=10,
             min_request_interval_seconds=min_request_interval_seconds,
             request_rate_limiter=request_rate_limiter,
         )
+
+    def _payload(self, messages: Sequence[ChatMessage], options: CompletionOptions, *, stream: bool) -> JsonObject:
+        payload = super()._payload(messages, options, stream=stream)
+        request_model = str(payload["model"]).lower()
+        payload["reasoning_effort"] = "low" if request_model.startswith("gemini-3.7-flash") else "minimal"
+        return payload
 
     def _json_schema_for_provider(self, schema: JsonObject) -> JsonObject:
         """Return Gemini's supported strict JSON Schema subset."""

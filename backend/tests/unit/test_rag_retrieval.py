@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 from typing import Any, cast
 from uuid import UUID, uuid4
 
+import pytest
 from sqlalchemy import Engine
 
 from l1_foundation.settings import Settings
@@ -65,8 +66,9 @@ class FakeSettings:
     rag_lexical_candidate_limit = 30
     rag_fused_candidate_limit = 20
     rag_rrf_k = 60
-    rag_vector_weight = 1.0
-    rag_lexical_weight = 1.0
+    rag_original_vector_weight = 0.7
+    rag_expanded_vector_weight = 0.2
+    rag_lexical_weight = 0.1
     embedding_model = "Qwen/Qwen3-Embedding-4B"
     embedding_dimensions = 2560
     rag_recording_profile_search_enabled = True
@@ -408,7 +410,25 @@ def test_rrf_fusion_rewards_a_chunk_returned_by_multiple_query_variants() -> Non
     )
 
     assert result[0]["chunk_id"] == returned_by_both
-    assert {row["chunk_id"] for row in result[1:]} == {original_only, expansion_only}
+    assert [row["chunk_id"] for row in result[1:]] == [original_only, expansion_only]
+    assert float(cast(float, result[1]["score"])) > float(cast(float, result[2]["score"]))
+
+
+def test_rrf_normalizes_total_lexical_weight_across_query_variants() -> None:
+    lexical_hit = uuid4()
+    retriever = _retriever(FakeConnection([]))
+
+    one_query = retriever.fuse_candidate_lists([], [[{"chunk_id": lexical_hit, "score": 1.0}]], limit=10)
+    two_queries = retriever.fuse_candidate_lists(
+        [],
+        [
+            [{"chunk_id": lexical_hit, "score": 1.0}],
+            [{"chunk_id": lexical_hit, "score": 1.0}],
+        ],
+        limit=10,
+    )
+
+    assert float(cast(float, one_query[0]["score"])) == pytest.approx(float(cast(float, two_queries[0]["score"])))
 
 
 def test_overlapping_expanded_contexts_are_merged_without_duplicate_lines() -> None:

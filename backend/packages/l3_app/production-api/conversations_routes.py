@@ -40,6 +40,7 @@ class SendConversationMessageRequest(BaseModel):
     content_blocks: list[TextBlock] = Field(min_length=1)
     client_message_id: UUID
     limit: int = Field(default=10, ge=1, le=20)
+    force_correction: bool = False
 
 
 class StartConversationTurnRequest(SendConversationMessageRequest):
@@ -97,6 +98,7 @@ async def start_conversation_turn(
             payload.client_message_id,
             payload.limit,
             _rag_service(request).accessible_recording_ids(user),
+            payload.force_correction,
         )
         if assistant_message.generation_run_id is None:
             raise RuntimeError("Assistant message is missing its generation run")
@@ -276,6 +278,7 @@ async def send_message(
             payload.client_message_id,
             payload.limit,
             _rag_service(request).accessible_recording_ids(user),
+            payload.force_correction,
         )
         if assistant_message.generation_run_id is None:
             raise RuntimeError("Assistant message is missing its generation run")

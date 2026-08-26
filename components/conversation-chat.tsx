@@ -17,6 +17,7 @@ const generationClient = new GenerationStreamClient();
 export function ConversationChat({ conversationId }: { conversationId?: string }) {
   const router = useRouter();
   const [draft, setDraft] = useState("");
+  const [forceCorrection, setForceCorrection] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [stopping, setStopping] = useState(false);
@@ -58,6 +59,7 @@ export function ConversationChat({ conversationId }: { conversationId?: string }
             client_conversation_id: temporaryId.slice("temporary:".length),
             client_message_id: clientMessageId,
             content_blocks: [{ type: "text", value: text }],
+            force_correction: forceCorrection,
             limit: 10,
           },
           (event) => {
@@ -75,7 +77,7 @@ export function ConversationChat({ conversationId }: { conversationId?: string }
         return;
       }
       if (creatingConversation) return;
-      const turn = await sendMessage(effectiveConversationId, text, clientMessageId);
+      const turn = await sendMessage(effectiveConversationId, text, clientMessageId, forceCorrection);
       reconcileTurn(turn); setDraft(""); generationClient.connect(turn.generation_run_id);
     } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); }
     finally { if (!creatingConversation) setSubmitting(false); }
@@ -107,7 +109,7 @@ export function ConversationChat({ conversationId }: { conversationId?: string }
     }
   }
 
-  return <div className="chat-page"><header className="chat-header"><Link className="button secondary" href="/recordings">返回录音管理</Link></header><div className={`chat-layout ${conversations.length === 0 ? "without-conversation-list" : ""}`}>{conversations.length > 0 ? <aside className="conversation-list"><Link className="button" href="/chat" onClick={() => setActiveConversation(null)}>新建对话</Link>{conversations.map((item) => <div className="conversation-list-item" key={item.id}>{item.id.startsWith("temporary:") ? <span className="selected">{item.title}</span> : <Link className={item.id === effectiveConversationId ? "selected" : ""} href={`/chat/${item.id}`}>{item.title}</Link>}<button aria-label={`删除对话：${item.title}`} className="conversation-delete" disabled={item.id.startsWith("temporary:")} onClick={() => void remove(item.id)} type="button">删除</button></div>)}</aside> : null}<section className="chat-panel"><div className="message-list">{effectiveConversationId ? messages.map((message) => <MessageItem isLatestAssistant={message.id === latestAssistant?.id} key={message.id} message={message} />) : <p className="chat-empty">开始一个新对话，向已处理的录音提问。</p>}</div>{error ? <p className="chat-error">{error}</p> : null}<form className="chat-composer" onSubmit={submit}><textarea disabled={creatingConversation || generationActive || interactionPending || submitting} value={draft} onChange={(event) => setDraft(event.target.value)} placeholder={interactionPending ? "请先处理上方的转写确认" : generationActive ? "请先停止当前回答，再发送新消息" : "输入一个关于录音的问题…"} rows={3} />{generationActive ? <button disabled={stopping || latestAssistant?.generation_run_id === null} onClick={() => void stopLatestGeneration()} type="button">{stopping ? "正在停止…" : "停止生成"}</button> : <button disabled={creatingConversation || interactionPending || submitting || !draft.trim()} type="submit">{interactionPending ? "等待确认" : submitting ? "正在发送…" : "发送"}</button>}</form></section></div></div>;
+  return <div className="chat-page"><header className="chat-header"><Link className="button secondary" href="/recordings">返回录音管理</Link></header><div className={`chat-layout ${conversations.length === 0 ? "without-conversation-list" : ""}`}>{conversations.length > 0 ? <aside className="conversation-list"><Link className="button" href="/chat" onClick={() => setActiveConversation(null)}>新建对话</Link>{conversations.map((item) => <div className="conversation-list-item" key={item.id}>{item.id.startsWith("temporary:") ? <span className="selected">{item.title}</span> : <Link className={item.id === effectiveConversationId ? "selected" : ""} href={`/chat/${item.id}`}>{item.title}</Link>}<button aria-label={`删除对话：${item.title}`} className="conversation-delete" disabled={item.id.startsWith("temporary:")} onClick={() => void remove(item.id)} type="button">删除</button></div>)}</aside> : null}<section className="chat-panel"><div className="message-list">{effectiveConversationId ? messages.map((message) => <MessageItem isLatestAssistant={message.id === latestAssistant?.id} key={message.id} message={message} />) : <p className="chat-empty">开始一个新对话，向已处理的录音提问。</p>}</div>{error ? <p className="chat-error">{error}</p> : null}<form className="chat-composer" onSubmit={submit}><div className="chat-composer-input"><textarea disabled={creatingConversation || generationActive || interactionPending || submitting} value={draft} onChange={(event) => setDraft(event.target.value)} placeholder={interactionPending ? "请先处理上方的转写确认" : generationActive ? "请先停止当前回答，再发送新消息" : "输入一个关于录音的问题…"} rows={3} /><label className="chat-correction-toggle" title="跳过风险判断，直接执行录音纠错"><input checked={forceCorrection} disabled={creatingConversation || generationActive || interactionPending || submitting} onChange={(event) => setForceCorrection(event.target.checked)} type="checkbox" />开启纠错</label></div>{generationActive ? <button disabled={stopping || latestAssistant?.generation_run_id === null} onClick={() => void stopLatestGeneration()} type="button">{stopping ? "正在停止…" : "停止生成"}</button> : <button disabled={creatingConversation || interactionPending || submitting || !draft.trim()} type="submit">{interactionPending ? "等待确认" : submitting ? "正在发送…" : "发送"}</button>}</form></section></div></div>;
 }
 
 function conversationReady(event: GenerationEvent): { conversation: Conversation; turn: ConversationTurn } | null {

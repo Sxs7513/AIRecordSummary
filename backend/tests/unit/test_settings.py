@@ -98,16 +98,21 @@ def test_summary_defaults_to_large_context_without_rolling() -> None:
     assert settings.llm_correction_provider == "gemini"
     assert settings.topic_detection_provider == "gemini"
     assert settings.recording_summary_provider == "gemini"
-    assert settings.rag_answer_provider == "gemini"
+    assert settings.rag_online_default_model == "gemini-gemini-3.5-flash-lite"
     assert settings.rag_asr_adjudication_search_provider == "gemini"
     assert settings.rag_asr_adjudication_audit_prompt_variant == "relation_rules"
-    assert settings.rag_asr_adjudication_audit_model is None
+    assert settings.rag_asr_adjudication_audit_model == "gemini-gemini-3.5-flash-lite"
+    assert settings.rag_asr_adjudication_construct_model == "gemini-gemini-3.5-flash-lite"
+    assert settings.rag_asr_adjudication_decision_model == "gemini-gemini-3.5-flash-lite"
     assert settings.rag_asr_adjudication_audit_min_request_interval_seconds == 15
     assert settings.rag_asr_adjudication_search_model == "gemini-2.5-flash-lite"
     assert settings.rag_asr_adjudication_chrome_aio_timeout_seconds == 45
     assert settings.rag_asr_adjudication_chrome_aio_poll_interval_seconds == 1
     assert settings.gemini_model == "gemini-3.5-flash-lite"
     assert settings.gemini_min_request_interval_seconds == 5
+    assert settings.qwen_llm_model == "qwen3.8-flash"
+    assert settings.qwen_llm_base_url == "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    assert settings.qwen_llm_min_request_interval_seconds == 0
     assert settings.llm_correction_max_output_tokens == 65_536
     assert settings.text_correction_context_units == 1
     assert settings.local_llm_model_repo == "Qwen/Qwen2.5-7B-Instruct-GGUF"
@@ -130,31 +135,60 @@ def test_adjudication_audit_prompt_variant_can_select_free_discovery() -> None:
         )
 
 
-def test_adjudication_audit_model_can_be_overridden() -> None:
+def test_adjudication_agent_models_can_be_overridden() -> None:
     settings = Settings(
         _env_file=None,
         **settings_payload(
-            RAG_ASR_ADJUDICATION_AUDIT_MODEL="gemini-3.6-flash",
+            RAG_ASR_ADJUDICATION_AUDIT_MODEL="qwen-qwen3.8-max",
+            RAG_ASR_ADJUDICATION_CONSTRUCT_MODEL="qwen-qwen3.8-max",
+            RAG_ASR_ADJUDICATION_DECISION_MODEL="qwen-qwen3.8-max",
             RAG_ASR_ADJUDICATION_AUDIT_MIN_REQUEST_INTERVAL_SECONDS=12,
         ),
     )
 
-    assert settings.rag_asr_adjudication_audit_model == "gemini-3.6-flash"
+    assert settings.rag_asr_adjudication_audit_model == "qwen-qwen3.8-max"
+    assert settings.rag_asr_adjudication_construct_model == "qwen-qwen3.8-max"
+    assert settings.rag_asr_adjudication_decision_model == "qwen-qwen3.8-max"
     assert settings.rag_asr_adjudication_audit_min_request_interval_seconds == 12
 
 
-def test_default_llm_provider_can_select_zhipu_for_every_llm_use() -> None:
+def test_default_llm_provider_can_select_zhipu_without_changing_the_rag_model() -> None:
     settings = Settings(_env_file=None, **settings_payload(LLM_DEFAULT_PROVIDER="zhipu"))
 
     assert settings.llm_correction_provider == "zhipu"
     assert settings.topic_detection_provider == "zhipu"
     assert settings.recording_summary_provider == "zhipu"
-    assert settings.rag_answer_provider == "zhipu"
+    assert settings.rag_online_default_model == "gemini-gemini-3.5-flash-lite"
 
 
-def test_rag_answer_provider_rejects_local_model() -> None:
-    with pytest.raises(ValidationError, match="must be an online provider"):
-        Settings(_env_file=None, **settings_payload(RAG_ANSWER_PROVIDER="local"))
+def test_default_llm_provider_can_select_qwen_without_changing_the_rag_model() -> None:
+    settings = Settings(
+        _env_file=None,
+        **settings_payload(
+            LLM_DEFAULT_PROVIDER="qwen",
+            QWEN_AI_PLATFORM_API_KEY="test-key",
+        ),
+    )
+
+    assert settings.llm_correction_provider == "qwen"
+    assert settings.topic_detection_provider == "qwen"
+    assert settings.recording_summary_provider == "qwen"
+    assert settings.rag_online_default_model == "gemini-gemini-3.5-flash-lite"
+    assert settings.qwen_ai_platform_api_key == "test-key"
+
+
+def test_rag_online_models_require_provider_qualified_online_references() -> None:
+    with pytest.raises(ValidationError, match="<provider>-<model>"):
+        Settings(_env_file=None, **settings_payload(RAG_ONLINE_DEFAULT_MODEL="gemini"))
+
+    with pytest.raises(ValidationError, match="provider must be one of"):
+        Settings(_env_file=None, **settings_payload(RAG_ASR_ADJUDICATION_AUDIT_MODEL="local-qwen3-4b"))
+
+    with pytest.raises(ValidationError, match="<provider>-<model>"):
+        Settings(_env_file=None, **settings_payload(RAG_ASR_ADJUDICATION_CONSTRUCT_MODEL="qwen"))
+
+    with pytest.raises(ValidationError, match="provider must be one of"):
+        Settings(_env_file=None, **settings_payload(RAG_ASR_ADJUDICATION_DECISION_MODEL="local-qwen3-4b"))
 
 
 def test_hybrid_retrieval_defaults_are_enabled_and_bounded() -> None:
@@ -165,6 +199,9 @@ def test_hybrid_retrieval_defaults_are_enabled_and_bounded() -> None:
     assert settings.rag_lexical_candidate_limit == 30
     assert settings.rag_fused_candidate_limit == 20
     assert settings.rag_rrf_k == 60
+    assert settings.rag_original_vector_weight == 0.7
+    assert settings.rag_expanded_vector_weight == 0.2
+    assert settings.rag_lexical_weight == 0.1
     assert settings.rag_local_model_repo == "Qwen/Qwen3-4B-GGUF"
     assert settings.rag_route_model_profile == "default"
     assert settings.rag_node_model_profile == "default"
@@ -193,9 +230,13 @@ def test_rag_node_model_profile_can_switch_between_7b_and_4b() -> None:
         Settings(_env_file=None, **settings_payload(RAG_NODE_MODEL_PROFILE="unknown"))
 
 
-def test_hybrid_retrieval_rejects_two_zero_weights() -> None:
-    with pytest.raises(ValidationError, match="cannot both be zero"):
+def test_hybrid_retrieval_rejects_all_zero_weights() -> None:
+    with pytest.raises(ValidationError, match="cannot all be zero"):
         Settings(
             _env_file=None,
-            **settings_payload(RAG_VECTOR_WEIGHT=0, RAG_LEXICAL_WEIGHT=0),
+            **settings_payload(
+                RAG_ORIGINAL_VECTOR_WEIGHT=0,
+                RAG_EXPANDED_VECTOR_WEIGHT=0,
+                RAG_LEXICAL_WEIGHT=0,
+            ),
         )

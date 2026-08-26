@@ -8,6 +8,8 @@ from urllib.parse import quote
 from pydantic import AliasChoices, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from l1_foundation.model_ref import OnlineModelRef
+
 
 def _find_repository_root() -> Path:
     for candidate in Path(__file__).resolve().parents:
@@ -19,7 +21,7 @@ def _find_repository_root() -> Path:
 REPOSITORY_ROOT = _find_repository_root()
 ROOT_ENV_FILE = REPOSITORY_ROOT / ".env"
 ROOT_ENV_LOCAL_FILE = REPOSITORY_ROOT / ".env.local"
-LlmProviderName = Literal["local", "zhipu", "gemini"]
+LlmProviderName = Literal["local", "zhipu", "gemini", "qwen"]
 RagAdjudicationSearchProvider = Literal["gemini", "chrome_ai_overview"]
 RagAdjudicationAuditPromptVariant = Literal["relation_rules", "free_discovery"]
 
@@ -143,8 +145,9 @@ class Settings(BaseSettings):
     rag_lexical_candidate_limit: int = Field(default=30, gt=0, le=200, validation_alias="RAG_LEXICAL_CANDIDATE_LIMIT")
     rag_fused_candidate_limit: int = Field(default=20, gt=0, le=200, validation_alias="RAG_FUSED_CANDIDATE_LIMIT")
     rag_rrf_k: int = Field(default=60, gt=0, validation_alias="RAG_RRF_K")
-    rag_vector_weight: float = Field(default=1.0, ge=0, validation_alias="RAG_VECTOR_WEIGHT")
-    rag_lexical_weight: float = Field(default=1.0, ge=0, validation_alias="RAG_LEXICAL_WEIGHT")
+    rag_original_vector_weight: float = Field(default=0.7, ge=0, validation_alias="RAG_ORIGINAL_VECTOR_WEIGHT")
+    rag_expanded_vector_weight: float = Field(default=0.2, ge=0, validation_alias="RAG_EXPANDED_VECTOR_WEIGHT")
+    rag_lexical_weight: float = Field(default=0.1, ge=0, validation_alias="RAG_LEXICAL_WEIGHT")
     rag_recording_profile_search_enabled: bool = Field(default=True, validation_alias="RAG_RECORDING_PROFILE_SEARCH_ENABLED")
     rag_recording_profile_candidate_limit: int = Field(default=3, gt=0, le=20, validation_alias="RAG_RECORDING_PROFILE_CANDIDATE_LIMIT")
     rag_recording_profile_min_score: float = Field(default=0.30, ge=-1, le=1, validation_alias="RAG_RECORDING_PROFILE_MIN_SCORE")
@@ -219,10 +222,20 @@ class Settings(BaseSettings):
         default="relation_rules",
         validation_alias="RAG_ASR_ADJUDICATION_AUDIT_PROMPT_VARIANT",
     )
-    rag_asr_adjudication_audit_model: str | None = Field(
-        default=None,
+    rag_asr_adjudication_audit_model: str = Field(
+        default="gemini-gemini-3.5-flash-lite",
         min_length=1,
         validation_alias="RAG_ASR_ADJUDICATION_AUDIT_MODEL",
+    )
+    rag_asr_adjudication_construct_model: str = Field(
+        default="gemini-gemini-3.5-flash-lite",
+        min_length=1,
+        validation_alias="RAG_ASR_ADJUDICATION_CONSTRUCT_MODEL",
+    )
+    rag_asr_adjudication_decision_model: str = Field(
+        default="gemini-gemini-3.5-flash-lite",
+        min_length=1,
+        validation_alias="RAG_ASR_ADJUDICATION_DECISION_MODEL",
     )
     rag_asr_adjudication_audit_min_request_interval_seconds: float = Field(
         default=15.0,
@@ -251,9 +264,10 @@ class Settings(BaseSettings):
         gt=0,
         validation_alias="RAG_ASR_ADJUDICATION_CHROME_AIO_POLL_INTERVAL_SECONDS",
     )
-    rag_answer_provider: LlmProviderName = Field(
-        default="gemini",
-        validation_alias=AliasChoices("RAG_ANSWER_PROVIDER", "LLM_DEFAULT_PROVIDER"),
+    rag_online_default_model: str = Field(
+        default="gemini-gemini-3.5-flash-lite",
+        min_length=1,
+        validation_alias="RAG_ONLINE_DEFAULT_MODEL",
     )
     zhipu_api_key: str | None = Field(default=None, validation_alias="ZHIPU_API_KEY")
     zhipu_model: str = Field(default="glm-4.5-flash", validation_alias="ZHIPU_MODEL")
@@ -270,6 +284,18 @@ class Settings(BaseSettings):
         default=5.0,
         ge=0,
         validation_alias="GEMINI_MIN_REQUEST_INTERVAL_SECONDS",
+    )
+    qwen_ai_platform_api_key: str | None = Field(default=None, validation_alias="QWEN_AI_PLATFORM_API_KEY")
+    qwen_llm_model: str = Field(default="qwen3.8-flash", validation_alias="QWEN_LLM_MODEL")
+    qwen_llm_base_url: str = Field(
+        default="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        validation_alias="QWEN_LLM_BASE_URL",
+    )
+    qwen_llm_timeout_seconds: float = Field(default=300.0, gt=0, validation_alias="QWEN_LLM_TIMEOUT_SECONDS")
+    qwen_llm_min_request_interval_seconds: float = Field(
+        default=0,
+        ge=0,
+        validation_alias="QWEN_LLM_MIN_REQUEST_INTERVAL_SECONDS",
     )
     pyannote_auth_token: str | None = Field(default=None, validation_alias="PYANNOTE_AUTH_TOKEN")
     pyannote_model: str = Field(default="pyannote/speaker-diarization-3.1", validation_alias="PYANNOTE_MODEL")
@@ -294,10 +320,12 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_hybrid_retrieval_settings(self) -> Self:
-        if self.rag_answer_provider == "local":
-            raise ValueError("RAG_ANSWER_PROVIDER must be an online provider because answer generation is always remote")
-        if self.rag_vector_weight == 0 and self.rag_lexical_weight == 0:
-            raise ValueError("RAG vector and lexical weights cannot both be zero")
+        OnlineModelRef.parse(self.rag_online_default_model)
+        OnlineModelRef.parse(self.rag_asr_adjudication_audit_model)
+        OnlineModelRef.parse(self.rag_asr_adjudication_construct_model)
+        OnlineModelRef.parse(self.rag_asr_adjudication_decision_model)
+        if self.rag_original_vector_weight == 0 and self.rag_expanded_vector_weight == 0 and self.rag_lexical_weight == 0:
+            raise ValueError("RAG retrieval weights cannot all be zero")
         if self.rag_fused_candidate_limit > self.rag_vector_candidate_limit + self.rag_lexical_candidate_limit:
             raise ValueError("RAG fused candidate limit cannot exceed the sum of branch candidate limits")
         if self.rag_rerank_output_limit > self.rag_rerank_candidate_limit:

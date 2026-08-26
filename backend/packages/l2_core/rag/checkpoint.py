@@ -35,12 +35,13 @@ def _string_set() -> set[str]:
     return set()
 
 
-def rag_input_hash(query: str, limit: int, scope_recording_ids: list[UUID]) -> str:
+def rag_input_hash(query: str, limit: int, scope_recording_ids: list[UUID], force_correction: bool = False) -> str:
     payload = json.dumps(
         {
             "query": query,
             "limit": limit,
             "scope_recording_ids": sorted(str(item) for item in scope_recording_ids),
+            "force_correction": force_correction,
             "workflow_version": WORKFLOW_VERSION,
         },
         ensure_ascii=False,

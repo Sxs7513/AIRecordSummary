@@ -355,10 +355,13 @@ class RagAdjudicationEvaluationService:
         end_char: int,
         original_expression: str,
         accepted_expressions: list[str],
+        importance: str = "important",
     ) -> dict[str, Any]:
         clean_accepted = list(dict.fromkeys(value.strip() for value in accepted_expressions if value.strip()))
         if not clean_accepted:
             raise ValueError("At least one accepted expression is required")
+        if importance not in {"important", "minor"}:
+            raise ValueError("Correction importance must be important or minor")
         with self._engine.begin() as connection:
             evidence = self._require_evidence(connection, user, target_evidence_id, for_update=True)
             if evidence["role"] != "target":
@@ -389,9 +392,9 @@ class RagAdjudicationEvaluationService:
                         """
                     insert into rag_adjudication_evaluation_correction_drafts (
                         target_evidence_draft_id, start_char, end_char,
-                        original_expression, accepted_expressions
+                        original_expression, accepted_expressions, importance
                     ) values (
-                        :id, :start_char, :end_char, :original, cast(:accepted as text[])
+                        :id, :start_char, :end_char, :original, cast(:accepted as text[]), :importance
                     ) returning *
                     """
                     ),
@@ -401,6 +404,7 @@ class RagAdjudicationEvaluationService:
                         "end_char": end_char,
                         "original": original_expression,
                         "accepted": clean_accepted,
+                        "importance": importance,
                     },
                 )
                 .mappings()
@@ -448,10 +452,13 @@ class RagAdjudicationEvaluationService:
         end_char: int,
         original_expression: str,
         accepted_expressions: list[str],
+        importance: str = "important",
     ) -> dict[str, Any]:
         clean_accepted = list(dict.fromkeys(value.strip() for value in accepted_expressions if value.strip()))
         if not clean_accepted:
             raise ValueError("At least one accepted expression is required")
+        if importance not in {"important", "minor"}:
+            raise ValueError("Correction importance must be important or minor")
         with self._engine.begin() as connection:
             row = (
                 connection.execute(
@@ -506,7 +513,8 @@ class RagAdjudicationEvaluationService:
                     update rag_adjudication_evaluation_correction_drafts
                     set start_char=:start_char, end_char=:end_char,
                         original_expression=:original,
-                        accepted_expressions=cast(:accepted as text[]), updated_at=now()
+                        accepted_expressions=cast(:accepted as text[]), importance=:importance,
+                        updated_at=now()
                     where id=:id returning *
                     """
                     ),
@@ -516,6 +524,7 @@ class RagAdjudicationEvaluationService:
                         "end_char": end_char,
                         "original": original_expression,
                         "accepted": clean_accepted,
+                        "importance": importance,
                     },
                 )
                 .mappings()
@@ -599,8 +608,9 @@ class RagAdjudicationEvaluationService:
                         "definition": _json(
                             {
                                 "task_type": "rag_adjudication",
-                                "metric_suite": "strict_relaxed_correction_prf_v2",
-                                "fuzzy_matcher": "rapidfuzz.fuzz.ratio",
+                                "metric_suite": "weighted_semantic_correction_prf_v5",
+                                "fuzzy_matcher": "rapidfuzz.fuzz.ratio(local_or_expression)",
+                                "gold_importance_weights": {"important": 1.0, "minor": 0.5},
                             }
                         ),
                         "count": len(payload),
@@ -672,10 +682,10 @@ class RagAdjudicationEvaluationService:
                                 """
                                 insert into rag_adjudication_evaluation_corrections (
                                     target_evidence_id, start_char, end_char,
-                                    original_expression, accepted_expressions
+                                    original_expression, accepted_expressions, importance
                                 ) values (
                                     :evidence_id, :start_char, :end_char,
-                                    :original, cast(:accepted as text[])
+                                    :original, cast(:accepted as text[]), :importance
                                 )
                                 """
                             ),
@@ -685,6 +695,7 @@ class RagAdjudicationEvaluationService:
                                 "end_char": correction["end_char"],
                                 "original": correction["original_expression"],
                                 "accepted": correction["accepted_expressions"],
+                                "importance": correction["importance"],
                             },
                         )
             return dict(
@@ -849,7 +860,8 @@ class RagAdjudicationEvaluationService:
                         text(
                             """
                             select scored.*, gold.start_char, gold.end_char,
-                                   gold.original_expression, gold.accepted_expressions
+                                   gold.original_expression, gold.accepted_expressions,
+                                   gold.importance
                             from rag_adjudication_evaluation_correction_results scored
                             join rag_adjudication_evaluation_corrections gold
                               on gold.id=scored.gold_correction_id
@@ -1010,11 +1022,15 @@ class RagAdjudicationEvaluationService:
 
     def _config_snapshot(self) -> dict[str, Any]:
         return {
-            "evaluator_version": "2",
-            "metric_version": "2",
-            "fuzzy_matcher": "rapidfuzz.fuzz.ratio",
+            "evaluator_version": "5",
+            "metric_version": "5",
+            "fuzzy_matcher": "rapidfuzz.fuzz.ratio(local_or_expression)",
             "fuzzy_threshold": 90.0,
-            "provider": self._settings.rag_answer_provider,
+            "expression_fuzzy_threshold": 80.0,
+            "coverage_matcher": "overlapping_union_window_v1",
+            "prediction_gold_cardinality": "one_to_many",
+            "gold_importance_weights": {"important": 1.0, "minor": 0.5},
+            "online_default_model": self._settings.rag_online_default_model,
             "context_size": self._settings.rag_context_size,
             "max_iterations": 4,
             "max_searches": 3,
@@ -1022,6 +1038,8 @@ class RagAdjudicationEvaluationService:
             "auto_resolve_confidence": self._settings.rag_asr_adjudication_auto_resolve_confidence,
             "audit_prompt_variant": self._settings.rag_asr_adjudication_audit_prompt_variant,
             "audit_model": self._settings.rag_asr_adjudication_audit_model,
+            "construct_model": self._settings.rag_asr_adjudication_construct_model,
+            "decision_model": self._settings.rag_asr_adjudication_decision_model,
         }
 
     @staticmethod

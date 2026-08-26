@@ -6,7 +6,7 @@ from uuid import UUID
 
 from sqlalchemy import Engine
 
-from l1_foundation.llm import LlmProvider
+from l1_foundation.model_ref import OnlineModelRef
 from l1_foundation.observability import InstrumentedModelClient, ObservabilityClient, ObservabilityScope, observation_scope
 from l1_foundation.settings import Settings
 from l1_foundation.streaming import SyncRedisStreamStore
@@ -56,10 +56,11 @@ class RagService:
         self._checkpoint_store = RagCheckpointStore(redis_store, settings.rag_checkpoint_ttl_seconds)
         self._access = RecordingAccessService(engine)
         grounded_search_client = self._grounded_search_client(settings)
+        online_model = OnlineModelRef.parse(settings.rag_online_default_model)
         self._graph = RagGraph(
             self._retriever,
             InstrumentedModelClient(worker_client),
-            online_provider=LlmProvider(settings.rag_answer_provider),
+            online_model=online_model,
             context_size=settings.rag_context_size,
             plan_local_input_tokens=settings.rag_plan_local_input_tokens,
             max_total_tokens=settings.rag_run_max_total_tokens,
@@ -70,7 +71,9 @@ class RagService:
             asr_adjudication_web_search_enabled=settings.rag_asr_adjudication_web_search_enabled,
             asr_adjudication_auto_resolve_confidence=settings.rag_asr_adjudication_auto_resolve_confidence,
             asr_adjudication_audit_prompt_variant=settings.rag_asr_adjudication_audit_prompt_variant,
-            asr_adjudication_audit_model=settings.rag_asr_adjudication_audit_model,
+            asr_adjudication_audit_model=OnlineModelRef.parse(settings.rag_asr_adjudication_audit_model),
+            asr_adjudication_construct_model=OnlineModelRef.parse(settings.rag_asr_adjudication_construct_model),
+            asr_adjudication_decision_model=OnlineModelRef.parse(settings.rag_asr_adjudication_decision_model),
             asr_adjudication_audit_min_request_interval_seconds=(settings.rag_asr_adjudication_audit_min_request_interval_seconds),
             grounded_search_client=grounded_search_client,
         )
@@ -120,6 +123,7 @@ class RagService:
         limit: int,
         scope_recording_ids: list[UUID] | None = None,
         history: list[RagHistoryMessage] | None = None,
+        force_correction: bool = False,
         resume_from_generation_id: UUID | None = None,
         adjudication_user_decision: ClaimConfirmationDecision | None = None,
     ) -> GenerationSnapshot:
@@ -159,7 +163,7 @@ class RagService:
                     store=self._checkpoint_store,
                     generation_id=run_id,
                     source_generation_id=resume_from_generation_id,
-                    input_hash=rag_input_hash(query, limit, scope_recording_ids or []),
+                    input_hash=rag_input_hash(query, limit, scope_recording_ids or [], force_correction),
                     hydrate_state=self._retriever.hydrate_checkpoint_state,
                     rerun_nodes=(
                         {
@@ -186,6 +190,7 @@ class RagService:
                         on_phase=sink.phase,
                         on_delta=sink.text,
                         history=history,
+                        force_correction=force_correction,
                         run_id=run_id,
                         existing_answer=existing_answer,
                         existing_original_answer=existing_original_answer,

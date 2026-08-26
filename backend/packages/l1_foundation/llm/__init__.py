@@ -20,6 +20,7 @@ from l1_foundation.llm.errors import LlmConfigurationError, LlmError, LlmRespons
 from l1_foundation.llm.factory import create_language_model, create_language_model_from_settings
 from l1_foundation.llm.gemini import GeminiLanguageModel
 from l1_foundation.llm.local import LocalLlamaLanguageModel
+from l1_foundation.llm.qwen import QwenLanguageModel
 from l1_foundation.llm.worker_handler import (
     LlmBatchPrompt,
     LlmBatchWorkerHandler,
@@ -50,6 +51,7 @@ __all__ = [
     "LlmStreamEvent",
     "LocalLlamaLanguageModel",
     "ProviderCapabilities",
+    "QwenLanguageModel",
     "ResponseFormat",
     "ResponseFormatType",
     "ToolCall",

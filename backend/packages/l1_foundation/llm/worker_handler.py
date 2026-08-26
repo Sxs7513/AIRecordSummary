@@ -268,10 +268,11 @@ class LlmWorkerHandler:
         started_at = monotonic()
         context.raise_if_cancelled()
         model = self._model_for(value.context_size, value.model_profile)
+        request_model = value.options.model or model.model_name
         logger.info(
             "LLM Worker 请求开始 provider=%s model=%s context_size=%d stream=%s",
             model.provider.value,
-            model.model_name,
+            request_model,
             value.context_size,
             str(value.stream).lower(),
         )
@@ -311,7 +312,7 @@ class LlmWorkerHandler:
             logger.info(
                 "LLM Worker 请求失败 provider=%s model=%s stream=%s elapsed_ms=%d",
                 model.provider.value,
-                model.model_name,
+                request_model,
                 str(value.stream).lower(),
                 round((monotonic() - started_at) * 1000),
                 exc_info=True,

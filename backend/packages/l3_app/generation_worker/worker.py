@@ -41,6 +41,7 @@ class RagGenerationExecutor(Protocol):
         limit: int,
         scope_recording_ids: list[UUID] | None = None,
         history: list[RagHistoryMessage] | None = None,
+        force_correction: bool = False,
         resume_from_generation_id: UUID | None = None,
         adjudication_user_decision: ClaimConfirmationDecision | None = None,
     ) -> GenerationSnapshot: ...
@@ -166,15 +167,16 @@ class GenerationCommandHandler:
     async def _execute_rag(self, item: RagGenerationWorkItem) -> GenerationSnapshot:
         with execution_scope(ExecutionScope(kind="generation", id=item.run_id)):
             return await self._rag_service.execute_answer_generation(
-                self._generation_service,
-                item.run_id,
-                item.workspace_id,
-                item.query,
-                item.limit,
-                item.scope_recording_ids,
-                item.history,
-                item.resume_from_generation_id,
-                item.adjudication_user_decision,
+                generation_service=self._generation_service,
+                run_id=item.run_id,
+                workspace_id=item.workspace_id,
+                query=item.query,
+                limit=item.limit,
+                scope_recording_ids=item.scope_recording_ids,
+                history=item.history,
+                force_correction=item.force_correction,
+                resume_from_generation_id=item.resume_from_generation_id,
+                adjudication_user_decision=item.adjudication_user_decision,
             )
 
     async def _handle_summary(self, event: EventEnvelope) -> None:

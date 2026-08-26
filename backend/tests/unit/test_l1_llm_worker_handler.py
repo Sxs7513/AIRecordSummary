@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterator, Sequence
+
+import pytest
 
 from l1_foundation.llm import (
     ChatMessage,
@@ -99,7 +102,7 @@ def test_llm_worker_command_serializes_provider_and_operation() -> None:
     assert command.input.messages[0].content == "测试"
 
 
-def test_llm_worker_round_trips_per_request_model_override() -> None:
+def test_llm_worker_round_trips_per_request_model_override(caplog: pytest.LogCaptureFixture) -> None:
     command = build_llm_generate_command(
         LlmProvider.GEMINI,
         [ChatMessage(ChatRole.USER, "测试")],
@@ -112,6 +115,7 @@ def test_llm_worker_round_trips_per_request_model_override() -> None:
         stream=False,
     )
     model = FakeModel()
+    caplog.set_level(logging.INFO, logger="llm")
 
     LlmWorkerHandler(LlmProvider.GEMINI, lambda _context_size: model)(command.input, FakeContext())
 
@@ -119,6 +123,8 @@ def test_llm_worker_round_trips_per_request_model_override() -> None:
     assert command.input.options.min_request_interval_seconds == 15
     assert model.requested_models == ["gemini-audit"]
     assert model.requested_intervals == [15]
+    assert "LLM Worker 请求开始 provider=gemini model=gemini-audit" in caplog.text
+    assert "LLM Worker 请求开始 provider=gemini model=gemini-test" not in caplog.text
 
 
 def test_llm_worker_handler_supports_streaming() -> None:

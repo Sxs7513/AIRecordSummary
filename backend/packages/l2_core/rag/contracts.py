@@ -406,6 +406,7 @@ class RagGraphState(TypedDict):
     corrected_grade: EvidenceGrade | None
     planning_required: bool
     answer_plan: AnswerPlan | None
+    force_correction: bool
     query_correction_risk: bool
     adjudication_agent_state: AdjudicationAgentState | None
     adjudication_user_decision: ClaimConfirmationDecision | None

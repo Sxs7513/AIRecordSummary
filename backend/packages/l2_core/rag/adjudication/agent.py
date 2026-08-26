@@ -20,6 +20,7 @@ from l1_foundation.llm import (
     ResponseFormatType,
     build_llm_generate_command,
 )
+from l1_foundation.model_ref import OnlineModelRef
 from l1_foundation.observability import InstrumentedModelClient
 from l2_core.rag.adjudication.contracts import (
     AdjudicationAgentState,
@@ -85,7 +86,7 @@ class EvidenceAdjudicationAgent:
         self,
         *,
         model_client: InstrumentedModelClient,
-        online_provider: LlmProvider,
+        online_model: OnlineModelRef,
         context_size: int,
         token_budget: RagTokenBudgetMiddleware,
         grounded_search_client: GroundedSearchClient | None,
@@ -95,14 +96,17 @@ class EvidenceAdjudicationAgent:
         max_iterations: int,
         max_searches: int,
         audit_prompt_variant: AuditPromptVariant = "relation_rules",
-        audit_model: str | None = None,
+        audit_model: OnlineModelRef | None = None,
+        construct_model: OnlineModelRef | None = None,
+        decision_model: OnlineModelRef | None = None,
         audit_min_request_interval_seconds: float | None = None,
         node_started: NodeStarted,
         node_completed: NodeCompleted,
         event_logger: EventLogger,
+        structured_completion_logger: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         self._model_client = model_client
-        self._online_provider = online_provider
+        self._online_model = online_model
         self._context_size = context_size
         self._token_budget = token_budget
         self._grounded_search_client = grounded_search_client
@@ -112,11 +116,14 @@ class EvidenceAdjudicationAgent:
         self._max_iterations = max_iterations
         self._max_searches = max_searches
         self._audit_prompt_variant: AuditPromptVariant = audit_prompt_variant
-        self._audit_model = audit_model
+        self._audit_model = audit_model or online_model
+        self._construct_model = construct_model or online_model
+        self._decision_model = decision_model or online_model
         self._audit_min_request_interval_seconds = audit_min_request_interval_seconds
         self._node_started = node_started
         self._node_completed = node_completed
         self._event_logger = event_logger
+        self._structured_completion_logger = structured_completion_logger
 
         builder = cast(Any, StateGraph(RagGraphState))
         builder.add_node(
@@ -1235,8 +1242,8 @@ class EvidenceAdjudicationAgent:
             offset = found + 1
         return starts
 
-    @staticmethod
     def _log_structured_completion(
+        self,
         context: AdjudicationCaseContext,
         case_index: int,
         iteration: int,
@@ -1247,10 +1254,23 @@ class EvidenceAdjudicationAgent:
             value: object = json.loads(completion.text)
             payload = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
         except json.JSONDecodeError:
-            payload = json.dumps(
-                {"invalid_json": True, "raw_text": completion.text},
-                ensure_ascii=False,
-                separators=(",", ":"),
+            value = {"invalid_json": True, "raw_text": completion.text}
+            payload = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        structured_completion_logger = getattr(self, "_structured_completion_logger", None)
+        if structured_completion_logger is not None:
+            structured_completion_logger(
+                {
+                    "case_index": case_index,
+                    "iteration": iteration,
+                    "operation": operation,
+                    "provider": completion.provider.value,
+                    "model": completion.model,
+                    "finish_reason": completion.finish_reason,
+                    "prompt_tokens": completion.prompt_tokens,
+                    "completion_tokens": completion.completion_tokens,
+                    "request_id": completion.request_id,
+                    "payload": value,
+                }
             )
         logger.info(
             "Evidence Correct Agent Output run_id=%s case=%d iteration=%d operation=%s "
@@ -1381,7 +1401,7 @@ class EvidenceAdjudicationAgent:
             schema,
             node="adjudication_audit_expressions",
             max_tokens=5_000,
-            model=self._audit_model,
+            model_ref=self._audit_model,
             min_request_interval_seconds=self._audit_min_request_interval_seconds,
         )
 
@@ -1397,6 +1417,7 @@ class EvidenceAdjudicationAgent:
             schema,
             node="adjudication_reconstruct_candidates",
             max_tokens=8_000,
+            model_ref=self._construct_model,
         )
 
     async def _complete_candidate_decisions(
@@ -1411,6 +1432,7 @@ class EvidenceAdjudicationAgent:
             schema,
             node="adjudication_candidate_decisions",
             max_tokens=8_000,
+            model_ref=self._decision_model,
         )
 
     async def _complete_structured(
@@ -1421,17 +1443,18 @@ class EvidenceAdjudicationAgent:
         *,
         node: str,
         max_tokens: int,
-        model: str | None = None,
+        model_ref: OnlineModelRef | None = None,
         min_request_interval_seconds: float | None = None,
     ) -> LlmGenerateResult:
         self._token_budget.before_model(state.get("token_usage", 0), node)
+        selected_model = model_ref or self._online_model
         return await self._model_client.execute(
             build_llm_generate_command(
-                self._online_provider,
+                LlmProvider(selected_model.provider),
                 self._worker_messages(messages),
                 CompletionOptions(
                     max_tokens=max_tokens,
-                    model=model,
+                    model=selected_model.model,
                     min_request_interval_seconds=min_request_interval_seconds,
                     response_format=ResponseFormat(
                         type=ResponseFormatType.JSON_SCHEMA,

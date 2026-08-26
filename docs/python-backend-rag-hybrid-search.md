@@ -235,8 +235,9 @@ lexical candidate limit = 30
 
 ```text
 fused_score =
-    vector_weight  / (rrf_k + vector_rank)
-  + lexical_weight / (rrf_k + lexical_rank)
+    original_vector_weight / (rrf_k + original_vector_rank)
+  + expanded_vector_weight / (rrf_k + expanded_vector_rank)
+  + Σ (lexical_weight / lexical_query_count) / (rrf_k + lexical_rank_i)
 ```
 
 某个分支未命中该 chunk 时，不计算对应项。
@@ -245,8 +246,9 @@ fused_score =
 
 ```text
 rrf_k = 60
-vector_weight = 1.0
-lexical_weight = 1.0
+original_vector_weight = 0.7
+expanded_vector_weight = 0.2
+lexical_weight = 0.1
 ```
 
 不能直接使用下面的方式融合：
@@ -301,19 +303,21 @@ fused candidate limit = 20
   -> 生成 Evidence
 ```
 
-`RagGraph` 不感知内部检索实现，只调用：
+`RagGraph` 通过 `ChunkEvidencePipeline` 分阶段获取候选、扩展上下文并生成 Evidence：
 
 ```python
-evidence = await retriever.retrieve_chunks(
-    query=query,
+candidates = await chunk_evidence.retrieve_candidates(
+    query,
     filters=filters,
     limit=limit,
+    run_id=run_id,
 )
+evidence = await asyncio.to_thread(retriever.expand_candidates, candidates)
 ```
 
 ## 5. 资源调度
 
-当前 `RagGraph` 将整个 `retrieve_chunks()` 提交到 GPU 队列。混合搜索接入后需要缩小 GPU 资源边界：
+当前 `ChunkEvidencePipeline` 将同步 embedding 和数据库查询分别交给工作线程，并在协程层并行编排语义与关键词分支：
 
 ```text
 vector 分支：
@@ -335,12 +339,12 @@ vector_candidates, lexical_candidates = await asyncio.gather(
 
 其中：
 
-- embedding 推理作为 GPU 任务提交给 `ResourceScheduler`；
+- embedding 推理由 compute worker 执行，同步客户端等待过程通过 `asyncio.to_thread()` 隔离；
 - 同步 PostgreSQL 查询作为 CPU 任务执行，不能阻塞 Web 事件循环；
 - RRF 只处理几十个候选，可以直接在当前协程中完成；
-- embedding 模型仍按现有策略在查询向量生成完毕后释放。
+- 向量查询等待 embedding，关键词查询无需等待 embedding。
 
-关键词查询不能占用 GPU queue，数据库查询也不应在等待期间继续持有 GPU 资源。
+关键词查询不占用 compute worker，数据库查询也不会在 embedding 等待期间持有 GPU 资源。
 
 ## 6. Evidence 与 source
 
@@ -408,8 +412,9 @@ rag_vector_candidate_limit: int = 30
 rag_lexical_candidate_limit: int = 30
 rag_fused_candidate_limit: int = 20
 rag_rrf_k: int = 60
-rag_vector_weight: float = 1.0
-rag_lexical_weight: float = 1.0
+rag_original_vector_weight: float = 0.7
+rag_expanded_vector_weight: float = 0.2
+rag_lexical_weight: float = 0.1
 ```
 
 约束：
@@ -417,7 +422,7 @@ rag_lexical_weight: float = 1.0
 - candidate limit 必须大于零；
 - `rag_fused_candidate_limit` 不得大于两路候选数量之和；
 - `rag_rrf_k` 必须大于零；
-- 两个 weight 必须大于等于零，且不能同时为零。
+- 三个 weight 必须大于等于零，且不能同时为零。
 
 `rag_hybrid_search_enabled=false` 时退回当前向量检索，作为部署和故障回退开关。
 

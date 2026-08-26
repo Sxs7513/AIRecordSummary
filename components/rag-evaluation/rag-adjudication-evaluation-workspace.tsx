@@ -402,12 +402,25 @@ export function RagAdjudicationEvaluationWorkspace() {
               <section className="panel">
                 <h2>冻结版本</h2>
                 <div className="rag-eval-version-list">
-                  {detail.versions.map((version) => (
+                  {detail.versions.slice(0, 1).map((version) => (
                     <div className="rag-eval-version" key={version.id}>
-                      <div><strong>v{version.version_number}</strong><span>{version.case_count} 个 Case · {version.status}</span></div>
+                      <div><strong>v{version.version_number} <span className="badge">最新</span></strong><span>{version.case_count} 个 Case · {version.status}</span></div>
                       <button className="button" disabled={busy || version.status !== "frozen"} onClick={() => createRun(version)}>运行评测</button>
                     </div>
                   ))}
+                  {detail.versions.length > 1 && (
+                    <details className="rag-eval-version-history">
+                      <summary>其他冻结版本（{detail.versions.length - 1}）</summary>
+                      <div className="rag-eval-version-list">
+                        {detail.versions.slice(1).map((version) => (
+                          <div className="rag-eval-version" key={version.id}>
+                            <div><strong>v{version.version_number}</strong><span>{version.case_count} 个 Case · {version.status}</span></div>
+                            <button className="button secondary" disabled={busy || version.status !== "frozen"} onClick={() => createRun(version)}>运行评测</button>
+                          </div>
+                        ))}
+                      </div>
+                    </details>
+                  )}
                   {!detail.versions.length && <p className="subtle">批准 Case 后冻结不可变版本。</p>}
                 </div>
               </section>
@@ -443,6 +456,7 @@ function TargetEditor({
   const textRef = useRef<HTMLDivElement>(null);
   const [selection, setSelection] = useState<{ start: number; end: number; text: string } | null>(null);
   const [accepted, setAccepted] = useState("");
+  const [importance, setImportance] = useState<"important" | "minor">("important");
   const [localError, setLocalError] = useState<string | null>(null);
 
   function captureSelection() {
@@ -481,11 +495,13 @@ function TargetEditor({
           start_char: selection.start,
           end_char: selection.end,
           original_expression: selection.text,
-          accepted_expressions: values
+          accepted_expressions: values,
+          importance
         })
       });
       setSelection(null);
       setAccepted("");
+      setImportance("important");
       setLocalError(null);
       await onChanged();
     } catch (caught) {
@@ -496,6 +512,27 @@ function TargetEditor({
   async function deleteCorrection(id: string) {
     try {
       await ragAdjudicationEvaluationRequest(`/corrections/${id}`, { method: "DELETE" });
+      await onChanged();
+    } catch (caught) {
+      setLocalError(message(caught));
+    }
+  }
+
+  async function updateImportance(
+    item: AdjudicationEvidence["corrections"][number],
+    value: "important" | "minor"
+  ) {
+    try {
+      await ragAdjudicationEvaluationRequest(`/corrections/${item.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({
+          start_char: item.start_char,
+          end_char: item.end_char,
+          original_expression: item.original_expression,
+          accepted_expressions: item.accepted_expressions,
+          importance: value
+        })
+      });
       await onChanged();
     } catch (caught) {
       setLocalError(message(caught));
@@ -519,6 +556,7 @@ function TargetEditor({
       <form className="rag-adj-correction-form" onSubmit={addCorrection}>
         <label>已选错误文本<input readOnly value={selection?.text ?? ""} placeholder="请在上方文本中框选" /></label>
         <label>正确表达（逗号或换行分隔）<textarea onChange={(event) => setAccepted(event.target.value)} rows={2} value={accepted} /></label>
+        <label>重要性<select onChange={(event) => setImportance(event.target.value as "important" | "minor")} value={importance}><option value="important">重要 · 1.0</option><option value="minor">次要 · 0.5</option></select></label>
         <button className="button" disabled={busy || !selection}>添加 Gold</button>
       </form>
       {localError && <p className="error">{localError}</p>}
@@ -526,6 +564,7 @@ function TargetEditor({
         {evidence.corrections.map((item) => (
           <div className="rag-adj-gold" key={item.id}>
             <span><del>{item.original_expression}</del> → <AcceptedExpressionTags values={item.accepted_expressions} /></span>
+            <select aria-label="Gold 重要性" disabled={busy} onChange={(event) => void updateImportance(item, event.target.value as "important" | "minor")} value={item.importance}><option value="important">重要 · 1.0</option><option value="minor">次要 · 0.5</option></select>
             <small>[{item.start_char}, {item.end_char})</small>
             <button className="button danger" disabled={busy} onClick={() => deleteCorrection(item.id)}>删除</button>
           </div>
@@ -601,16 +640,8 @@ function RunResults({
       {detail && (
         <div className="rag-adj-run-detail">
           <div className="rag-adj-metric-groups">
-            <section className="rag-adj-metric-group">
-              <div className="rag-adj-metric-heading"><strong>Strict</strong><span>仅统计 Exact</span></div>
-              <div className="stats rag-adj-metrics">
-                <div className="stat card"><span className="subtle">Precision</span><strong>{percentage(strictPrecision?.value)}</strong></div>
-                <div className="stat card"><span className="subtle">Recall</span><strong>{percentage(strictRecall?.value)}</strong></div>
-                <div className="stat card"><span className="subtle">F1</span><strong>{percentage(strictF1?.value)}</strong></div>
-              </div>
-            </section>
-            <section className="rag-adj-metric-group">
-              <div className="rag-adj-metric-heading"><strong>Relaxed</strong><span>统计 Exact + Fuzzy</span></div>
+            <section className="rag-adj-metric-group primary">
+              <div className="rag-adj-metric-heading"><strong>语义匹配</strong><span>主指标 · 重要 1.0 / 次要 0.5</span></div>
               <div className="stats rag-adj-metrics">
                 <div className="stat card"><span className="subtle">Precision</span><strong>{percentage(relaxedPrecision?.value)}</strong></div>
                 <div className="stat card"><span className="subtle">Recall</span><strong>{percentage(relaxedRecall?.value)}</strong></div>
@@ -618,9 +649,19 @@ function RunResults({
               </div>
             </section>
             <div className="stats rag-adj-metric-summary">
-              <div className="stat card"><span className="subtle">Exact / Fuzzy</span><strong>{counts?.exact_count ?? 0}/{counts?.fuzzy_count ?? 0}</strong></div>
-              <div className="stat card"><span className="subtle">漏改 / 误改</span><strong>{counts?.false_negative ?? 0}/{counts?.false_positive ?? 0}</strong></div>
+              <div className="stat card"><span className="subtle">漏改 / 误改（互斥计数）</span><strong>{counts?.missed_gold_count ?? counts?.false_negative ?? 0}/{counts?.incorrect_prediction_count ?? counts?.false_positive ?? 0}</strong></div>
             </div>
+            <details className="rag-adj-metric-advanced">
+              <summary>高级指标 · 精确匹配</summary>
+              <section className="rag-adj-metric-group">
+                <div className="rag-adj-metric-heading"><strong>精确匹配</strong><span>仅统计 Exact</span></div>
+                <div className="stats rag-adj-metrics">
+                  <div className="stat card"><span className="subtle">Precision</span><strong>{percentage(strictPrecision?.value)}</strong></div>
+                  <div className="stat card"><span className="subtle">Recall</span><strong>{percentage(strictRecall?.value)}</strong></div>
+                  <div className="stat card"><span className="subtle">F1</span><strong>{percentage(strictF1?.value)}</strong></div>
+                </div>
+              </section>
+            </details>
           </div>
           <div className="rag-eval-result-cases">
             {detail.cases.map((item) => (
@@ -629,11 +670,11 @@ function RunResults({
                 {item.error_message && <p className="error">{item.error_type}: {item.error_message}</p>}
                 <div className="rag-adj-result-gold">
                   {item.corrections.map((correction) => (
-                    <div className={correction.details.match_kind === "fuzzy" ? "fuzzy" : correction.passed ? "passed" : "failed"} key={correction.gold_correction_id}>
-                      <span>{correction.original_expression} → <AcceptedExpressionTags values={correction.accepted_expressions} /></span>
+                    <div className={correction.passed ? "passed" : "failed"} key={correction.gold_correction_id}>
+                      <span>{correction.original_expression} → <AcceptedExpressionTags values={correction.accepted_expressions} /> <span className={`rag-adj-importance ${correction.importance}`}>{correction.importance === "important" ? "重要 · 1.0" : "次要 · 0.5"}</span></span>
                       <strong>
                         {correction.passed
-                          ? `✓ ${correction.actual_expression} · ${correction.details.match_kind}${correction.details.match_kind === "fuzzy" ? ` ${Number(correction.details.similarity).toFixed(1)}` : ""}`
+                          ? `✓ ${correction.actual_expression} · ${correction.details.match_kind}${correction.details.match_kind === "fuzzy" ? ` ${Number(correction.details.similarity).toFixed(1)} · ${correction.details.match_basis === "expression" ? "表达匹配" : "局部文本匹配"}` : ""}`
                           : "漏改"}
                       </strong>
                     </div>
@@ -645,7 +686,32 @@ function RunResults({
                     </div>
                   ))}
                 </div>
-                {item.agent_state && <details className="rag-adj-trace"><summary>查看 Agent Trace</summary><pre>{JSON.stringify(item.agent_state, null, 2)}</pre></details>}
+                {(item.agent_state || item.trace_events.length > 0) && (
+                  <details className="rag-adj-trace">
+                    <summary>查看 Agent Trace · {item.trace_events.length} 条模型日志</summary>
+                    <div className="rag-adj-trace-events">
+                      {item.trace_events.map((event) => (
+                        <section className="rag-adj-trace-event" key={event.sequence}>
+                          <div>
+                            <strong>#{event.sequence} · {event.operation}</strong>
+                            <span>Case {event.case_index + 1} · Iteration {event.iteration} · {event.provider}/{event.model}</span>
+                          </div>
+                          <small>
+                            Tokens {event.prompt_tokens ?? "—"} + {event.completion_tokens ?? "—"}
+                            {event.finish_reason ? ` · ${event.finish_reason}` : ""}
+                          </small>
+                          <pre>{JSON.stringify(event.payload, null, 2)}</pre>
+                        </section>
+                      ))}
+                    </div>
+                    {item.agent_state && (
+                      <details className="rag-adj-final-state">
+                        <summary>查看最终 Agent State</summary>
+                        <pre>{JSON.stringify(item.agent_state, null, 2)}</pre>
+                      </details>
+                    )}
+                  </details>
+                )}
               </details>
             ))}
           </div>

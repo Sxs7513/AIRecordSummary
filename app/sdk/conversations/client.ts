@@ -16,9 +16,9 @@ export async function deleteConversation(conversationId: string): Promise<void> 
   if (!response.ok) throw new Error(await responseDetail(response, `删除对话失败：${response.status}`));
 }
 export const getMessages = (conversationId: string) => request<MessagePage>(`/api/conversations/${encodeURIComponent(conversationId)}/messages`);
-export const sendMessage = (conversationId: string, text: string, clientMessageId: string) => request<ConversationTurn>(
+export const sendMessage = (conversationId: string, text: string, clientMessageId: string, forceCorrection = false) => request<ConversationTurn>(
   `/api/conversations/${encodeURIComponent(conversationId)}/messages`,
-  { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ content_blocks: [{ type: "text", value: text }], client_message_id: clientMessageId }) }
+  { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ content_blocks: [{ type: "text", value: text }], client_message_id: clientMessageId, force_correction: forceCorrection }) }
 );
 export const restartGeneration = (
   conversationId: string,

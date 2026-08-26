@@ -195,6 +195,7 @@ class ConversationService:
         client_message_id: UUID,
         limit: int,
         scope_recording_ids: list[UUID] | None = None,
+        force_correction: bool = False,
     ) -> tuple[ConversationMessage, ConversationMessage, list[RagHistoryMessage]]:
         query = "".join(block.value for block in blocks).strip()
         if not query:
@@ -330,7 +331,12 @@ class ConversationService:
                 parent_type="conversation_message",
                 parent_id=str(assistant_row["id"]),
                 access_scope=GenerationAccessScope(owner_user_id=user.id),
-                input={"query": query, "limit": limit, "conversation_id": str(conversation_id)},
+                input={
+                    "query": query,
+                    "limit": limit,
+                    "conversation_id": str(conversation_id),
+                    "force_correction": force_correction,
+                },
             )
             generation = self._generation_service.create_in_transaction(connection, command)
             assistant_row = (
@@ -357,6 +363,7 @@ class ConversationService:
                 history,
                 scope_recording_ids or [],
                 command,
+                force_correction=force_correction,
             )
         self._delete_generation_runtime_data(conversation_id, superseded_generation_ids)
         return self._message(user_row), self._message(assistant_row), history
@@ -369,6 +376,7 @@ class ConversationService:
         client_message_id: UUID,
         limit: int,
         scope_recording_ids: list[UUID] | None = None,
+        force_correction: bool = False,
     ) -> tuple[Conversation, ConversationMessage, ConversationMessage, list[RagHistoryMessage], bool]:
         """Atomically create a conversation and its first generation-backed turn.
 
@@ -482,7 +490,12 @@ class ConversationService:
                 parent_type="conversation_message",
                 parent_id=str(assistant_row["id"]),
                 access_scope=GenerationAccessScope(owner_user_id=user.id),
-                input={"query": query, "limit": limit, "conversation_id": str(conversation_id)},
+                input={
+                    "query": query,
+                    "limit": limit,
+                    "conversation_id": str(conversation_id),
+                    "force_correction": force_correction,
+                },
             )
             generation = self._generation_service.create_in_transaction(connection, command)
             assistant_row = (
@@ -503,6 +516,7 @@ class ConversationService:
                 [],
                 scope_recording_ids or [],
                 command,
+                force_correction=force_correction,
             )
         return self._conversation(conversation_row), self._message(user_row), self._message(assistant_row), [], True
 
@@ -609,6 +623,7 @@ class ConversationService:
                 history,
                 scope_recording_ids or [],
                 command,
+                force_correction=bool(command.input.get("force_correction", False)),
                 resume_from_generation_id=source_generation_id if reuse_checkpoint else None,
             )
         return self._message(user_row), self._message(assistant_row), history
@@ -723,6 +738,7 @@ class ConversationService:
                 history,
                 scope_recording_ids or [],
                 command,
+                force_correction=bool(command.input.get("force_correction", False)),
                 resume_from_generation_id=source_generation_id,
                 adjudication_user_decision=decision,
             )
@@ -740,6 +756,7 @@ class ConversationService:
         scope_recording_ids: list[UUID],
         command: CreateGenerationCommand,
         *,
+        force_correction: bool = False,
         resume_from_generation_id: UUID | None = None,
         adjudication_user_decision: ClaimConfirmationDecision | None = None,
     ) -> None:
@@ -754,6 +771,7 @@ class ConversationService:
                 limit=limit,
                 scope_recording_ids=scope_recording_ids,
                 history=history,
+                force_correction=force_correction,
                 conversation_message_id=conversation_message_id,
                 resume_from_generation_id=resume_from_generation_id,
                 adjudication_user_decision=adjudication_user_decision,

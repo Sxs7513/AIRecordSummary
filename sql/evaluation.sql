@@ -402,6 +402,7 @@ create table if not exists rag_adjudication_evaluation_correction_drafts (
     end_char integer not null check (end_char > start_char),
     original_expression text not null,
     accepted_expressions text[] not null,
+    importance text not null default 'important',
     created_at timestamptz not null default now(),
     updated_at timestamptz not null default now(),
     check (length(btrim(original_expression)) > 0),
@@ -411,6 +412,22 @@ create table if not exists rag_adjudication_evaluation_correction_drafts (
 
 comment on table rag_adjudication_evaluation_correction_drafts is
     '可编辑的 Gold 纠偏标注草稿，定义原始文本区间及可接受的纠偏表达。';
+
+alter table rag_adjudication_evaluation_correction_drafts
+    add column if not exists importance text not null default 'important';
+
+do $evaluation$
+begin
+    if not exists (
+        select 1 from pg_constraint
+        where conname = 'rag_adjudication_correction_drafts_importance_check'
+    ) then
+        alter table rag_adjudication_evaluation_correction_drafts
+            add constraint rag_adjudication_correction_drafts_importance_check
+            check (importance in ('important', 'minor'));
+    end if;
+end
+$evaluation$;
 
 create table if not exists rag_adjudication_evaluation_cases (
     id uuid primary key default gen_random_uuid(),
@@ -460,6 +477,7 @@ create table if not exists rag_adjudication_evaluation_corrections (
     end_char integer not null check (end_char > start_char),
     original_expression text not null,
     accepted_expressions text[] not null,
+    importance text not null default 'important',
     created_at timestamptz not null default now(),
     check (length(btrim(original_expression)) > 0),
     check (cardinality(accepted_expressions) > 0),
@@ -468,6 +486,22 @@ create table if not exists rag_adjudication_evaluation_corrections (
 
 comment on table rag_adjudication_evaluation_corrections is
     '冻结证据上的 Gold 纠偏快照；独立保存评测预期，不依赖 Draft Gold。';
+
+alter table rag_adjudication_evaluation_corrections
+    add column if not exists importance text not null default 'important';
+
+do $evaluation$
+begin
+    if not exists (
+        select 1 from pg_constraint
+        where conname = 'rag_adjudication_corrections_importance_check'
+    ) then
+        alter table rag_adjudication_evaluation_corrections
+            add constraint rag_adjudication_corrections_importance_check
+            check (importance in ('important', 'minor'));
+    end if;
+end
+$evaluation$;
 
 -- Frozen Gold must be a self-contained snapshot.  Draft corrections remain editable
 -- after a version is frozen, so snapshots cannot retain a foreign-key reference to them.
@@ -650,6 +684,7 @@ create table if not exists rag_adjudication_evaluation_case_results (
     latency_ms integer check (latency_ms is null or latency_ms >= 0),
     token_usage integer not null default 0 check (token_usage >= 0),
     agent_state jsonb,
+    trace_events jsonb not null default '[]'::jsonb,
     overlays jsonb not null default '[]'::jsonb,
     pending_confirmation jsonb,
     error_type text,
@@ -657,12 +692,16 @@ create table if not exists rag_adjudication_evaluation_case_results (
     created_at timestamptz not null default now(),
     updated_at timestamptz not null default now(),
     check (agent_state is null or jsonb_typeof(agent_state) = 'object'),
+    check (jsonb_typeof(trace_events) = 'array'),
     check (jsonb_typeof(overlays) = 'array'),
     unique (evaluation_run_id, evaluation_case_id)
 );
 
 comment on table rag_adjudication_evaluation_case_results is
     '单个冻结 Case 在一次 RAG ASR 文本裁决评测 Run 中的 Agent 输出与执行结果。';
+
+alter table rag_adjudication_evaluation_case_results
+    add column if not exists trace_events jsonb not null default '[]'::jsonb;
 
 create index if not exists rag_adjudication_case_results_run_idx
     on rag_adjudication_evaluation_case_results (evaluation_run_id, status);
@@ -702,7 +741,7 @@ create table if not exists rag_adjudication_evaluation_prediction_results (
 );
 
 comment on table rag_adjudication_evaluation_prediction_results is
-    'Agent 实际应用的逐 span 修改及其一对一 Gold 匹配结果；未匹配项用于统计误改。';
+    'Agent 实际应用的逐 span 修改及其 Gold 覆盖匹配结果；details 可记录多个 matched Gold ID，未匹配项用于统计误改。';
 
 create index if not exists rag_adjudication_prediction_results_case_idx
     on rag_adjudication_evaluation_prediction_results (case_result_id, match_kind);

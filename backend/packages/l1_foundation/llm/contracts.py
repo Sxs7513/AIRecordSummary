@@ -32,6 +32,7 @@ class LlmProvider(StrEnum):
     LOCAL = "local"
     ZHIPU = "zhipu"
     GEMINI = "gemini"
+    QWEN = "qwen"
 
 
 class ChatRole(StrEnum):

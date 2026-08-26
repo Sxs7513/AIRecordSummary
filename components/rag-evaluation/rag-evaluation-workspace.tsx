@@ -19,7 +19,10 @@ import type {
 
 const operationLabels: Record<string, string> = {
   "retrieve.vector": "Vector",
+  "retrieve.vector.original": "Vector / 原问题",
+  "retrieve.vector.expanded": "Vector / 扩展问题",
   "retrieve.lexical": "Lexical",
+  "retrieve.lexical.term": "Lexical / 专业术语（逐词）",
   "retrieve.rrf": "RRF",
   "retrieve.scope": "Scope Summary",
   "retrieve.expand": "Expand",
@@ -27,6 +30,22 @@ const operationLabels: Record<string, string> = {
   "retrieve.empty": "Empty Retrieval",
   "route.unresolved": "Route Unresolved"
 };
+
+const retrievalOperationOrder: Record<string, number> = {
+  "retrieve.vector": 0,
+  "retrieve.vector.original": 0,
+  "retrieve.vector.expanded": 1,
+  "retrieve.lexical": 2,
+  "retrieve.lexical.term": 2,
+  "retrieve.rrf": 3,
+  "retrieve.expand": 4,
+  "retrieve.rerank": 5
+};
+
+function compareRetrievalOperations(left: string, right: string) {
+  const fallbackRank = Object.keys(retrievalOperationOrder).length;
+  return (retrievalOperationOrder[left] ?? fallbackRank) - (retrievalOperationOrder[right] ?? fallbackRank);
+}
 
 const CHUNK_PAGE_SIZE = 50;
 
@@ -444,7 +463,8 @@ function RunWorkspace({ runs, detail, busy, onOpen, onDelete }: { runs: RagEvalR
   const finalMetrics = useMemo(() => detail?.metrics.filter((item) => item.scope === "run") ?? [], [detail]);
   const operations = useMemo(() => {
     const rows = detail?.metrics.filter((item) => item.scope === "operation") ?? [];
-    return Array.from(new Set(rows.map((item) => item.operation).filter((item): item is string => Boolean(item))));
+    return Array.from(new Set(rows.map((item) => item.operation).filter((item): item is string => Boolean(item))))
+      .sort(compareRetrievalOperations);
   }, [detail]);
   return (
     <section className="panel grid">
@@ -469,7 +489,7 @@ function RunWorkspace({ runs, detail, busy, onOpen, onDelete }: { runs: RagEvalR
             <MetricCard label="Hit@5" metric={metric(finalMetrics, "hit_at_5")} percent />
             <MetricCard label="Recall@10" metric={metric(finalMetrics, "recall_at_10")} percent />
             <MetricCard label="MRR" metric={metric(finalMetrics, "reciprocal_rank")} />
-            <MetricCard label="P90" metric={metric(finalMetrics, "latency_p90_ms")} suffix=" ms" />
+            <MetricCard label="nDCG@10" metric={metric(finalMetrics, "ndcg_at_10")} />
           </div>
           <div className="table-wrap">
             <table>
@@ -490,9 +510,13 @@ function RunWorkspace({ runs, detail, busy, onOpen, onDelete }: { runs: RagEvalR
               <details className="rag-eval-result-case" key={item.id}>
                 <summary><span>{item.query}</span><span className={`badge ${item.status}`}>{item.status}</span><span>{item.latency_ms ?? 0} ms</span></summary>
                 {item.error_message && <p className="error">{item.error_message}</p>}
-                {item.steps.map((step) => (
+                {[...item.steps].sort((left, right) => compareRetrievalOperations(left.operation, right.operation)).map((step) => (
                   <div className="rag-eval-step" key={step.id}>
-                    <h3>{operationLabels[step.operation] || step.operation} <small>{step.latency_ms ?? 0} ms · {step.output.candidate_count ?? 0} candidates</small></h3>
+                    <h3>
+                      {operationLabels[step.operation] || step.operation}
+                      {typeof step.details.query === "string" ? <small> · {step.details.query}</small> : null}{" "}
+                      <small>{step.latency_ms ?? 0} ms · {step.output.candidate_count ?? 0} candidates</small>
+                    </h3>
                     <ol>{step.ranked_results.slice(0, 10).map((ranked) => (
                       <li className={ranked.matched_relevance > 0 ? "matched" : ""} key={ranked.rank}>
                         <span>#{ranked.rank}</span>

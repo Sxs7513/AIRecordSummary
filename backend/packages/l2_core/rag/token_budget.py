@@ -31,7 +31,7 @@ class RagTokenBudgetMiddleware:
 
     @staticmethod
     def estimate_input_tokens(messages: Sequence[ChatMessage]) -> int:
-        """Conservative dependency-free estimate used only for provider routing."""
+        """Conservative dependency-free estimate used for routing and pre-call prompt fitting."""
         total = 0
         for message in messages:
             cjk = len(_CJK_CHARACTER.findall(message.content))

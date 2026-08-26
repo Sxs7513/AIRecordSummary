@@ -11,6 +11,7 @@ from langchain_core.messages import BaseMessage, HumanMessage
 from pydantic import ValidationError
 
 from l1_foundation.llm import LlmGenerateResult, LlmProvider
+from l1_foundation.model_ref import OnlineModelRef
 from l2_core.rag.adjudication.agent import AdjudicationCaseContext, EvidenceAdjudicationAgent
 from l2_core.rag.adjudication.contracts import (
     AdjudicationAgentState,
@@ -107,6 +108,43 @@ def test_adjudication_validation_error_is_json_serializable_for_logging() -> Non
 
     assert "adjudication proposal must change the expression" in serialized
     assert '"type": "ValueError"' in serialized
+
+
+def test_structured_completion_logger_receives_reconstruction_payload() -> None:
+    events: list[dict[str, object]] = []
+    agent = object.__new__(EvidenceAdjudicationAgent)
+    agent._structured_completion_logger = events.append  # pyright: ignore[reportPrivateUsage]
+    context = cast(AdjudicationCaseContext, type("Context", (), {"run_id": "evaluation-case"})())
+    completion = LlmGenerateResult(
+        text='{"proposals":[{"id":"proposal-1"}]}',
+        provider=LlmProvider.GEMINI,
+        model="gemini-test",
+        prompt_tokens=12,
+        completion_tokens=8,
+    )
+
+    agent._log_structured_completion(  # pyright: ignore[reportPrivateUsage]
+        context,
+        case_index=0,
+        iteration=0,
+        operation="initial_reconstruct",
+        completion=completion,
+    )
+
+    assert events == [
+        {
+            "case_index": 0,
+            "iteration": 0,
+            "operation": "initial_reconstruct",
+            "provider": "gemini",
+            "model": "gemini-test",
+            "finish_reason": None,
+            "prompt_tokens": 12,
+            "completion_tokens": 8,
+            "request_id": None,
+            "payload": {"proposals": [{"id": "proposal-1"}]},
+        }
+    ]
 
 
 def test_adjudication_review_filters_one_noop_proposal_without_discarding_valid_siblings() -> None:
@@ -950,7 +988,7 @@ def test_initial_reconstruction_retries_once_for_missing_audit_items(caplog: pyt
     assert "首次候选重建缺少审计项，开始单次重试" in caplog.text
 
 
-def test_audit_and_candidate_reconstruction_use_independent_completion_policies() -> None:
+def test_agent_stages_use_independent_model_policies() -> None:
     commands: list[Any] = []
     budget_nodes: list[str] = []
 
@@ -966,10 +1004,12 @@ def test_audit_and_candidate_reconstruction_use_independent_completion_policies(
     agent = object.__new__(EvidenceAdjudicationAgent)
     untyped_agent = cast(Any, agent)
     untyped_agent._model_client = CaptureClient()
-    untyped_agent._online_provider = LlmProvider.GEMINI
+    untyped_agent._online_model = OnlineModelRef.parse("gemini-gemini-3.5-flash-lite")
     untyped_agent._context_size = 16_384
     untyped_agent._token_budget = CaptureBudget()
-    untyped_agent._audit_model = "gemini-3.6-flash"
+    untyped_agent._audit_model = OnlineModelRef.parse("qwen-qwen3.8-max")
+    untyped_agent._construct_model = OnlineModelRef.parse("qwen-qwen3.8-max")
+    untyped_agent._decision_model = OnlineModelRef.parse("qwen-qwen3.8-max")
     untyped_agent._audit_min_request_interval_seconds = 15.0
     state = {"token_usage": 0}
     messages = [HumanMessage(content="测试")]
@@ -982,12 +1022,16 @@ def test_audit_and_candidate_reconstruction_use_independent_completion_policies(
     audit_options = commands[0].input.options
     reconstruction_options = commands[1].input.options
     decision_options = commands[2].input.options
-    assert audit_options.model == "gemini-3.6-flash"
+    assert commands[0].input.provider == LlmProvider.QWEN
+    assert audit_options.model == "qwen3.8-max"
     assert audit_options.max_tokens == 5_000
     assert audit_options.min_request_interval_seconds == 15
-    assert reconstruction_options.model is None
+    assert commands[1].input.provider == LlmProvider.QWEN
+    assert reconstruction_options.model == "qwen3.8-max"
     assert reconstruction_options.max_tokens == 8_000
     assert reconstruction_options.min_request_interval_seconds is None
+    assert commands[2].input.provider == LlmProvider.QWEN
+    assert decision_options.model == "qwen3.8-max"
     assert decision_options.max_tokens == 8_000
     assert budget_nodes == [
         "adjudication_audit_expressions",

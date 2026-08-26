@@ -14,6 +14,7 @@ export type GoldCorrection = {
   end_char: number;
   original_expression: string;
   accepted_expressions: string[];
+  importance: "important" | "minor";
 };
 
 export type AdjudicationEvidence = {
@@ -104,12 +105,15 @@ export type CorrectionResult = {
   end_char: number;
   original_expression: string;
   accepted_expressions: string[];
+  importance: "important" | "minor";
   details: {
     match_kind?: "exact" | "fuzzy" | "unmatched";
     similarity?: number | string | null;
+    match_basis?: "local" | "expression" | null;
     matched_accepted_expression?: string | null;
     actual_local_text?: string | null;
     expected_local_text?: string | null;
+    gold_weight?: number | string;
   };
 };
 
@@ -125,6 +129,11 @@ export type PredictionResult = {
   resolved_expression: string;
   match_kind: "exact" | "fuzzy" | "unmatched";
   similarity: number | string | null;
+  details: {
+    matched_gold_correction_ids?: string[];
+    strict_credit?: number | string;
+    relaxed_credit?: number | string;
+  };
 };
 
 export type AdjudicationCaseResult = {
@@ -134,10 +143,25 @@ export type AdjudicationCaseResult = {
   latency_ms: number | null;
   token_usage: number;
   agent_state: Record<string, unknown> | null;
+  trace_events: AdjudicationTraceEvent[];
   error_type: string | null;
   error_message: string | null;
   corrections: CorrectionResult[];
   predictions: PredictionResult[];
+};
+
+export type AdjudicationTraceEvent = {
+  sequence: number;
+  case_index: number;
+  iteration: number;
+  operation: string;
+  provider: string;
+  model: string;
+  finish_reason: string | null;
+  prompt_tokens: number | null;
+  completion_tokens: number | null;
+  request_id: string | null;
+  payload: unknown;
 };
 
 export type AdjudicationMetric = {
@@ -153,13 +177,22 @@ export type AdjudicationMetric = {
   sample_count: number;
   details: {
     scope: "strict" | "relaxed";
-    true_positive: number;
+    true_positive?: number;
+    matched_gold_count?: number;
+    matched_prediction_count?: number;
     false_positive: number;
     false_negative: number;
     exact_count: number;
     fuzzy_count: number;
     gold_count: number;
     prediction_count: number;
+    matched_gold_weight?: number | string;
+    gold_weight?: number | string;
+    prediction_credit?: number | string;
+    weighted_false_positive?: number | string;
+    weighted_false_negative?: number | string;
+    missed_gold_count?: number;
+    incorrect_prediction_count?: number;
   };
 };
 

@@ -13,7 +13,7 @@ from uuid import UUID
 from pydantic import BaseModel
 from sqlalchemy import Engine, text
 
-from l1_foundation.llm import LlmProvider
+from l1_foundation.model_ref import OnlineModelRef
 from l1_foundation.observability import InstrumentedModelClient
 from l1_foundation.settings import Settings
 from l1_foundation.worker import ComputeCommand, ExecutionScope, SyncWorkerClient, WorkerClient, execution_scope
@@ -278,7 +278,7 @@ class RagEvaluationWorker:
             graph = RagGraph(
                 retriever,
                 InstrumentedModelClient(cast(WorkerClient, model_worker)),
-                online_provider=LlmProvider(settings.rag_answer_provider),
+                online_model=OnlineModelRef.parse(settings.rag_online_default_model),
                 context_size=settings.rag_context_size,
                 plan_local_input_tokens=settings.rag_plan_local_input_tokens,
                 max_total_tokens=settings.rag_run_max_total_tokens,
@@ -761,17 +761,28 @@ class RagEvaluationWorker:
     def _settings_for_run(self, config: Mapping[str, object]) -> Settings:
         embedding = cast(Mapping[str, object], config.get("embedding") or {})
         rerank = cast(Mapping[str, object], config.get("rerank") or {})
+        legacy_vector_weight = _float_setting(config, "vector_weight", self._settings.rag_original_vector_weight)
         return self._settings.model_copy(
             update={
                 "embedding_model": str(embedding.get("model", self._settings.embedding_model)),
                 "embedding_dimensions": _int_setting(embedding, "dimensions", self._settings.embedding_dimensions),
                 "rag_hybrid_search_enabled": bool(config.get("hybrid_enabled", True)),
+                "rag_online_default_model": str(config.get("online_default_model", self._settings.rag_online_default_model)),
                 "rag_query_term_expansion_enabled": bool(config.get("query_term_expansion_enabled", self._settings.rag_query_term_expansion_enabled)),
                 "rag_vector_candidate_limit": _int_setting(config, "vector_top_k", self._settings.rag_vector_candidate_limit),
                 "rag_lexical_candidate_limit": _int_setting(config, "lexical_top_k", self._settings.rag_lexical_candidate_limit),
                 "rag_fused_candidate_limit": _int_setting(config, "fused_top_k", self._settings.rag_fused_candidate_limit),
                 "rag_rrf_k": _int_setting(config, "rrf_k", self._settings.rag_rrf_k),
-                "rag_vector_weight": _float_setting(config, "vector_weight", self._settings.rag_vector_weight),
+                "rag_original_vector_weight": _float_setting(
+                    config,
+                    "original_vector_weight",
+                    legacy_vector_weight,
+                ),
+                "rag_expanded_vector_weight": _float_setting(
+                    config,
+                    "expanded_vector_weight",
+                    legacy_vector_weight,
+                ),
                 "rag_lexical_weight": _float_setting(config, "lexical_weight", self._settings.rag_lexical_weight),
                 "rag_chunk_context_window_utterances": _int_setting(config, "context_window_utterances", self._settings.rag_chunk_context_window_utterances),
                 "rag_rerank_enabled": bool(rerank.get("enabled", self._settings.rag_rerank_enabled)),
@@ -818,8 +829,8 @@ def _evidence_item(item: Evidence, *, reranked: bool = False) -> RankedItem:
 
 
 def _operation_items(event: RagOperationCompleted) -> list[RankedItem]:
-    if event.operation in {"retrieve.vector", "retrieve.lexical", "retrieve.rrf"}:
-        score_kind = event.operation.removeprefix("retrieve.")
+    if event.operation == "retrieve.rrf" or event.operation.startswith(("retrieve.vector", "retrieve.lexical")):
+        score_kind = event.operation.removeprefix("retrieve.").split(".", maxsplit=1)[0]
         rows = cast(Sequence[Mapping[str, object]], event.output)
         return [_row_item(row, score_kind=score_kind) for row in rows]
     evidence = cast(Sequence[Evidence], event.output)

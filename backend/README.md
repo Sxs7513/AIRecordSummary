@@ -90,9 +90,10 @@ and each use can be selected independently:
 LLM_DEFAULT_PROVIDER=gemini
 ```
 
-Supported values are `gemini`, `local`, and `zhipu`. A use can override the default with
+Supported values are `gemini`, `local`, `qwen`, and `zhipu`. A use can override the default with
 `LLM_CORRECTION_PROVIDER`, `TOPIC_DETECTION_PROVIDER`,
-`RECORDING_SUMMARY_PROVIDER`, or `RAG_ANSWER_PROVIDER`. The local provider uses
+or `RECORDING_SUMMARY_PROVIDER`. RAG selects its online provider and model
+through the provider-qualified `RAG_ONLINE_DEFAULT_MODEL` setting. The local provider uses
 the single Qwen2.5 7B GGUF model configured by `LOCAL_LLM_MODEL_REPO` and
 `LOCAL_LLM_MODEL_FILE`.
 
@@ -115,9 +116,39 @@ ZHIPU_MODEL=glm-4.5-flash
 ZHIPU_BASE_URL=https://open.bigmodel.cn/api/paas/v4
 ```
 
-Both providers implement streaming, non-streaming, JSON-object, and
+To use Qwen 3.8 Flash through DashScope's OpenAI-compatible API, configure:
+
+```text
+LLM_DEFAULT_PROVIDER=qwen
+QWEN_AI_PLATFORM_API_KEY=your-api-key
+QWEN_LLM_MODEL=qwen3.8-flash
+QWEN_LLM_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+```
+
+The Qwen adapter currently disables thinking mode explicitly. It maps the
+provider-neutral output-token limit to DashScope's `max_completion_tokens`
+request field.
+
+All online providers implement streaming, non-streaming, JSON-object, and
 provider-adapted JSON-schema requests. Business output is always validated in
 L2 after generation.
+
+RAG online model references use `<provider>-<model>` format and split only the
+first hyphen. The default online model and the Correct Agent stage overrides
+can therefore be configured independently:
+
+```text
+RAG_ONLINE_DEFAULT_MODEL=gemini-gemini-3.5-flash-lite
+RAG_ASR_ADJUDICATION_AUDIT_MODEL=qwen-qwen3.8-max
+RAG_ASR_ADJUDICATION_CONSTRUCT_MODEL=qwen-qwen3.8-max
+RAG_ASR_ADJUDICATION_DECISION_MODEL=qwen-qwen3.8-max
+```
+
+All RAG nodes that require an online model use `RAG_ONLINE_DEFAULT_MODEL`,
+except Correct Agent expression Audit, candidate construction, and candidate
+decision, which use their corresponding stage-specific model settings.
+Local routing and grading nodes remain local. Supported reference providers
+are `gemini`, `qwen`, and `zhipu`.
 
 ### Local Chrome AI Overview bridge
 
@@ -128,6 +159,9 @@ instead of calling Gemini Search Grounding:
 RAG_ASR_ADJUDICATION_ENABLED=true
 RAG_ASR_ADJUDICATION_WEB_SEARCH_ENABLED=true
 RAG_ASR_ADJUDICATION_AUDIT_PROMPT_VARIANT=relation_rules
+RAG_ASR_ADJUDICATION_AUDIT_MODEL=qwen-qwen3.8-max
+RAG_ASR_ADJUDICATION_CONSTRUCT_MODEL=qwen-qwen3.8-max
+RAG_ASR_ADJUDICATION_DECISION_MODEL=qwen-qwen3.8-max
 RAG_ASR_ADJUDICATION_SEARCH_PROVIDER=chrome_ai_overview
 RAG_ASR_ADJUDICATION_CHROME_AIO_TIMEOUT_SECONDS=45
 RAG_ASR_ADJUDICATION_CHROME_AIO_POLL_INTERVAL_SECONDS=1

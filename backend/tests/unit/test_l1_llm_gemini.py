@@ -104,7 +104,19 @@ def test_gemini_provider_supports_non_streaming_strict_json_schema(caplog: pytes
     assert "Online LLM：请求完成 provider=gemini model=gemini-test stream=false" in caplog.text
 
 
-def test_gemini_provider_supports_per_request_model_override(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    ("requested_model", "expected_reasoning_effort"),
+    [
+        ("gemini-3.6-flash", "minimal"),
+        ("gemini-3.7-flash", "low"),
+        ("gemini-3.7-flash-001", "low"),
+    ],
+)
+def test_gemini_provider_supports_per_request_model_override(
+    monkeypatch: pytest.MonkeyPatch,
+    requested_model: str,
+    expected_reasoning_effort: str,
+) -> None:
     captured: dict[str, object] = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -123,11 +135,28 @@ def test_gemini_provider_supports_per_request_model_override(monkeypatch: pytest
     monkeypatch.setattr(openai_compatible_module, "sleep", no_sleep)
     output = _model(httpx.MockTransport(handler)).complete(
         [ChatMessage(ChatRole.USER, "audit")],
-        CompletionOptions(max_tokens=20, model="gemini-3.6-flash"),
+        CompletionOptions(max_tokens=20, model=requested_model),
     )
 
-    assert captured["model"] == "gemini-3.6-flash"
-    assert output.model == "gemini-3.6-flash"
+    assert captured["model"] == requested_model
+    assert captured["reasoning_effort"] == expected_reasoning_effort
+    assert output.model == requested_model
+
+
+def test_gemini_37_default_model_uses_low_reasoning_effort() -> None:
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(cast(dict[str, object], json.loads(request.content)))
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]},
+        )
+
+    model = _model(httpx.MockTransport(handler), model_name="gemini-3.7-flash")
+    model.complete([ChatMessage(ChatRole.USER, "audit")], CompletionOptions(max_tokens=20))
+
+    assert captured["reasoning_effort"] == "low"
 
 
 def test_gemini_request_interval_uses_provider_default_and_per_request_override(
@@ -674,12 +703,13 @@ def test_factory_selects_gemini_provider() -> None:
 def _model(
     transport: httpx.MockTransport,
     *,
+    model_name: str = "gemini-test",
     min_request_interval_seconds: float = 0,
     request_rate_limiter: openai_compatible_module.SynchronousRequestRateLimiter | None = None,
 ) -> GeminiLanguageModel:
     model = GeminiLanguageModel(
         "test-key",
-        "gemini-test",
+        model_name,
         min_request_interval_seconds=min_request_interval_seconds,
         request_rate_limiter=request_rate_limiter or openai_compatible_module.SynchronousRequestRateLimiter(),
     )

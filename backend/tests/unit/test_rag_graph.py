@@ -12,6 +12,7 @@ import pytest
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 
 from l1_foundation.llm import LlmGenerateInput, LlmGenerateResult, LlmProvider, ToolCall
+from l1_foundation.model_ref import OnlineModelRef
 from l1_foundation.observability import (
     InstrumentedModelClient,
     ModelInvocationRecord,
@@ -39,10 +40,11 @@ from l2_core.rag.contracts import (
     ResolvedFilters,
 )
 from l2_core.rag.graph import RagGraph
-from l2_core.rag.hooks import RagNodeCompleted, RagOperationCompleted
+from l2_core.rag.hooks import RagNodeCompleted, RagOperationCompleted, rag_execution_hook_scope
 from l2_core.rag.retrieval import RagRetriever
 from l2_core.rag.routing import AMBIGUOUS_RECORDING_SCOPE_MESSAGE, ROUTE_UNRESOLVED_MESSAGE
 from l2_core.rag.streaming import ThinkTagFilter
+from l2_core.rag.token_budget import RagTokenBudgetMiddleware
 from l2_core.rag.worker_tasks import RerankResult
 from l2_core.rag.workflows.chunk_evidence import (  # pyright: ignore[reportPrivateUsage]
     _retain_protected_evidence,
@@ -56,6 +58,7 @@ class FakeModel:
         self.json_schema_strict: list[bool] = []
         self.message_batches: list[list[str]] = []
         self.model_profiles: list[str] = []
+        self.requested_models: list[str | None] = []
         self.providers: list[LlmProvider] = []
         self.tool_call_providers: list[LlmProvider] = []
         self._responses = iter(
@@ -106,6 +109,11 @@ class FakeWorkerClient:
             providers = []
             self._model.providers = providers
         providers.append(value.provider)
+        requested_models = cast(list[str | None] | None, getattr(self._model, "requested_models", None))
+        if requested_models is None:
+            requested_models = []
+            self._model.requested_models = requested_models
+        requested_models.append(value.options.model)
         messages = [_base_message(message.role.value, message.content) for message in value.messages]
         options = value.options
         json_schema_strict = cast(list[bool] | None, getattr(self._model, "json_schema_strict", None))
@@ -146,6 +154,11 @@ class FakeWorkerClient:
             providers = []
             self._model.providers = providers
         providers.append(value.provider)
+        requested_models = cast(list[str | None] | None, getattr(self._model, "requested_models", None))
+        if requested_models is None:
+            requested_models = []
+            self._model.requested_models = requested_models
+        requested_models.append(value.options.model)
         messages = [_base_message(message.role.value, message.content) for message in value.messages]
         options = value.options
         chunks: list[str] = []
@@ -194,6 +207,7 @@ def _graph(
     retriever: object,
     model: FakeModel,
     *,
+    context_size: int = 16_384,
     plan_local_input_tokens: int = 4_000,
     route_model_profile: Literal["default", "rag"] = "default",
     node_model_profile: Literal["default", "rag"] = "default",
@@ -205,8 +219,8 @@ def _graph(
     return RagGraph(
         cast(RagRetriever, retriever),
         cast(InstrumentedModelClient, FakeWorkerClient(model)),
-        online_provider=LlmProvider.GEMINI,
-        context_size=16_384,
+        online_model=OnlineModelRef.parse("gemini-gemini-3.5-flash-lite"),
+        context_size=context_size,
         plan_local_input_tokens=plan_local_input_tokens,
         route_model_profile=route_model_profile,
         node_model_profile=node_model_profile,
@@ -224,7 +238,7 @@ class FakeRetriever:
     def resolve_recording_scope(self, filters: object, *args: object) -> list[object]:
         return list(getattr(filters, "recording_ids", []))
 
-    def retrieve_chunks(self, topic: str, filters: object, limit: int, run_id: str = "standalone") -> list[Evidence]:
+    def _fake_evidence(self, topic: str, filters: object, limit: int, run_id: str = "standalone") -> list[Evidence]:
         recording_id = uuid4()
         return [
             Evidence(
@@ -240,7 +254,7 @@ class FakeRetriever:
     def retrieve_candidates(self, topic: str, filters: object, limit: int) -> list[dict[str, object]]:
         return [
             {"chunk_id": item.chunk.id, "recording_id": item.recording.id, "score": item.score, "evidence": item}
-            for item in self.retrieve_chunks(topic, filters, limit)
+            for item in self._fake_evidence(topic, filters, limit)
         ]
 
     def expand_candidates(self, rows: list[dict[str, object]]) -> list[Evidence]:
@@ -383,7 +397,7 @@ def test_extracted_terms_are_each_sent_to_lexical_retrieval() -> None:
         )
     )
 
-    assert set(lexical_queries) == {"最近是不是有个项目答辩的路演", "项目答辩", "路演"}
+    assert lexical_queries == ["项目答辩", "路演"]
 
 
 def test_vector_queries_are_embedded_in_one_worker_batch() -> None:
@@ -414,18 +428,30 @@ def test_vector_queries_are_embedded_in_one_worker_batch() -> None:
             return []
 
     graph = _graph(CapturingHybridRetriever(), FakeModel())
-    asyncio.run(
-        graph._retrieve_candidates(  # pyright: ignore[reportPrivateUsage]
-            "原始问题",
-            ResolvedFilters(recording_scope_resolved=True, recording_ids=[recording_id]),
-            10,
-            str(uuid4()),
-            expanded_query="扩展检索词",
+    hook = CapturingRagHook()
+    with rag_execution_hook_scope(hook):
+        asyncio.run(
+            graph._retrieve_candidates(  # pyright: ignore[reportPrivateUsage]
+                "原始问题",
+                ResolvedFilters(recording_scope_resolved=True, recording_ids=[recording_id]),
+                10,
+                str(uuid4()),
+                expanded_query="扩展检索词",
+            )
         )
-    )
 
     assert embedding_batches == [["原始问题", "扩展检索词"]]
     assert sorted(searched_embeddings) == [[1.0], [2.0]]
+    assert {event.operation for event in hook.operations[:-1]} == {
+        "retrieve.vector.original",
+        "retrieve.vector.expanded",
+    }
+    assert hook.operations[-1].operation == "retrieve.rrf"
+    queries_by_operation = {event.operation: event.details.get("query") for event in hook.operations[:-1]}
+    assert queries_by_operation == {
+        "retrieve.vector.original": "原始问题",
+        "retrieve.vector.expanded": "扩展检索词",
+    }
 
 
 def test_summary_match_runs_exact_chunk_search_and_reserves_its_candidate(caplog: pytest.LogCaptureFixture) -> None:
@@ -502,25 +528,30 @@ def test_summary_match_runs_exact_chunk_search_and_reserves_its_candidate(caplog
 
 def test_recording_profile_candidate_reuses_global_row_without_duplication() -> None:
     chunk_id = uuid4()
+    leading_chunk_id = uuid4()
     recording_id = uuid4()
     profile_row = cast(
         dict[str, object],
         {"chunk_id": chunk_id, "recording_id": recording_id, "score": 0.3, "retrieved_via_recording_profile": True},
     )
+    leading_row = cast(dict[str, object], {"chunk_id": leading_chunk_id, "recording_id": recording_id, "score": 1.0})
     global_row = cast(dict[str, object], {"chunk_id": chunk_id, "recording_id": recording_id, "score": 0.9, "match_type": "hybrid"})
 
     retained = _retain_recording_profile_candidates(  # pyright: ignore[reportArgumentType]
-        [global_row],
+        [leading_row, global_row],
         [profile_row],
     )
 
-    assert len(retained) == 1
-    assert retained[0]["retrieved_via_recording_profile"] is True
-    assert retained[0]["match_type"] == "hybrid"
+    assert len(retained) == 2
+    assert retained[0]["chunk_id"] == leading_chunk_id
+    assert retained[1]["retrieved_via_recording_profile"] is True
+    assert retained[1]["match_type"] == "hybrid"
+    assert retained[1]["score"] == 0.9
 
 
 def test_exact_lexical_term_hit_is_retained_when_rrf_drops_it() -> None:
     recording_id = uuid4()
+    fused_chunk_id = uuid4()
     protected_chunk_id = uuid4()
 
     class ExactMatchRetriever:
@@ -550,7 +581,7 @@ def test_exact_lexical_term_hit_is_retained_when_rrf_drops_it() -> None:
             _lexical_lists: list[list[dict[str, object]]],
             _limit: int,
         ) -> list[dict[str, object]]:
-            return []
+            return [{"chunk_id": fused_chunk_id, "recording_id": recording_id, "score": 0.9}]
 
     graph = _graph(ExactMatchRetriever(), FakeModel())
     candidates = asyncio.run(
@@ -564,8 +595,8 @@ def test_exact_lexical_term_hit_is_retained_when_rrf_drops_it() -> None:
         )
     )
 
-    assert candidates[0]["chunk_id"] == protected_chunk_id
-    assert candidates[0]["protected_lexical_terms"] == ["路演"]
+    assert [candidate["chunk_id"] for candidate in candidates] == [fused_chunk_id, protected_chunk_id]
+    assert candidates[1]["protected_lexical_terms"] == ["路演"]
 
 
 def test_rerank_preserves_protected_exact_lexical_evidence() -> None:
@@ -589,7 +620,8 @@ def test_rerank_preserves_protected_exact_lexical_evidence() -> None:
 
     retained = _retain_protected_evidence([reranked], [protected, reranked], [str(protected.chunk.id)])
 
-    assert retained == [protected, reranked]
+    assert [item.chunk.id for item in retained] == [reranked.chunk.id, protected.chunk.id]
+    assert [item.index for item in retained] == [1, 2]
 
 
 class JsonEventHandler(logging.Handler):
@@ -766,7 +798,7 @@ def test_retrieval_run_hook_captures_independent_rerank_node() -> None:
     assert hook.operations[-1].details["input_tokens"] == 42
 
 
-def test_route_uses_the_online_answer_provider() -> None:
+def test_route_uses_the_online_default_model() -> None:
     model = FakeModel()
     graph = _graph(FakeRetriever(), model, route_model_profile="rag")
     state = cast(
@@ -786,6 +818,7 @@ def test_route_uses_the_online_answer_provider() -> None:
 
     assert model.model_profiles == ["default"]
     assert model.providers == [LlmProvider.GEMINI]
+    assert model.requested_models == ["gemini-3.5-flash-lite"]
 
 
 def test_local_non_route_rag_nodes_can_switch_back_to_rag_4b() -> None:
@@ -811,7 +844,7 @@ def test_direct_answer_prompt_keeps_all_evidence_while_final_sources_follow_cita
     second_recording_id = uuid4()
 
     class TwoEvidenceRetriever(FakeRetriever):
-        def retrieve_chunks(
+        def _fake_evidence(
             self,
             topic: str,
             filters: object,
@@ -1069,7 +1102,7 @@ def test_fact_lookup_adjudication_reviews_each_final_evidence_in_isolated_contex
     second_chunk_id = uuid4()
 
     class StableEvidenceRetriever(FakeRetriever):
-        def retrieve_chunks(self, topic: str, filters: object, limit: int, run_id: str = "standalone") -> list[Evidence]:
+        def _fake_evidence(self, topic: str, filters: object, limit: int, run_id: str = "standalone") -> list[Evidence]:
             del topic, filters, limit, run_id
             return [
                 Evidence(
@@ -1196,6 +1229,25 @@ def test_fact_lookup_adjudication_skips_review_when_query_gate_returns_none() ->
     assert "AdjudicationReview" not in schema_titles
 
 
+def test_forced_correction_skips_risk_model_and_sets_risk_true() -> None:
+    model = FakeModel()
+    graph = _graph(FakeRetriever(), model, asr_adjudication_enabled=True)
+    state = graph._initial_state(  # pyright: ignore[reportPrivateUsage]
+        "forced-correction",
+        "answer",
+        "交付风险是什么？",
+        10,
+        [uuid4()],
+        None,
+        force_correction=True,
+    )
+
+    update = asyncio.run(graph._classify_query_correction_risk(state))  # pyright: ignore[reportPrivateUsage]
+
+    assert update == {"query_correction_risk": True}
+    assert model.json_schemas == []
+
+
 def test_active_adjudication_reconsiders_candidate_after_web_search_without_confirmation(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -1204,7 +1256,7 @@ def test_active_adjudication_reconsiders_candidate_after_web_search_without_conf
     chunk_id = uuid4()
 
     class StableRetriever(FakeRetriever):
-        def retrieve_chunks(self, topic: str, filters: object, limit: int, run_id: str = "standalone") -> list[Evidence]:
+        def _fake_evidence(self, topic: str, filters: object, limit: int, run_id: str = "standalone") -> list[Evidence]:
             del topic, filters, limit, run_id
             return [
                 Evidence(
@@ -1344,7 +1396,7 @@ def test_active_adjudication_auto_overlay_is_disclosed_in_answer_context_and_sou
     searched_queries: list[str] = []
 
     class StableRetriever(FakeRetriever):
-        def retrieve_chunks(self, topic: str, filters: object, limit: int, run_id: str = "standalone") -> list[Evidence]:
+        def _fake_evidence(self, topic: str, filters: object, limit: int, run_id: str = "standalone") -> list[Evidence]:
             del topic, filters, limit, run_id
             return [
                 Evidence(
@@ -1627,6 +1679,7 @@ def test_hybrid_retrieval_uses_lexical_candidates_when_vector_branch_fails() -> 
             ResolvedFilters(recording_scope_resolved=True, recording_ids=[recording_id]),
             10,
             str(uuid4()),
+            lexical_queries=["API v2"],
         )
     )
     update = asyncio.run(
@@ -1811,7 +1864,7 @@ def test_history_scope_retries_all_accessible_recordings_after_abstain() -> None
         def __init__(self) -> None:
             self.scopes: list[list[UUID]] = []
 
-        def retrieve_chunks(self, topic: str, filters: object, limit: int, run_id: str = "standalone") -> list[Evidence]:
+        def _fake_evidence(self, topic: str, filters: object, limit: int, run_id: str = "standalone") -> list[Evidence]:
             del topic, limit, run_id
             recording_ids = list(cast(ResolvedFilters, filters).recording_ids)
             self.scopes.append(recording_ids)
@@ -2120,6 +2173,57 @@ def test_chunk_search_grades_the_original_query() -> None:
     assert "硅光具有较好的发展前景。" in rendered
     assert "recording_id" not in rendered
     assert "录音名字：最近录音" in rendered
+
+
+def test_grade_truncates_evidence_to_leave_room_for_output_tokens() -> None:
+    class CapturingGradeModel(FakeModel):
+        def __init__(self) -> None:
+            self.messages: list[Sequence[BaseMessage]] = []
+
+        async def complete(
+            self,
+            messages: Sequence[BaseMessage],
+            max_tokens: int,
+            temperature: float = 0.0,
+            json_schema: Mapping[str, object] | None = None,
+        ) -> str:
+            self.messages.append(messages)
+            return '{"verdict":"qualified_answer","reason":"truncated but useful"}'
+
+    evidence = Evidence(
+        index=1,
+        recording=EvidenceRecording(id=uuid4(), title="超长录音", file_name="long.mp3"),
+        chunk=EvidenceChunk(
+            id=uuid4(),
+            text="开头的关键事实。" + "很长的后续内容。" * 2_000 + "不应保留的尾部。",
+            start_ms=0,
+            end_ms=1_000,
+        ),
+        score=0.9,
+        match_type="vector",
+        url="/recordings/long",
+    )
+    state = cast(
+        RagGraphState,
+        {
+            "query": "关键事实是什么？",
+            "route": RagRoute(status="resolved", strategy_id="fact_lookup", recording_limit=1),
+            "evidence": [evidence],
+        },
+    )
+    model = CapturingGradeModel()
+    context_size = 2_000
+    graph = _graph(FakeRetriever(), model, context_size=context_size)
+
+    result = asyncio.run(graph._grade(state))  # pyright: ignore[reportPrivateUsage]
+
+    worker_messages = RagGraph._worker_messages(list(model.messages[0]))  # pyright: ignore[reportPrivateUsage]
+    rendered = "\n".join(message.content for message in worker_messages)
+    assert cast(EvidenceGrade, result["grade"]).verdict == "qualified_answer"
+    assert RagTokenBudgetMiddleware.estimate_input_tokens(worker_messages) + 500 <= context_size
+    assert "开头的关键事实。" in rendered
+    assert "[后续证据因上下文长度限制已截断]" in rendered
+    assert "不应保留的尾部。" not in rendered
 
 
 def test_empty_chunk_evidence_abstains() -> None:
