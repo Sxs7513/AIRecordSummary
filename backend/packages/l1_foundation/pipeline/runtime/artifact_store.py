@@ -3,19 +3,28 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import cast
-from uuid import UUID, uuid4
+from uuid import UUID
 
 from pydantic import BaseModel
 
+from l1_foundation.files import FileStore
+from l1_foundation.infrastructure.storage.local import LocalStorage
 from l1_foundation.pipeline.contracts import ArtifactPayload, ArtifactRef, PipelineRunId, StageResult, StageRunId
 
 
 class ArtifactStore:
     """Stores JSON pipeline artifacts under the existing local storage root."""
 
-    def __init__(self, storage_root: Path) -> None:
-        self._storage_root = storage_root.resolve()
+    def __init__(self, file_store: FileStore | Path) -> None:
+        # Path compatibility keeps isolated stage tests concise while production
+        # composition always injects the provider-neutral FileStore.
+        self._file_store = LocalStorage(file_store) if isinstance(file_store, Path) else file_store
+
+    @property
+    def file_store(self) -> FileStore:
+        return self._file_store
 
     def write_json(
         self,
@@ -36,15 +45,11 @@ class ArtifactStore:
             payload.artifact_type,
             payload.artifact_version,
         )
-        path = self._storage_root / relative_path
-        path.parent.mkdir(parents=True, exist_ok=True)
         serialized = json.dumps(payload.data, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        temporary = path.with_name(f".{path.name}.{uuid4()}.tmp")
-        try:
+        with TemporaryDirectory(prefix="artifact-store-") as temporary_directory:
+            temporary = Path(temporary_directory) / "artifact.json"
             temporary.write_text(serialized, encoding="utf-8")
-            temporary.replace(path)
-        finally:
-            temporary.unlink(missing_ok=True)
+            self._file_store.put_file(temporary, key=relative_path.as_posix())
         return ArtifactRef(
             artifact_type=payload.artifact_type,
             artifact_version=payload.artifact_version,
@@ -67,8 +72,9 @@ class ArtifactStore:
     ) -> StageResult[OutputT] | None:
         """Restore one complete JSON stage result from its deterministic object key."""
         relative_path = self._json_relative_path(pipeline_run_id, stage_run_id, stage_name, stage_version, artifact_type, artifact_version)
-        path = self._storage_root / relative_path
-        if not path.is_file():
+        try:
+            path = self._file_store.get_file_by_key(relative_path.as_posix())
+        except FileNotFoundError:
             return None
         try:
             serialized = path.read_text(encoding="utf-8")
@@ -88,9 +94,7 @@ class ArtifactStore:
         return StageResult(output=output, artifacts=(ref,))
 
     def read_json(self, artifact: ArtifactRef) -> dict[str, object]:
-        path = (self._storage_root / artifact.uri).resolve()
-        if self._storage_root not in path.parents:
-            raise ValueError("Artifact URI escapes storage root")
+        path = self._file_store.get_file_by_key(artifact.uri)
         parsed = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(parsed, dict):
             raise ValueError(f"Artifact must contain a JSON object: {artifact.uri}")

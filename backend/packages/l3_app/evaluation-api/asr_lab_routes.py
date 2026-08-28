@@ -174,9 +174,10 @@ def get_asset_audio(
 ) -> FileResponse:
     try:
         asset = service.get_asset_audio(user, asset_id)
-        path = storage.resolve(str(asset["storage_path"]))
-        if not path.is_file():
-            raise AsrLabNotFoundError("Audio file not found")
+        try:
+            path = storage.get_file_by_key(str(asset["storage_path"]))
+        except FileNotFoundError as error:
+            raise AsrLabNotFoundError("Audio file not found") from error
         return FileResponse(path, media_type=str(asset["mime_type"]), filename=str(asset["file_name"]))
     except Exception as error:
         _raise_api_error(error)

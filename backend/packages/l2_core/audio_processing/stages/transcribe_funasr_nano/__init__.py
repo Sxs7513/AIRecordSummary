@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import tempfile
 from pathlib import Path
+from uuid import uuid4
 
+from l1_foundation.files import FileStore
 from l1_foundation.pipeline.contracts import ArtifactPayload, RetryPolicy, StageContext, StageResult
 from l1_foundation.pipeline.runtime.artifact_store import ArtifactStore
 from l1_foundation.worker import WorkerClient
@@ -19,7 +21,7 @@ class FunAsrNanoTranscribeStage:
 
     def __init__(
         self,
-        storage_root: Path,
+        file_store: FileStore,
         artifact_store: ArtifactStore,
         model_name: str,
         language: str,
@@ -32,7 +34,7 @@ class FunAsrNanoTranscribeStage:
         hotwords: list[str] | None = None,
         worker_client: WorkerClient | None = None,
     ) -> None:
-        self._storage_root = storage_root.resolve()
+        self._file_store = file_store
         self._artifact_store = artifact_store
         self._worker_client = worker_client
         self._engine = FunAsrNanoEngine(
@@ -62,21 +64,23 @@ class FunAsrNanoTranscribeStage:
         if self._worker_client is None:
             raise RuntimeError("FunAsrNanoTranscribeStage requires WorkerClient")
         audio_path = self._resolve_storage_path(storage_path)
-        work_root = self._storage_root / "compute-inputs"
-        work_root.mkdir(parents=True, exist_ok=True)
+        input_keys: list[str] = []
         with (
-            tempfile.TemporaryDirectory(dir=work_root) as directory,
+            tempfile.TemporaryDirectory(prefix="funasr-input-") as directory,
             self._engine.prepare_inference_batch(audio_path, diarization.segments, Path(directory)) as (windows, paths),
         ):
             if paths:
-                inference = await self._worker_client.execute(
-                    asr_inference_batch_command(
-                        "funasr_nano",
-                        [path.relative_to(self._storage_root).as_posix() for path in paths],
-                    ),
-                    result_type=AsrInferenceBatchResult,
-                    on_progress=lambda progress, message: context.report_progress(round(progress * 100), message or "FunASR"),
-                )
+                batch_id = uuid4().hex
+                input_keys = [self._file_store.put_file(path, key=f"compute-inputs/{batch_id}/{path.name}") for path in paths]
+                try:
+                    inference = await self._worker_client.execute(
+                        asr_inference_batch_command("funasr_nano", input_keys),
+                        result_type=AsrInferenceBatchResult,
+                        on_progress=lambda progress, message: context.report_progress(round(progress * 100), message or "FunASR"),
+                    )
+                finally:
+                    for key in input_keys:
+                        self._file_store.delete_file(key)
             else:
                 inference = AsrInferenceBatchResult(provider="funasr_nano", model_name=self._engine.model_name, items=[])
         if len(inference.items) != len(windows):
@@ -106,10 +110,7 @@ class FunAsrNanoTranscribeStage:
         )
 
     def _resolve_storage_path(self, uri: str) -> Path:
-        path = (self._storage_root / uri).resolve()
-        if self._storage_root not in path.parents or not path.is_file():
-            raise FileNotFoundError(f"ASR audio does not exist: {uri}")
-        return path
+        return self._file_store.get_file_by_key(uri)
 
 
 __all__ = ["FunAsrNanoTranscribeStage"]

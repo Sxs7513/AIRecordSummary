@@ -36,10 +36,11 @@ def build_recording_stage_registry(
 ) -> StageRegistry:
     """Build every recording-owned stage; stages orchestrate atomic compute calls themselves."""
     registry = StageRegistry()
-    registry.register(NormalizeAudioStage(settings.resolved_local_storage_root))
+    file_store = artifact_store.file_store
+    registry.register(NormalizeAudioStage(file_store, artifact_store))
     registry.register(
         PreprocessAsrAudioStage(
-            settings.resolved_local_storage_root,
+            file_store,
             artifact_store,
             settings.asr_preprocess_recording_enabled,
         )
@@ -60,7 +61,7 @@ def build_recording_stage_registry(
     )
     registry.register(
         PyannoteDiarizeStage(
-            settings.resolved_local_storage_root,
+            file_store,
             artifact_store,
             settings.pyannote_model,
             settings.pyannote_auth_token,
@@ -75,7 +76,7 @@ def build_recording_stage_registry(
     )
     registry.register(
         QwenAsrTranscribeStage(
-            settings.resolved_local_storage_root,
+            file_store,
             artifact_store,
             settings.qwen_asr_model,
             settings.qwen_asr_language,
@@ -97,7 +98,7 @@ def build_recording_stage_registry(
     funasr_hotwords = build_funasr_hotwords(settings.resolved_qwen_asr_context_config, settings.qwen_asr_max_context_items)
     registry.register(
         FunAsrNanoTranscribeStage(
-            settings.resolved_local_storage_root,
+            file_store,
             artifact_store,
             settings.funasr_nano_model,
             settings.qwen_asr_language,
@@ -140,7 +141,7 @@ def build_recording_stage_registry(
     )
     registry.register(
         AlignTranscriptStage(
-            settings.resolved_local_storage_root,
+            file_store,
             artifact_store,
             settings.transcript_alignment_model,
             settings.resolved_huggingface_hub_cache_dir,

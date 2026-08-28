@@ -4,6 +4,7 @@ import asyncio
 import logging
 
 from l1_foundation.infrastructure.db.session import create_database_engine
+from l1_foundation.infrastructure.storage.local import LocalStorage
 from l1_foundation.messaging import KafkaEventConsumer, KafkaEventProducer, SyncKafkaEventProducer, Topics
 from l1_foundation.pipeline.runtime.artifact_store import ArtifactStore
 from l1_foundation.settings import get_settings
@@ -18,7 +19,9 @@ from l3_app.processing_worker.worker import ProcessingCancelHandler, ProcessingC
 async def run() -> None:
     settings = get_settings()
     engine = create_database_engine(settings)
-    artifact_store = ArtifactStore(settings.resolved_local_storage_root)
+    storage = LocalStorage(settings.resolved_local_storage_root)
+    storage.initialize()
+    artifact_store = ArtifactStore(storage)
     redis = SyncRedisStreamStore.from_url(
         settings.redis_url,
         maxlen=settings.redis_stream_maxlen,

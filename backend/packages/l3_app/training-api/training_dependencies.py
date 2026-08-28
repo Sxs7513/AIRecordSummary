@@ -35,6 +35,7 @@ def get_asr_lab_service(request: Request) -> AsrLabService:
         request.app.state.database_engine,
         request.app.state.storage,
         settings.resolved_asr_lab_project_dataset_root,
+        training_workspace_root=settings.resolved_local_storage_root,
         evaluation_context=build_qwen_asr_context(
             settings.resolved_qwen_asr_context_config,
             settings.qwen_asr_max_context_items,

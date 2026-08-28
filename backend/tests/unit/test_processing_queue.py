@@ -156,9 +156,9 @@ def test_embedding_retry_reuses_the_current_processing_chunk_artifact(tmp_path: 
         uri="artifacts/search-chunks.json",
     )
     storage = LocalStorage(tmp_path)
-    artifact_path = storage.resolve(chunks.uri)
-    artifact_path.parent.mkdir(parents=True)
+    artifact_path = tmp_path / "search-chunks.json"
     artifact_path.write_text("{}", encoding="utf-8")
+    storage.put_file(artifact_path, key=chunks.uri)
     state_store = _StateStore(
         {
             f"recording:{recording_id}:processing": {"processing_id": str(processing_id)},

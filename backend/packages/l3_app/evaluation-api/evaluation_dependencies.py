@@ -4,7 +4,7 @@ from typing import Annotated
 
 from fastapi import Depends, HTTPException, Request, status
 
-from l1_foundation.infrastructure.storage.local import LocalStorage
+from l1_foundation.files import FileStore
 from l2_core.asr_lab.service import AsrLabService
 from l2_core.audio_processing.stages.transcribe_qwen_asr.context import build_qwen_asr_context
 from l2_core.auth.authorization import AuthorizationService
@@ -32,11 +32,11 @@ def require_current_user(request: Request, service: AuthServiceDependency) -> Cu
 CurrentUserDependency = Annotated[CurrentUser, Depends(require_current_user)]
 
 
-def get_storage(request: Request) -> LocalStorage:
+def get_storage(request: Request) -> FileStore:
     return request.app.state.storage
 
 
-StorageDependency = Annotated[LocalStorage, Depends(get_storage)]
+StorageDependency = Annotated[FileStore, Depends(get_storage)]
 
 
 def get_asr_lab_service(request: Request) -> AsrLabService:
@@ -45,6 +45,7 @@ def get_asr_lab_service(request: Request) -> AsrLabService:
         request.app.state.database_engine,
         request.app.state.storage,
         settings.resolved_asr_lab_project_dataset_root,
+        training_workspace_root=settings.resolved_local_storage_root,
         evaluation_context=build_qwen_asr_context(
             settings.resolved_qwen_asr_context_config,
             settings.qwen_asr_max_context_items,

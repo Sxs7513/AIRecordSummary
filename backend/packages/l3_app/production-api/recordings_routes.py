@@ -228,9 +228,10 @@ def get_recording_audio(recording_id: UUID, service: RecordingServiceDependency,
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Recording not found") from error
     except RecordingAccessDeniedError as error:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Recording access denied") from error
-    path = storage.resolve(str(recording["storage_path"]))
-    if not path.is_file():
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Recording audio not found")
+    try:
+        path = storage.get_file_by_key(str(recording["storage_path"]))
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Recording audio not found") from error
     return FileResponse(path, media_type=str(recording["mime_type"]), filename=str(recording["file_name"]))
 
 

@@ -3,13 +3,14 @@ from __future__ import annotations
 import hashlib
 import logging
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any, cast
 from uuid import UUID, uuid4, uuid5
 
 from fastapi import UploadFile
 from sqlalchemy import Connection, Engine, RowMapping, text
 
-from l1_foundation.infrastructure.storage.local import LocalStorage
+from l1_foundation.files import FileStore
 from l1_foundation.pipeline.contracts import ArtifactRef, PipelineRunId, StageRunId
 from l1_foundation.pipeline.definitions.graph import PipelineDefinition
 from l1_foundation.streaming import SyncRedisStreamStore
@@ -41,7 +42,7 @@ class RecordingService:
     def __init__(
         self,
         engine: Engine,
-        storage: LocalStorage,
+        storage: FileStore,
         processing_definition: PipelineDefinition = recording_processing,
         processing_publisher: ProcessingCommandPublisher | None = None,
         processing_state_store: SyncRedisStreamStore | None = None,
@@ -58,8 +59,14 @@ class RecordingService:
         file_name = self._safe_file_name(upload.filename)
         recording_id = RecordingId(uuid4())
         storage_path = self._storage_key(recording_id, file_name)
-        destination = self._storage.resolve(storage_path)
-        file_size_bytes, content_md5 = await self._write_upload(upload, destination)
+        try:
+            with TemporaryDirectory(prefix="recording-upload-") as temporary_directory:
+                source = Path(temporary_directory) / file_name
+                file_size_bytes, content_md5 = await self._write_upload(upload, source)
+                self._storage.put_file(source, key=storage_path)
+        except Exception:
+            await upload.close()
+            raise
         processing_id = stable_recording_processing_id(
             user.current_workspace_id,
             user.id,
@@ -99,12 +106,12 @@ class RecordingService:
                         workspace_id=user.current_workspace_id,
                     )
             if not recording_created:
-                self._storage.remove_tree(f"recordings/{recording_id}")
+                self._storage.delete_file(storage_path)
                 return recording, PipelineRunId(processing_id)
             run_id = PipelineRunId(processing_id)
             self._remember_processing(recording_id, run_id)
         except Exception:
-            destination.unlink(missing_ok=True)
+            self._storage.delete_file(storage_path)
             raise
         finally:
             await upload.close()
@@ -427,8 +434,12 @@ class RecordingService:
             ),
             None,
         )
-        if chunk_ref is None or not self._storage.resolve(chunk_ref.uri).is_file():
-            raise RecordingStageNotRetryableError("Search chunk artifact is no longer available")
+        try:
+            if chunk_ref is None:
+                raise FileNotFoundError
+            self._storage.get_file_by_key(chunk_ref.uri)
+        except FileNotFoundError as error:
+            raise RecordingStageNotRetryableError("Search chunk artifact is no longer available") from error
         with self._engine.begin() as connection:
             self._processing_publisher.enqueue_embedding_retry(connection, processing_id, recording_id, chunk_ref)
         return StageRunId(uuid5(processing_id, "embedding_indexing"))
@@ -537,14 +548,16 @@ class RecordingService:
             if self._processing_publisher is None:
                 raise RuntimeError("Processing outbox publisher is unavailable")
             self._processing_publisher.enqueue_cancel(connection, recording_id)
-            exists = connection.execute(
-                text("delete from recordings where id = :recording_id returning id"), {"recording_id": recording_id}
-            ).scalar_one_or_none()
-        if exists is None:
+            deleted = connection.execute(
+                text("delete from recordings where id = :recording_id returning id, storage_path, processing_id"), {"recording_id": recording_id}
+            ).mappings().one_or_none()
+        if deleted is None:
             raise RecordingNotFoundError(str(recording_id))
-        self._storage.remove_tree(f"recordings/{recording_id}")
-        self._storage.remove_tree(f"normalized/{recording_id}")
-        self._storage.remove_tree(f"artifacts/{recording_id}")
+        self._storage.delete_file(str(deleted["storage_path"]))
+        processing_id = deleted.get("processing_id")
+        if processing_id is not None:
+            self._storage.delete_file(f"normalized/{recording_id}/{processing_id}.wav")
+            self._storage.delete_file(f"asr-preprocessed/{recording_id}/{processing_id}.wav")
 
     def _insert_recording(
         self,

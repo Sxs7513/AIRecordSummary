@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from l1_foundation.files import FileStore
+from l1_foundation.infrastructure.storage.local import LocalStorage
 from l1_foundation.llm import (
     LlmBatchWorkerHandler,
     LlmGenerateBatchInput,
@@ -35,9 +37,13 @@ from l3_app.compute_worker.registry import ComputeOperationRegistry, ComputeOper
 from l3_app.compute_worker.rerank_handler import RerankHandler
 
 
-def build_compute_operation_registry(settings: Settings) -> ComputeOperationRegistry:
+def build_compute_operation_registry(settings: Settings, file_store: FileStore | None = None) -> ComputeOperationRegistry:
     registry = ComputeOperationRegistry()
-    artifact_store = ArtifactStore(settings.resolved_local_storage_root)
+    if file_store is None:
+        local_storage = LocalStorage(settings.resolved_local_storage_root)
+        local_storage.initialize()
+        file_store = local_storage
+    artifact_store = ArtifactStore(file_store)
     for provider in LlmProvider:
         handler = LlmWorkerHandler(
             provider,
@@ -72,8 +78,8 @@ def build_compute_operation_registry(settings: Settings) -> ComputeOperationRegi
             )
         )
     diarize = PyannoteInferenceHandler(settings, artifact_store)
-    qwen_asr = build_qwen_asr_handler(settings)
-    funasr = build_funasr_handler(settings)
+    qwen_asr = build_qwen_asr_handler(settings, file_store)
+    funasr = build_funasr_handler(settings, file_store)
     align = AlignmentInferenceBatchHandler(settings, artifact_store)
     embedding = EmbeddingEncodeHandler(settings, artifact_store)
     rerank = RerankHandler(settings)

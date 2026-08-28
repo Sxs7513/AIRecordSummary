@@ -16,6 +16,7 @@ from uuid import UUID
 
 from sqlalchemy import Connection, Engine, text
 
+from l1_foundation.files import FileStore
 from l2_core.asr_lab.model_runtime import build_asr_runtime
 from l2_core.asr_lab.normalization import normalize_text
 from l2_core.evaluation.metrics import character_error_rate, word_error_rate
@@ -29,6 +30,7 @@ class AsrEvaluationWorker:
     def __init__(
         self,
         engine: Engine,
+        file_store: FileStore,
         storage_root: Path,
         model_cache_root: Path,
         *,
@@ -37,6 +39,7 @@ class AsrEvaluationWorker:
         context: str = "",
     ) -> None:
         self._engine = engine
+        self._file_store = file_store
         self._storage_root = storage_root.resolve()
         self._model_cache_root = model_cache_root.resolve()
         self._hf_runtime_python = hf_runtime_python.absolute() if hf_runtime_python is not None else None
@@ -512,10 +515,7 @@ class AsrEvaluationWorker:
         uri = case["artifact_uri"] or case["recording_storage_path"]
         if not isinstance(uri, str):
             raise ValueError("Evaluation source asset has no storage path")
-        path = (self._storage_root / uri).resolve()
-        if self._storage_root not in path.parents or not path.is_file():
-            raise FileNotFoundError(f"Evaluation source audio does not exist: {uri}")
-        return path
+        return self._file_store.get_file_by_key(uri)
 
     @staticmethod
     @contextmanager

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
+from l1_foundation.files import FileStore
 from l1_foundation.pipeline.contracts import ArtifactPayload, RetryPolicy, StageContext, StageResult
 from l1_foundation.pipeline.runtime.artifact_store import ArtifactStore
 from l2_core.audio_processing.stages.recording_models import NormalizedAudioOutput, PreprocessAsrAudioInput
@@ -18,8 +20,8 @@ class PreprocessAsrAudioStage:
     retry_policy = RetryPolicy(initial_backoff_seconds=10)
     input_model = PreprocessAsrAudioInput
 
-    def __init__(self, storage_root: Path, artifact_store: ArtifactStore, enabled: bool, ffmpeg_binary: str = "ffmpeg") -> None:
-        self._storage_root = storage_root.resolve()
+    def __init__(self, file_store: FileStore, artifact_store: ArtifactStore, enabled: bool, ffmpeg_binary: str = "ffmpeg") -> None:
+        self._file_store = file_store
         self._artifact_store = artifact_store
         self._enabled = enabled
         self._ffmpeg_binary = ffmpeg_binary
@@ -53,32 +55,32 @@ class PreprocessAsrAudioStage:
                 output=output,
                 artifacts=(ArtifactPayload(artifact_type="audio.asr_preprocessed", data=output.model_dump(mode="json")),),
             )
-        target_relative = Path("asr-preprocessed") / str(context.subject_id) / f"{context.pipeline_run_id}.wav"
-        target = self._storage_root / target_relative
-        target.parent.mkdir(parents=True, exist_ok=True)
+        target_key = f"asr-preprocessed/{context.subject_id}/{context.pipeline_run_id}.wav"
         context.report_progress(5, "执行 ASR 音频前置处理")
-        process = await asyncio.create_subprocess_exec(
-            self._ffmpeg_binary,
-            "-y",
-            "-i",
-            str(source),
-            "-vn",
-            *ASR_AUDIO_OUTPUT_ARGS,
-            str(target),
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        try:
-            _, stderr = await process.communicate()
-        except asyncio.CancelledError:
-            if process.returncode is None:
-                process.terminate()
-                await process.wait()
-            target.unlink(missing_ok=True)
-            raise
-        if process.returncode != 0:
-            raise RuntimeError(f"ffmpeg ASR preprocessing failed: {stderr.decode('utf-8', errors='replace')[-2000:]}")
-        output = NormalizedAudioOutput(storage_path=target_relative.as_posix(), sample_rate_hz=16000, channels=1, format="wav")
+        with TemporaryDirectory(prefix="preprocess-asr-") as temporary_directory:
+            target = Path(temporary_directory) / "preprocessed.wav"
+            process = await asyncio.create_subprocess_exec(
+                self._ffmpeg_binary,
+                "-y",
+                "-i",
+                str(source),
+                "-vn",
+                *ASR_AUDIO_OUTPUT_ARGS,
+                str(target),
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                _, stderr = await process.communicate()
+            except asyncio.CancelledError:
+                if process.returncode is None:
+                    process.terminate()
+                    await process.wait()
+                raise
+            if process.returncode != 0:
+                raise RuntimeError(f"ffmpeg ASR preprocessing failed: {stderr.decode('utf-8', errors='replace')[-2000:]}")
+            self._file_store.put_file(target, key=target_key)
+        output = NormalizedAudioOutput(storage_path=target_key, sample_rate_hz=16000, channels=1, format="wav")
         context.report_progress(100, "ASR 音频前置处理完成")
         return StageResult(
             output=output,
@@ -86,7 +88,4 @@ class PreprocessAsrAudioStage:
         )
 
     def _resolve(self, uri: str) -> Path:
-        path = (self._storage_root / uri).resolve()
-        if self._storage_root not in path.parents or not path.is_file():
-            raise FileNotFoundError(f"Normalized audio does not exist: {uri}")
-        return path
+        return self._file_store.get_file_by_key(uri)

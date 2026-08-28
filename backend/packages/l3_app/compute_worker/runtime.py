@@ -4,8 +4,6 @@ import asyncio
 import hashlib
 import json
 import logging
-import os
-import shutil
 import tempfile
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
@@ -16,6 +14,8 @@ from threading import Event
 from time import monotonic
 from uuid import UUID
 
+from l1_foundation.files import FileStore
+from l1_foundation.infrastructure.storage.local import LocalStorage
 from l1_foundation.task_runtime.resources import ResourceQueue
 from l1_foundation.worker.contracts import (
     ComputeCancelledEvent,
@@ -147,7 +147,9 @@ class ComputeWorkerRuntime:
         registry: ComputeOperationRegistry,
         execution_pool: ComputeExecutionPool,
         *,
-        output_root: Path,
+        file_store: FileStore | None = None,
+        result_prefix: str = "compute-tasks",
+        output_root: Path | None = None,
         completed_ttl_seconds: float = 1800,
         max_tasks: int = 100,
         heartbeat_seconds: float = 15,
@@ -162,8 +164,15 @@ class ComputeWorkerRuntime:
             raise ValueError("heartbeat_seconds must be positive")
         self._registry = registry
         self._execution_pool = execution_pool
-        self._output_root = output_root.resolve()
-        self._output_root.mkdir(parents=True, exist_ok=True)
+        if file_store is None:
+            if output_root is None:
+                raise ValueError("file_store is required")
+            local_storage = LocalStorage(output_root)
+            local_storage.initialize()
+            file_store = local_storage
+            result_prefix = ""
+        self._file_store = file_store
+        self._result_prefix = result_prefix.strip("/")
         self._completed_ttl = timedelta(seconds=completed_ttl_seconds)
         self._max_tasks = max_tasks
         self._heartbeat_seconds = heartbeat_seconds
@@ -535,31 +544,18 @@ class ComputeWorkerRuntime:
                 task_ids.discard(task_id)
                 if not task_ids:
                     self._scope_tasks.pop(scope, None)
-        task_output_dir = self._output_root / str(task_id)
-        if task_output_dir.parent == self._output_root:
-            shutil.rmtree(task_output_dir, ignore_errors=True)
+        self._file_store.delete_file(self._result_key(task_id))
         logger.info("Compute task evicted task_id=%s operation=%s", task_id, state.request.operation)
 
     def _persist_result(self, task_id: UUID, result: JsonObject) -> None:
-        task_output_dir = self._output_root / str(task_id)
-        task_output_dir.mkdir(parents=True, exist_ok=True)
-        result_path = task_output_dir / "result.json"
-        descriptor: int | None = None
-        temporary_path: str | None = None
-        try:
-            descriptor, temporary_path = tempfile.mkstemp(prefix="result-", suffix=".json.tmp", dir=task_output_dir)
-            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-                descriptor = None
-                json.dump(result, stream, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(temporary_path, result_path)
-            temporary_path = None
-        finally:
-            if descriptor is not None:
-                os.close(descriptor)
-            if temporary_path is not None:
-                Path(temporary_path).unlink(missing_ok=True)
+        with tempfile.TemporaryDirectory(prefix="compute-result-") as temporary_directory:
+            source = Path(temporary_directory) / "result.json"
+            source.write_text(json.dumps(result, ensure_ascii=False, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+            self._file_store.put_file(source, key=self._result_key(task_id))
+
+    def _result_key(self, task_id: UUID) -> str:
+        suffix = f"{task_id}/result.json"
+        return f"{self._result_prefix}/{suffix}" if self._result_prefix else suffix
 
     @staticmethod
     def _request_hash(request: ComputeTaskRequest) -> str:

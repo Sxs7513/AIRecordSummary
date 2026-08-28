@@ -115,7 +115,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     app.state.outbox_repository = OutboxRepository(app.state.database_engine)
     app.state.generation_command_publisher = GenerationCommandPublisher(app.state.generation_command_producer, app.state.outbox_repository)
     app.state.processing_command_publisher = ProcessingCommandPublisher(app.state.generation_command_producer, app.state.outbox_repository)
-    artifact_store = ArtifactStore(app.state.settings.resolved_local_storage_root)
+    artifact_store = ArtifactStore(storage)
     injected_worker_client = app.state.injected_worker_client
     app.state.worker_client = injected_worker_client or KafkaWorkerClient(
         app.state.generation_command_producer,

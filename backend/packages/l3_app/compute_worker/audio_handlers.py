@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from pathlib import Path
 
+from l1_foundation.files import FileStore
 from l1_foundation.pipeline.runtime.artifact_store import ArtifactStore
 from l1_foundation.settings import Settings
 from l1_foundation.worker import WorkerExecutionContext
@@ -34,9 +35,9 @@ def _progress(context: WorkerExecutionContext) -> Callable[[int, str], None]:
 
 class PyannoteInferenceHandler:
     def __init__(self, settings: Settings, artifact_store: ArtifactStore) -> None:
-        self._storage_root = settings.resolved_local_storage_root
+        self._file_store = artifact_store.file_store
         self._diarizer = PyannoteDiarizeStage(
-            self._storage_root,
+            self._file_store,
             artifact_store,
             settings.pyannote_model,
             settings.pyannote_auth_token,
@@ -55,17 +56,14 @@ class PyannoteInferenceHandler:
         self._diarizer.release()
 
     def _resolve(self, value: str) -> Path:
-        path = (self._storage_root / value).resolve()
-        if self._storage_root not in path.parents or not path.is_file():
-            raise FileNotFoundError(f"Shared audio file does not exist: {value}")
-        return path
+        return self._file_store.get_file_by_key(value)
 
 
 class AsrInferenceBatchHandler:
-    def __init__(self, engine: QwenAsrEngine | FunAsrNanoEngine, provider: str, storage_root: Path) -> None:
+    def __init__(self, engine: QwenAsrEngine | FunAsrNanoEngine, provider: str, file_store: FileStore) -> None:
         self._engine = engine
         self._provider = provider
-        self._storage_root = storage_root.resolve()
+        self._file_store = file_store
 
     def __call__(self, value: AsrInferenceBatchInput, context: WorkerExecutionContext) -> AsrInferenceBatchResult:
         paths = [self._resolve(item.audio_storage_path) for item in value.items]
@@ -91,17 +89,14 @@ class AsrInferenceBatchHandler:
         self._engine.release()
 
     def _resolve(self, value: str) -> Path:
-        path = (self._storage_root / value).resolve()
-        if self._storage_root not in path.parents or not path.is_file():
-            raise FileNotFoundError(f"Shared audio file does not exist: {value}")
-        return path
+        return self._file_store.get_file_by_key(value)
 
 
 class AlignmentInferenceBatchHandler:
     def __init__(self, settings: Settings, artifact_store: ArtifactStore) -> None:
-        self._storage_root = settings.resolved_local_storage_root
+        self._file_store = artifact_store.file_store
         self._aligner = AlignTranscriptStage(
-            self._storage_root,
+            self._file_store,
             artifact_store,
             settings.transcript_alignment_model,
             settings.resolved_huggingface_hub_cache_dir,
@@ -118,10 +113,7 @@ class AlignmentInferenceBatchHandler:
         self._aligner.release()
 
     def _resolve(self, value: str) -> Path:
-        path = (self._storage_root / value).resolve()
-        if self._storage_root not in path.parents or not path.is_file():
-            raise FileNotFoundError(f"Shared audio file does not exist: {value}")
-        return path
+        return self._file_store.get_file_by_key(value)
 
 
 class EmbeddingEncodeHandler:
@@ -159,7 +151,7 @@ class EmbeddingEncodeHandler:
         self._encoder.release()
 
 
-def build_qwen_asr_handler(settings: Settings) -> AsrInferenceBatchHandler:
+def build_qwen_asr_handler(settings: Settings, file_store: FileStore) -> AsrInferenceBatchHandler:
     engine = QwenAsrEngine(
         QwenAsrConfig(
             model_name=settings.qwen_asr_model,
@@ -182,10 +174,10 @@ def build_qwen_asr_handler(settings: Settings) -> AsrInferenceBatchHandler:
             low_volume_max_gain_db=settings.qwen_asr_low_volume_max_gain_db,
         )
     )
-    return AsrInferenceBatchHandler(engine, "qwen_asr", settings.resolved_local_storage_root)
+    return AsrInferenceBatchHandler(engine, "qwen_asr", file_store)
 
 
-def build_funasr_handler(settings: Settings) -> AsrInferenceBatchHandler:
+def build_funasr_handler(settings: Settings, file_store: FileStore) -> AsrInferenceBatchHandler:
     hotwords = build_funasr_hotwords(settings.resolved_qwen_asr_context_config, settings.qwen_asr_max_context_items)
     engine = FunAsrNanoEngine(
         FunAsrNanoConfig(
@@ -199,4 +191,4 @@ def build_funasr_handler(settings: Settings) -> AsrInferenceBatchHandler:
             settings.asr_speech_window_overlap_ms,
         )
     )
-    return AsrInferenceBatchHandler(engine, "funasr_nano", settings.resolved_local_storage_root)
+    return AsrInferenceBatchHandler(engine, "funasr_nano", file_store)

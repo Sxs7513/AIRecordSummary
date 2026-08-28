@@ -4,6 +4,7 @@ import asyncio
 import logging
 
 from l1_foundation.infrastructure.db.session import create_database_engine
+from l1_foundation.infrastructure.storage.local import LocalStorage
 from l1_foundation.messaging import KafkaEventConsumer, KafkaEventProducer, OutboxRepository, SyncKafkaEventProducer, Topics
 from l1_foundation.observability import ObservabilityClient
 from l1_foundation.pipeline.runtime.artifact_store import ArtifactStore
@@ -81,7 +82,9 @@ async def run() -> None:
     await worker_client.ready()
     await observability.start()
     rag_service = RagService(engine, settings, worker_client, sync_worker_client, observability, sync_redis_store)
-    summary_stage = build_recording_summary_stage(settings, ArtifactStore(settings.resolved_local_storage_root), sync_worker_client)
+    storage = LocalStorage(settings.resolved_local_storage_root)
+    storage.initialize()
+    summary_stage = build_recording_summary_stage(settings, ArtifactStore(storage), sync_worker_client)
     summary_service = RecordingSummaryRegenerationService(
         engine,
         generation_service,

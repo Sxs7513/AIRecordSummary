@@ -13,6 +13,7 @@ from importlib import import_module
 from pathlib import Path
 from typing import Any, Protocol, cast
 
+from l1_foundation.files import FileStore
 from l1_foundation.pipeline.contracts import ArtifactPayload, RetryPolicy, StageContext, StageResult
 from l1_foundation.pipeline.runtime.artifact_store import ArtifactStore
 from l1_foundation.worker import WorkerClient
@@ -64,7 +65,7 @@ class PyannoteDiarizeStage:
 
     def __init__(
         self,
-        storage_root: Path,
+        file_store: FileStore,
         artifact_store: ArtifactStore,
         model_name: str,
         auth_token: str | None,
@@ -76,7 +77,7 @@ class PyannoteDiarizeStage:
         short_segment_absorb_max_gap_ms: int = 2_000,
         worker_client: WorkerClient | None = None,
     ) -> None:
-        self._storage_root = storage_root.resolve()
+        self._file_store = file_store
         self._artifact_store = artifact_store
         self._model_name = model_name
         self._auth_token = auth_token
@@ -407,12 +408,6 @@ class PyannoteDiarizeStage:
             else:
                 merged.append(segment)
         return merged
-
-    def _resolve_storage_path(self, uri: str) -> Path:
-        path = (self._storage_root / uri).resolve()
-        if self._storage_root not in path.parents or not path.is_file():
-            raise FileNotFoundError(f"Normalized audio does not exist: {uri}")
-        return path
 
     @staticmethod
     def _speaker_label(index: int) -> str:

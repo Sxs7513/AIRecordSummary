@@ -4,8 +4,8 @@ import asyncio
 import hashlib
 import json
 import logging
-from contextlib import suppress
 from pathlib import Path
+from shutil import rmtree
 from tempfile import TemporaryDirectory
 from typing import Any, Literal, cast
 from uuid import UUID, uuid4
@@ -14,7 +14,7 @@ from fastapi import UploadFile
 from sqlalchemy import Connection, Engine, text
 from sqlalchemy.exc import IntegrityError
 
-from l1_foundation.infrastructure.storage.local import LocalStorage
+from l1_foundation.files import FileStore
 from l2_core.access.recordings import RecordingAccessService
 from l2_core.asr_lab.encrypted_datasets import EncryptedDatasetStore, crop_audio_to_flac
 from l2_core.auth.contracts import CurrentUser
@@ -44,15 +44,17 @@ class AsrLabService:
     def __init__(
         self,
         engine: Engine,
-        storage: LocalStorage,
+        storage: FileStore,
         project_dataset_root: Path,
         *,
+        training_workspace_root: Path | None = None,
         evaluation_context: str = "",
     ) -> None:
         self._engine = engine
         self._storage = storage
         self._recording_access = RecordingAccessService(engine)
         self._encrypted_datasets = EncryptedDatasetStore(project_dataset_root)
+        self._training_workspace_root = training_workspace_root.resolve() if training_workspace_root is not None else None
         self._evaluation_context = evaluation_context
 
     def list_datasets(self, user: CurrentUser) -> list[DatabaseRow]:
@@ -169,7 +171,7 @@ class AsrLabService:
             )
 
         for artifact_uri in artifact_uris:
-            self._storage.remove_tree(str(Path(artifact_uri).parent))
+            self._storage.delete_file(artifact_uri)
         return {
             "id": dataset_id,
             "mode": "deleted",
@@ -275,9 +277,7 @@ class AsrLabService:
         annotation_id = uuid4()
         file_name = f"{asset_id}.flac"
         storage_key = f"asr-lab/samples/{asset_id}/{file_name}"
-        destination = self._storage.resolve(storage_key)
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_bytes(audio)
+        destination = self._put_bytes(audio, storage_key)
         sample_duration_ms = self._probe_duration_ms_sync(destination)
         checksum = hashlib.sha256(audio).hexdigest()
         try:
@@ -339,7 +339,7 @@ class AsrLabService:
                     },
                 ).mappings().one()
         except Exception:
-            self._storage.remove_tree(str(Path(storage_key).parent))
+            self._storage.delete_file(storage_key)
             raise
 
         result = dict(row)
@@ -372,7 +372,7 @@ class AsrLabService:
         if recording_row is None:
             raise AsrLabNotFoundError(str(recording_id))
         recording = dict(recording_row)
-        source_path = self._storage.resolve(cast(str, recording["storage_path"]))
+        source_path = self._storage.get_file_by_key(cast(str, recording["storage_path"]))
         if not source_path.is_file():
             raise AsrLabNotFoundError("Recording audio not found")
         checksum = self._file_checksum(source_path)
@@ -505,7 +505,7 @@ class AsrLabService:
 
         artifact_uri = asset.get("artifact_uri")
         if isinstance(artifact_uri, str):
-            self._storage.remove_tree(str(Path(artifact_uri).parent))
+            self._storage.delete_file(artifact_uri)
         return {
             "id": asset_id,
             "mode": "deleted",
@@ -658,16 +658,14 @@ class AsrLabService:
 
         dataset_id = uuid4()
         prepared_assets: list[dict[str, Any]] = []
-        written_paths: list[Path] = []
+        written_keys: list[str] = []
         try:
             for sample in samples:
                 asset_id = uuid4()
                 file_name = f"{sample.sample_id}.flac"
                 storage_key = f"asr-lab/assets/{asset_id}/{file_name}"
-                destination = self._storage.resolve(storage_key)
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                destination.write_bytes(sample.audio)
-                written_paths.append(destination)
+                destination = self._put_bytes(sample.audio, storage_key)
+                written_keys.append(storage_key)
                 prepared_assets.append(
                     {
                         "asset_id": asset_id,
@@ -744,17 +742,16 @@ class AsrLabService:
             result["imported_sample_count"] = len(prepared_assets)
             return result
         except Exception:
-            for path in written_paths:
-                path.unlink(missing_ok=True)
-                with suppress(OSError):
-                    path.parent.rmdir()
+            for key in written_keys:
+                self._storage.delete_file(key)
             raise
 
     def _persist_annotation_sample(self, user: CurrentUser, annotation: DatabaseRow, password: str) -> None:
         asset = self.get_asset_audio(user, UUID(str(annotation["source_asset_id"])))
-        source = self._storage.resolve(cast(str, asset["storage_path"]))
-        if not source.is_file():
-            raise AsrLabNotFoundError("Audio file not found")
+        try:
+            source = self._storage.get_file_by_key(cast(str, asset["storage_path"]))
+        except FileNotFoundError as error:
+            raise AsrLabNotFoundError("Audio file not found") from error
         self._encrypted_datasets.persist_sample(
             package_id=str(annotation["dataset_id"]),
             sample_id=str(annotation["id"]),
@@ -1249,7 +1246,11 @@ class AsrLabService:
                 {"run_id": run_id},
             )
 
-        self._storage.remove_tree(f"asr-lab/training/{run_id}")
+        if self._training_workspace_root is not None:
+            run_workspace = (self._training_workspace_root / "asr-lab" / "training" / str(run_id)).resolve()
+            if self._training_workspace_root not in run_workspace.parents:
+                raise ValueError("Training workspace escapes configured root")
+            rmtree(run_workspace, ignore_errors=True)
         train_logger.info("ASR LoRA：训练任务已删除 run_id=%s previous_status=%s", run_id, run_status)
         return {
             "id": run_id,
@@ -1684,6 +1685,13 @@ class AsrLabService:
         if size == 0:
             raise ValueError("Audio file is empty")
         return size, digest.hexdigest()
+
+    def _put_bytes(self, content: bytes, key: str) -> Path:
+        with TemporaryDirectory(prefix="asr-lab-file-") as temporary_directory:
+            source = Path(temporary_directory) / Path(key).name
+            source.write_bytes(content)
+            self._storage.put_file(source, key=key)
+        return self._storage.get_file_by_key(key)
 
     @staticmethod
     def _file_checksum(path: Path) -> str:

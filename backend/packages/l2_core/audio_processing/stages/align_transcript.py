@@ -8,7 +8,9 @@ from collections.abc import Callable, Generator, Sequence
 from importlib import import_module
 from pathlib import Path
 from typing import Any, Literal, Protocol, cast
+from uuid import uuid4
 
+from l1_foundation.files import FileStore
 from l1_foundation.infrastructure.huggingface import resolve_local_snapshot
 from l1_foundation.pipeline.contracts import ArtifactPayload, ArtifactRef, RetryPolicy, StageContext, StageResult
 from l1_foundation.pipeline.runtime.artifact_store import ArtifactStore
@@ -48,13 +50,13 @@ class AlignTranscriptStage:
 
     def __init__(
         self,
-        storage_root: Path,
+        file_store: FileStore,
         artifact_store: ArtifactStore,
         model_name: str,
         model_cache_root: Path,
         worker_client: WorkerClient | None = None,
     ) -> None:
-        self._storage_root = storage_root.resolve()
+        self._file_store = file_store
         self._artifact_store = artifact_store
         self._model_name = model_name
         self._model_cache_root = model_cache_root
@@ -83,27 +85,31 @@ class AlignTranscriptStage:
         audio_path = self._resolve_storage_path(audio_storage_path)
         source_windows = [window for window in corrected.windows if window.text.strip()]
         if source_windows:
-            work_root = self._storage_root / "compute-inputs"
-            work_root.mkdir(parents=True, exist_ok=True)
-            with tempfile.TemporaryDirectory(dir=work_root) as directory, contextlib.ExitStack() as stack:
+            with tempfile.TemporaryDirectory(prefix="alignment-input-") as directory, contextlib.ExitStack() as stack:
                 clips = [
                     stack.enter_context(self._cropped_wav(audio_path, window.input_start_ms, window.input_end_ms, Path(directory))) for window in source_windows
                 ]
-                inference = await self._worker_client.execute(
-                    alignment_inference_batch_command(
-                        [
-                            AlignmentInferenceItem(
-                                item_id=str(window.window_index),
-                                audio_storage_path=clip.relative_to(self._storage_root).as_posix(),
-                                text=window.text,
-                                language=window.language or "Chinese",
-                            )
-                            for window, clip in zip(source_windows, clips, strict=True)
-                        ]
-                    ),
-                    result_type=AlignmentInferenceBatchResult,
-                    on_progress=lambda progress, message: context.report_progress(round(progress * 100), message or "转写对齐"),
-                )
+                batch_id = uuid4().hex
+                input_keys = [self._file_store.put_file(clip, key=f"compute-inputs/{batch_id}/{index}.wav") for index, clip in enumerate(clips)]
+                try:
+                    inference = await self._worker_client.execute(
+                        alignment_inference_batch_command(
+                            [
+                                AlignmentInferenceItem(
+                                    item_id=str(window.window_index),
+                                    audio_storage_path=key,
+                                    text=window.text,
+                                    language=window.language or "Chinese",
+                                )
+                                for window, key in zip(source_windows, input_keys, strict=True)
+                            ]
+                        ),
+                        result_type=AlignmentInferenceBatchResult,
+                        on_progress=lambda progress, message: context.report_progress(round(progress * 100), message or "转写对齐"),
+                    )
+                finally:
+                    for key in input_keys:
+                        self._file_store.delete_file(key)
         else:
             inference = AlignmentInferenceBatchResult(model_name=self._model_name, items=[])
         output = self._build_output(diarization.segments, corrected, source_windows, inference)
@@ -372,16 +378,10 @@ class AlignTranscriptStage:
         path = descriptor.get("storage_path")
         if not isinstance(path, str):
             raise ValueError("ASR preprocessed audio artifact is missing storage_path")
-        resolved = (self._storage_root / path).resolve()
-        if self._storage_root not in resolved.parents or not resolved.is_file():
-            raise FileNotFoundError(f"ASR preprocessed audio does not exist: {path}")
-        return resolved
+        return self._file_store.get_file_by_key(path)
 
     def _resolve_storage_path(self, uri: str) -> Path:
-        path = (self._storage_root / uri).resolve()
-        if self._storage_root not in path.parents or not path.is_file():
-            raise FileNotFoundError(f"ASR preprocessed audio does not exist: {uri}")
-        return path
+        return self._file_store.get_file_by_key(uri)
 
     @contextlib.contextmanager
     def _cropped_wav(self, source: Path, start_ms: int, end_ms: int, output_dir: Path | None = None) -> Generator[Path]:

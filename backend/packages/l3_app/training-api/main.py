@@ -56,7 +56,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     storage.initialize()
     app.state.storage = storage
     app.state.database_engine = create_database_engine(app.state.settings)
-    worker = AsrLabWorker(app.state.database_engine, app.state.settings)
+    worker = AsrLabWorker(app.state.database_engine, app.state.settings, storage)
     worker_task = asyncio.create_task(_run_asr_lab_worker(worker), name="asr-lab-worker")
     app.state.asr_lab_worker = worker
     try:

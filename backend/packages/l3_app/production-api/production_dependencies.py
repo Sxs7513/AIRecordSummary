@@ -5,7 +5,7 @@ from typing import Annotated
 from fastapi import Depends, Request
 from sqlalchemy import Engine
 
-from l1_foundation.infrastructure.storage.local import LocalStorage
+from l1_foundation.files import FileStore
 from l1_foundation.streaming import RedisStreamStore
 from l2_core.access.generations import GenerationAccessService
 from l2_core.application.recordings import RecordingService
@@ -63,12 +63,12 @@ def get_database_engine(request: Request) -> Engine:
     return request.app.state.database_engine
 
 
-def get_storage(request: Request) -> LocalStorage:
+def get_storage(request: Request) -> FileStore:
     return request.app.state.storage
 
 
 DatabaseEngineDependency = Annotated[Engine, Depends(get_database_engine)]
-StorageDependency = Annotated[LocalStorage, Depends(get_storage)]
+StorageDependency = Annotated[FileStore, Depends(get_storage)]
 
 
 def get_generation_access_service(request: Request) -> GenerationAccessService:

@@ -5,6 +5,8 @@ from threading import Event
 
 from sqlalchemy import Engine
 
+from l1_foundation.files import FileStore
+from l1_foundation.infrastructure.storage.local import LocalStorage
 from l1_foundation.settings import Settings
 from l2_core.asr_lab.evaluators import AsrEvaluationWorker
 from l2_core.asr_lab.training import AsrTrainingWorker
@@ -16,7 +18,11 @@ logger = logging.getLogger("train")
 class AsrLabWorker:
     """Single-GPU ASR Lab worker that serializes evaluation and training work."""
 
-    def __init__(self, engine: Engine, settings: Settings) -> None:
+    def __init__(self, engine: Engine, settings: Settings, file_store: FileStore | None = None) -> None:
+        if file_store is None:
+            local_storage = LocalStorage(settings.resolved_local_storage_root)
+            local_storage.initialize()
+            file_store = local_storage
         evaluation_context = build_qwen_asr_context(
             settings.resolved_qwen_asr_context_config,
             settings.qwen_asr_max_context_items,
@@ -24,6 +30,7 @@ class AsrLabWorker:
         )
         self._evaluation = AsrEvaluationWorker(
             engine,
+            file_store,
             settings.resolved_local_storage_root,
             settings.resolved_huggingface_hub_cache_dir,
             hf_runtime_python=settings.resolved_asr_lab_training_python_bin,
@@ -32,6 +39,7 @@ class AsrLabWorker:
         )
         self._training = AsrTrainingWorker(
             engine,
+            file_store=file_store,
             storage_root=settings.resolved_local_storage_root,
             model_cache_root=settings.resolved_huggingface_hub_cache_dir,
             training_python=settings.resolved_asr_lab_training_python_bin,

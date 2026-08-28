@@ -39,10 +39,12 @@ def _configure_worker_loggers() -> None:
 
 
 def build_compute_worker_runtime(settings: Settings, registry: ComputeOperationRegistry | None = None) -> ComputeWorkerRuntime:
+    storage = LocalStorage(settings.resolved_local_storage_root)
+    storage.initialize()
     return ComputeWorkerRuntime(
-        registry if registry is not None else build_compute_operation_registry(settings),
+        registry if registry is not None else build_compute_operation_registry(settings, storage),
         ComputeExecutionPool(),
-        output_root=settings.resolved_local_storage_root / "compute-tasks",
+        file_store=storage,
         completed_ttl_seconds=settings.compute_worker_completed_ttl_seconds,
         max_tasks=settings.compute_worker_max_tasks,
         heartbeat_seconds=settings.compute_worker_heartbeat_seconds,

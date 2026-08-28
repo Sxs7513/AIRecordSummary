@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Annotated, Literal
 from uuid import UUID, uuid4
 
@@ -97,16 +98,17 @@ async def create_speaker_profile_sample(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="请选择 mp3、m4a、wav 或 mp4 格式的参考音频")
     file_name = Path(audio.filename or "sample").name
     key = f"speaker-samples/{speaker_profile_id}/{uuid4().hex}{suffix or '.audio'}"
-    destination = storage.resolve(key)
-    destination.parent.mkdir(parents=True, exist_ok=True)
     size = 0
     try:
-        with destination.open("wb") as output:
-            while chunk := await audio.read(1024 * 1024):
-                size += len(chunk)
-                output.write(chunk)
-        if size == 0:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="请选择非空的参考音频")
+        with TemporaryDirectory(prefix="speaker-sample-") as temporary_directory:
+            source = Path(temporary_directory) / file_name
+            with source.open("wb") as output:
+                while chunk := await audio.read(1024 * 1024):
+                    size += len(chunk)
+                    output.write(chunk)
+            if size == 0:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="请选择非空的参考音频")
+            storage.put_file(source, key=key)
         with engine.begin() as connection:
             exists = connection.execute(text("select 1 from speaker_profiles where id = :id"), {"id": speaker_profile_id}).scalar_one_or_none()
             if exists is None:
@@ -129,7 +131,7 @@ async def create_speaker_profile_sample(
                 .one()
             )
     except Exception:
-        destination.unlink(missing_ok=True)
+        storage.delete_file(key)
         raise
     finally:
         await audio.close()
@@ -153,7 +155,7 @@ def delete_speaker_profile(
     if deleted is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Speaker profile not found")
     for path in paths:
-        storage.resolve(path).unlink(missing_ok=True)
+        storage.delete_file(path)
     if _is_html_form(request):
         return RedirectResponse("/speaker-profiles", status_code=status.HTTP_303_SEE_OTHER)
     return {"deleted": True}

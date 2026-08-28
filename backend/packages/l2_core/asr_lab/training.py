@@ -11,6 +11,7 @@ from uuid import UUID
 
 from sqlalchemy import Engine, text
 
+from l1_foundation.files import FileStore
 from l1_foundation.infrastructure.huggingface import resolve_local_snapshot
 from l2_core.asr_lab.evaluators import AsrEvaluationWorker
 
@@ -24,6 +25,7 @@ class AsrTrainingWorker:
         self,
         engine: Engine,
         *,
+        file_store: FileStore,
         storage_root: Path,
         model_cache_root: Path,
         training_python: Path,
@@ -31,6 +33,7 @@ class AsrTrainingWorker:
         evaluation_context: str = "",
     ) -> None:
         self._engine = engine
+        self._file_store = file_store
         self._storage_root = storage_root.resolve()
         self._model_cache_root = model_cache_root.resolve()
         self._training_python = training_python.absolute()
@@ -390,9 +393,7 @@ class AsrTrainingWorker:
         source_uri = case["artifact_uri"] or case["recording_storage_path"]
         if not isinstance(source_uri, str):
             raise ValueError("Training case source has no storage path")
-        source = (self._storage_root / source_uri).resolve()
-        if self._storage_root not in source.parents or not source.is_file():
-            raise FileNotFoundError(f"Training source does not exist: {source_uri}")
+        source = self._file_store.get_file_by_key(source_uri)
         target = audio_root / f"{case['id']}.wav"
         with AsrEvaluationWorker.cropped_audio(source, cast(int, case["start_ms"]), cast(int, case["end_ms"])) as temporary:
             target.write_bytes(temporary.read_bytes())
