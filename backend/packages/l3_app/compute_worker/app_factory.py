@@ -44,7 +44,6 @@ def build_compute_worker_runtime(settings: Settings, registry: ComputeOperationR
     return ComputeWorkerRuntime(
         registry if registry is not None else build_compute_operation_registry(settings, storage),
         ComputeExecutionPool(),
-        file_store=storage,
         completed_ttl_seconds=settings.compute_worker_completed_ttl_seconds,
         max_tasks=settings.compute_worker_max_tasks,
         heartbeat_seconds=settings.compute_worker_heartbeat_seconds,
@@ -92,7 +91,14 @@ def create_worker_app(settings: Settings | None = None, registry: ComputeOperati
         await producer.start()
         await consumer.start()
         await cancel_consumer.start()
-        kafka_handler = KafkaComputeTaskHandler(runtime, producer, redis_store)
+        kafka_handler = KafkaComputeTaskHandler(
+            runtime,
+            producer,
+            redis_store,
+            storage,
+            inline_result_limit_bytes=configured_settings.compute_inline_result_limit_bytes,
+            result_ttl_seconds=configured_settings.redis_terminal_ttl_seconds,
+        )
         consumer_task = asyncio.create_task(
             consumer.run(
                 kafka_handler.handle,

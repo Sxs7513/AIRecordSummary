@@ -36,6 +36,8 @@ async def run() -> None:
         terminal_ttl_seconds=settings.redis_terminal_ttl_seconds,
     )
     generation_service = GenerationService(engine, GenerationRedisRuntime(sync_redis_store))
+    storage = LocalStorage(settings.resolved_local_storage_root)
+    storage.initialize()
     compute_producer = KafkaEventProducer(
         settings.kafka_bootstrap_servers,
         f"{settings.kafka_client_id}-generation-compute",
@@ -51,12 +53,14 @@ async def run() -> None:
     worker_client = KafkaWorkerClient(
         compute_producer,
         async_redis_store,
-        poll_interval_seconds=settings.compute_worker_poll_interval_seconds,
+        storage,
+        reply_wait_timeout_seconds=settings.compute_reply_wait_timeout_seconds,
     )
     sync_worker_client = SyncKafkaWorkerClient(
         sync_compute_producer,
         sync_redis_store,
-        poll_interval_seconds=settings.compute_worker_poll_interval_seconds,
+        storage,
+        reply_wait_timeout_seconds=settings.compute_reply_wait_timeout_seconds,
     )
     observability = ObservabilityClient(
         bootstrap_servers=settings.kafka_bootstrap_servers,
@@ -80,10 +84,9 @@ async def run() -> None:
     )
 
     await worker_client.ready()
+    sync_worker_client.ready()
     await observability.start()
     rag_service = RagService(engine, settings, worker_client, sync_worker_client, observability, sync_redis_store)
-    storage = LocalStorage(settings.resolved_local_storage_root)
-    storage.initialize()
     summary_stage = build_recording_summary_stage(settings, ArtifactStore(storage), sync_worker_client)
     summary_service = RecordingSummaryRegenerationService(
         engine,

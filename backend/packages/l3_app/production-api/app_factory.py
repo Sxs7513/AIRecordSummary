@@ -120,7 +120,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     app.state.worker_client = injected_worker_client or KafkaWorkerClient(
         app.state.generation_command_producer,
         app.state.async_redis_store,
-        poll_interval_seconds=app.state.settings.compute_worker_poll_interval_seconds,
+        storage,
+        reply_wait_timeout_seconds=app.state.settings.compute_reply_wait_timeout_seconds,
     )
     await app.state.worker_client.ready()
     injected_sync_worker_client = app.state.injected_sync_worker_client
@@ -138,7 +139,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         app.state.sync_worker_client = SyncKafkaWorkerClient(
             sync_compute_producer,
             app.state.sync_redis_store,
-            poll_interval_seconds=app.state.settings.compute_worker_poll_interval_seconds,
+            storage,
+            reply_wait_timeout_seconds=app.state.settings.compute_reply_wait_timeout_seconds,
         )
     else:
         app.state.sync_worker_client = injected_sync_worker_client

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 from pathlib import Path
 from threading import Event
 from uuid import UUID, uuid4
@@ -86,7 +85,7 @@ async def _collect_events(runtime: ComputeWorkerRuntime, task_id: UUID) -> list[
 
 def test_runtime_streams_live_events_and_keeps_the_final_snapshot(tmp_path: Path) -> None:
     async def scenario() -> tuple[list[ComputeEvent], ComputeTaskStatus, ComputeTaskSnapshot]:
-        runtime = ComputeWorkerRuntime(registry(), ComputeExecutionPool(), output_root=tmp_path)
+        runtime = ComputeWorkerRuntime(registry(), ComputeExecutionPool())
         await runtime.start()
         task_request = request()
         try:
@@ -105,12 +104,11 @@ def test_runtime_streams_live_events_and_keeps_the_final_snapshot(tmp_path: Path
     assert isinstance(events[-1], ComputeCompletedEvent)
     assert snapshot.status == ComputeTaskStatus.SUCCEEDED
     assert snapshot.result == {"text": "hello"}
-    assert json.loads((tmp_path / str(snapshot.task_id) / "result.json").read_text()) == {"text": "hello"}
 
 
 def test_runtime_reuses_identical_task_id_and_rejects_conflicting_input(tmp_path: Path) -> None:
     async def scenario() -> None:
-        runtime = ComputeWorkerRuntime(registry(), ComputeExecutionPool(), output_root=tmp_path)
+        runtime = ComputeWorkerRuntime(registry(), ComputeExecutionPool())
         await runtime.start()
         task_id = uuid4()
         try:
@@ -145,7 +143,7 @@ def test_runtime_releases_operation_after_success(tmp_path: Path) -> None:
     )
 
     async def scenario() -> tuple[ComputeTaskSnapshot, bool]:
-        runtime = ComputeWorkerRuntime(value, ComputeExecutionPool(), output_root=tmp_path)
+        runtime = ComputeWorkerRuntime(value, ComputeExecutionPool())
         await runtime.start()
         task_request = request()
         try:
@@ -184,7 +182,7 @@ def test_runtime_releases_operation_after_failure(tmp_path: Path) -> None:
     )
 
     async def scenario() -> tuple[ComputeTaskSnapshot, bool]:
-        runtime = ComputeWorkerRuntime(value, ComputeExecutionPool(), output_root=tmp_path)
+        runtime = ComputeWorkerRuntime(value, ComputeExecutionPool())
         await runtime.start()
         task_request = request()
         try:
@@ -228,7 +226,7 @@ def test_runtime_cancels_active_execution_scope_and_releases_operation(tmp_path:
     )
 
     async def scenario() -> tuple[list[ComputeEvent], ComputeTaskSnapshot]:
-        runtime = ComputeWorkerRuntime(value, ComputeExecutionPool(), output_root=tmp_path)
+        runtime = ComputeWorkerRuntime(value, ComputeExecutionPool())
         await runtime.start()
         scope = ExecutionScope(kind="generation", id=uuid4())
         task_request = request().model_copy(update={"execution_scope": scope})
@@ -269,7 +267,7 @@ def test_runtime_fences_task_submitted_after_scope_cancellation(tmp_path: Path) 
     )
 
     async def scenario() -> tuple[list[ComputeEvent], ComputeTaskSnapshot]:
-        runtime = ComputeWorkerRuntime(value, ComputeExecutionPool(), output_root=tmp_path)
+        runtime = ComputeWorkerRuntime(value, ComputeExecutionPool())
         await runtime.start()
         scope = ExecutionScope(kind="processing", id=uuid4())
         runtime.cancel_scope(scope)
@@ -296,7 +294,7 @@ def test_batch_llm_operation_registers_shared_model_cleanup() -> None:
 
 def test_streaming_task_starts_only_after_the_first_subscriber_attaches(tmp_path: Path) -> None:
     async def scenario() -> tuple[ComputeTaskStatus, list[ComputeEvent]]:
-        runtime = ComputeWorkerRuntime(registry(), ComputeExecutionPool(), output_root=tmp_path)
+        runtime = ComputeWorkerRuntime(registry(), ComputeExecutionPool())
         await runtime.start()
         task_request = request(wait_for_subscriber=True)
         try:
@@ -318,7 +316,7 @@ def test_streaming_task_starts_only_after_the_first_subscriber_attaches(tmp_path
 def test_worker_http_routes_expose_health_and_metrics_only(tmp_path: Path) -> None:
     async def scenario() -> WorkerMetricsResponse:
         app = FastAPI()
-        runtime = ComputeWorkerRuntime(registry(), ComputeExecutionPool(), output_root=tmp_path)
+        runtime = ComputeWorkerRuntime(registry(), ComputeExecutionPool())
         app.state.compute_worker_runtime = runtime
         app.include_router(router, prefix="/internal/v1/compute")
         await runtime.start()

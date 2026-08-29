@@ -384,9 +384,10 @@ Redis 丢失时不重建逐 Stage运行态；录音详情从 PostgreSQL `recordi
 
 - Consumer Group 按 `io`、`cpu`、`gpu-high`、`gpu-normal` lane 消费；
 - Handler 继续使用类型化 Operation Contract；
-- progress 和 delta 进入 Redis Streams；
-- `started/completed/failed/cancelled` 等可靠生命周期进入 Kafka；
-- 小型结果进入 `compute.results`，大型产物先写对象存储再发送 URI；
+- 流式任务的 progress、delta 和终态进入 Redis Streams；
+- 每个请求携带 `reply_to` 和 `requester_id`，发起方实例使用独立 Consumer Group 接收 `compute.results` reply；
+- Kafka reply 只保存 locator 或终态错误，不承载 progress 和业务结果；序列化结果不超过 256 KiB 时写 Redis，超过阈值时写 FileStore；
+- 非流式 client 从 Redis task state 读取 progress，完成后按唯一一次 terminal reply 的 locator 读取并清理结果；流式 client 从唯一一次初始 reply 指定的 Redis Stream 消费事件；
 - `task_id` 是幂等边界，成功处理后提交 Offset；
 - HTTP 只保留 health、readiness、metrics、Operation 列表和管理接口。
 
@@ -605,7 +606,7 @@ attempt
 - 已完成：Docker Compose、Kafka/Redis L1 适配器、统一 envelope/topic、Kafka topic 初始化；
 - 已完成：Generation delta/progress/SSE 迁入 Redis，删除 `GenerationStreamHub` 和 `generation_events`；
 - 已完成：RAG API 改发 `generation.commands`，新增独立 `generation_worker`，删除进程内 `RagWorkflowRunner`；
-- 已完成：Compute Worker 消费资源 lane topic，Redis 保存 live state/delta，Kafka 保存 result；Production API 与 Generation Worker 使用 Kafka/Redis Compute Client；
+- 已完成：Compute Worker 消费资源 lane topic；Redis 保存 live state/stream 和不超过 256 KiB 的同步结果，大结果写 FileStore，Kafka Request/Reply 只传结果 locator；Production API 与各 Worker 使用独立 reply Consumer Group；
 - 已完成：RAG/模型统计改发 Kafka，新增 `observability_worker` 投影 PostgreSQL；
 - 已完成：新增共享 `integration_outbox`、独立 relay、失败退避/耗尽和保留清理；Worker 不接入通用 inbox，继续依赖稳定任务 ID、终态检查和业务幂等；
 - 已完成：Generation 提交以 Redis 活跃快照 + Kafka command 为起点，终态由 Generation Worker 幂等写入精简后的 `generation_runs`，不再创建数据库 queued 行；

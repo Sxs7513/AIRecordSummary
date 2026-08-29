@@ -19,8 +19,12 @@ class ComputeStreamDisconnectedError(ComputeTransportError):
     """An internal SSE stream disconnected after transmission had started."""
 
 
-class ComputeStateTimeoutError(ComputeTransportError):
-    """Kafka accepted a task but its initial Redis state did not appear in time."""
+class ComputeReplyTimeoutError(ComputeTransportError):
+    """An expected Kafka reply did not arrive within the configured timeout."""
+
+
+# Backward-compatible import for callers that handled the old Redis polling error.
+ComputeStateTimeoutError = ComputeReplyTimeoutError
 
 
 class ComputeTaskNotFoundError(ComputeError):

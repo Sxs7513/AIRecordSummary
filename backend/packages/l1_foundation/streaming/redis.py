@@ -82,6 +82,11 @@ class RedisStreamStore:
         pipeline.expire(stream_key, self._terminal_ttl_seconds)
         await pipeline.execute()
 
+    async def delete(self, *keys: str) -> int:
+        if not keys:
+            return 0
+        return cast(int, await self._client.delete(*keys))
+
     async def request_cancel(self, task_id: str) -> None:
         await self._client.set(f"task:{task_id}:cancel", "1", ex=self._terminal_ttl_seconds)
 

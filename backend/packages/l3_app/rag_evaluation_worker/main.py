@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 
 from l1_foundation.infrastructure.db.session import create_database_engine
+from l1_foundation.infrastructure.storage.local import LocalStorage
 from l1_foundation.messaging import SyncKafkaEventProducer
 from l1_foundation.settings import get_settings
 from l1_foundation.streaming import SyncRedisStreamStore
@@ -28,6 +29,8 @@ def run() -> None:
     _configure_loggers()
     settings = get_settings()
     engine = create_database_engine(settings)
+    storage = LocalStorage(settings.resolved_local_storage_root)
+    storage.initialize()
     redis = SyncRedisStreamStore.from_url(
         settings.redis_url,
         maxlen=settings.redis_stream_maxlen,
@@ -42,8 +45,10 @@ def run() -> None:
     compute = SyncKafkaWorkerClient(
         producer,
         redis,
-        poll_interval_seconds=settings.compute_worker_poll_interval_seconds,
+        storage,
+        reply_wait_timeout_seconds=settings.compute_reply_wait_timeout_seconds,
     )
+    compute.ready()
     worker = RagEvaluationWorker(engine, settings, compute)
     try:
         worker.run_forever()

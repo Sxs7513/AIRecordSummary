@@ -80,6 +80,44 @@ class ComputeTaskError(BaseModel):
     details: JsonObject = Field(default_factory=dict)
 
 
+class ComputeReplyAddress(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    topic: str = Field(min_length=1, max_length=160)
+    requester_id: str = Field(min_length=1, max_length=160)
+
+
+class ComputeResultLocator(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    storage: Literal["redis", "file"]
+    key: str = Field(min_length=1, max_length=500)
+    size_bytes: int = Field(ge=0)
+
+
+class ComputeTaskReply(BaseModel):
+    """One-time Kafka reply carrying a result or stream locator."""
+
+    model_config = ConfigDict(frozen=True)
+
+    task_id: UUID
+    requester_id: str = Field(min_length=1, max_length=160)
+    status: ComputeTaskStatus
+    result: ComputeResultLocator | None = None
+    stream_key: str | None = Field(default=None, min_length=1, max_length=500)
+    error: ComputeTaskError | None = None
+
+    @model_validator(mode="after")
+    def validate_locator(self) -> ComputeTaskReply:
+        if self.result is not None and self.stream_key is not None:
+            raise ValueError("Compute reply cannot contain both result and stream locators")
+        if self.result is not None and self.status != ComputeTaskStatus.SUCCEEDED:
+            raise ValueError("Compute result locator requires succeeded status")
+        if self.error is not None and self.status != ComputeTaskStatus.FAILED:
+            raise ValueError("Compute reply error requires failed status")
+        return self
+
+
 class ComputeTaskRequest(BaseModel):
     model_config = ConfigDict(frozen=True)
 
@@ -90,6 +128,7 @@ class ComputeTaskRequest(BaseModel):
     execution_scope: ExecutionScope | None = None
     input: JsonObject = Field(default_factory=dict)
     wait_for_subscriber: bool = False
+    reply_to: ComputeReplyAddress | None = None
 
 
 @dataclass(frozen=True, slots=True)

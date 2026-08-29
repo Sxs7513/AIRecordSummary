@@ -44,8 +44,10 @@ async def run() -> None:
     )
     await producer.start()
     sync_producer.start()
-    async_compute = KafkaWorkerClient(producer, async_redis, poll_interval_seconds=settings.compute_worker_poll_interval_seconds)
-    sync_compute = SyncKafkaWorkerClient(sync_producer, redis, poll_interval_seconds=settings.compute_worker_poll_interval_seconds)
+    async_compute = KafkaWorkerClient(producer, async_redis, storage, reply_wait_timeout_seconds=settings.compute_reply_wait_timeout_seconds)
+    sync_compute = SyncKafkaWorkerClient(sync_producer, redis, storage, reply_wait_timeout_seconds=settings.compute_reply_wait_timeout_seconds)
+    await async_compute.ready()
+    sync_compute.ready()
     summary_stage = build_recording_summary_stage(settings, artifact_store, sync_compute)
     registry = build_recording_stage_registry(
         settings,
@@ -100,6 +102,8 @@ async def run() -> None:
         await asyncio.gather(command_task, cancel_task, return_exceptions=True)
         await consumer.stop()
         await cancel_consumer.stop()
+        await async_compute.close()
+        sync_compute.close()
         await producer.stop()
         sync_producer.stop()
         await async_redis.close()

@@ -8,6 +8,7 @@ from uuid import UUID
 from sqlalchemy import Engine, text
 
 from l1_foundation.infrastructure.db.session import create_database_engine
+from l1_foundation.infrastructure.storage.local import LocalStorage
 from l1_foundation.messaging import SyncKafkaEventProducer
 from l1_foundation.settings import Settings, get_settings
 from l1_foundation.streaming import SyncRedisStreamStore
@@ -284,6 +285,7 @@ def run(args: argparse.Namespace, settings: Settings) -> int:
     engine = create_database_engine(settings)
     producer: SyncKafkaEventProducer | None = None
     redis: SyncRedisStreamStore | None = None
+    worker: SyncKafkaWorkerClient | None = None
     try:
         _ensure_schema(engine)
         documents, skipped = _load_documents(
@@ -312,7 +314,9 @@ def run(args: argparse.Namespace, settings: Settings) -> int:
         )
         active_producer.start()
         producer = active_producer
-        worker = SyncKafkaWorkerClient(active_producer, redis, poll_interval_seconds=settings.compute_worker_poll_interval_seconds)
+        storage = LocalStorage(settings.resolved_local_storage_root)
+        storage.initialize()
+        worker = SyncKafkaWorkerClient(active_producer, redis, storage, reply_wait_timeout_seconds=settings.compute_reply_wait_timeout_seconds)
         worker.ready()
         completed = 0
         batches = _batches(documents, args.batch_size)
@@ -326,6 +330,8 @@ def run(args: argparse.Namespace, settings: Settings) -> int:
             print(f"recording profile embeddings: batch={batch_index}/{len(batches)} completed={completed}/{len(documents)}")
         return 0
     finally:
+        if worker is not None:
+            worker.close()
         if producer is not None:
             producer.stop()
         if redis is not None:
