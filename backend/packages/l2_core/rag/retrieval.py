@@ -415,7 +415,8 @@ class RagRetriever:
         }
         clauses = [
             "recordings.status = 'completed'",
-            "(position(:query in chunks.normalized_text) > 0 or word_similarity(:query, chunks.normalized_text) > 0)",
+            "(position(:query in coalesce(nullif(chunks.normalized_original_text, ''), chunks.normalized_text)) > 0 "
+            "or word_similarity(:query, coalesce(nullif(chunks.normalized_original_text, ''), chunks.normalized_text)) > 0)",
         ]
         self._append_chunk_filters(clauses, values, filters)
         with self._engine.connect() as connection:
@@ -432,16 +433,16 @@ class RagRetriever:
                                    chunks.metadata,
                                    recordings.title, recordings.file_name,
                                    recordings.location, recordings.duration_seconds, recordings.created_at,
-                                   (position(:query in chunks.normalized_text) > 0) as exact_match,
+                                   (position(:query in coalesce(nullif(chunks.normalized_original_text, ''), chunks.normalized_text)) > 0) as exact_match,
                                    case
-                                     when position(:query in chunks.normalized_text) > 0 then 1.0
-                                     else word_similarity(:query, chunks.normalized_text)
+                                     when position(:query in coalesce(nullif(chunks.normalized_original_text, ''), chunks.normalized_text)) > 0 then 1.0
+                                     else word_similarity(:query, coalesce(nullif(chunks.normalized_original_text, ''), chunks.normalized_text))
                                    end as score
                             from recording_search_chunks chunks
                             join recordings on recordings.id = chunks.recording_id
                             where {" and ".join(clauses)}
-                            order by (position(:query in chunks.normalized_text) > 0) desc,
-                                     :query <<-> chunks.normalized_text
+                            order by (position(:query in coalesce(nullif(chunks.normalized_original_text, ''), chunks.normalized_text)) > 0) desc,
+                                     :query <<-> coalesce(nullif(chunks.normalized_original_text, ''), chunks.normalized_text)
                             limit :limit
                             """
                         ),

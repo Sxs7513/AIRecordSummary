@@ -52,6 +52,8 @@ def test_correction_prompt_allows_moderate_contextual_repairs_without_rewriting(
     assert "可以修复上下文能够明确支持的局部漏字、错词和语序问题" in prompt
     assert "不得总结、扩写、压缩或大范围重写" in prompt
     assert "无法确定是否需要修改时，保留原文" in prompt
+    assert "不得为了简写而删除标点" in prompt
+    assert "不使用公式排版或公式包裹" in prompt
 
 
 def make_corrector(tmp_path: Path, *, pycorrector_enabled: bool = False, llm_enabled: bool = False) -> LocalTextCorrector:

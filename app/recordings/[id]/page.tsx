@@ -108,7 +108,9 @@ export default async function RecordingDetailPage({
             {pipelineRun ? (
               <p className="subtle">
                 本次运行：<StatusBadge status={pipelineRun.status} />
-                {pipelineRun.status === "failed" ? <RetryRecordingButton recordingId={detail.recording.id} /> : null}
+                {(pipelineRun.status === "failed" || pipelineRun.status === "partial_failed") && detail.recording.status !== "processing" ? (
+                  <RetryRecordingButton recordingId={detail.recording.id} />
+                ) : null}
               </p>
             ) : (
               <p className="subtle">尚未创建流水线运行</p>
@@ -184,7 +186,7 @@ export default async function RecordingDetailPage({
       <details className="panel collapsible-panel" style={{ marginTop: 16 }} open>
         <summary>文字记录</summary>
         <div className="collapsible-body">
-          <UtteranceList segments={detail.utteranceSegments} tokens={detail.transcriptionTokens} speakerProfiles={detail.speakerProfiles} highlightRange={highlightRange} highlightText={highlightText} />
+          <UtteranceList segments={detail.utteranceSegments} transcriptionSegments={detail.transcriptionSegments} tokens={detail.transcriptionTokens} speakerProfiles={detail.speakerProfiles} highlightRange={highlightRange} highlightText={highlightText} />
         </div>
       </details>
 

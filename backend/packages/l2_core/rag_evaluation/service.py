@@ -357,12 +357,15 @@ class RagEvaluationService:
             # guarantees that an exact keyword remains searchable, while the
             # trigram predicate still recalls fuzzy matches.
             clauses.append(
-                "(position(:query in chunks.normalized_text) > 0 "
-                "or word_similarity(:query, chunks.normalized_text) > 0)"
+                "(position(:query in coalesce(nullif(chunks.normalized_original_text, ''), chunks.normalized_text)) > 0 "
+                "or word_similarity(:query, coalesce(nullif(chunks.normalized_original_text, ''), chunks.normalized_text)) > 0)"
             )
             values["query"] = normalized
-            score = "word_similarity(:query, chunks.normalized_text)"
-            order = "(position(:query in chunks.normalized_text) > 0) desc, :query <<-> chunks.normalized_text"
+            score = "word_similarity(:query, coalesce(nullif(chunks.normalized_original_text, ''), chunks.normalized_text))"
+            order = (
+                "(position(:query in coalesce(nullif(chunks.normalized_original_text, ''), chunks.normalized_text)) > 0) desc, "
+                ":query <<-> coalesce(nullif(chunks.normalized_original_text, ''), chunks.normalized_text)"
+            )
         else:
             score = "0.0"
             order = "recordings.created_at desc, chunks.chunk_index"

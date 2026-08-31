@@ -77,7 +77,7 @@ class RecordingService:
         recording_created = False
         try:
             with self._engine.begin() as connection:
-                recording, recording_created = self._insert_recording(
+                recording, recording_created, uploaded_file_retained = self._insert_recording(
                     connection=connection,
                     recording_id=recording_id,
                     workspace_id=user.current_workspace_id,
@@ -106,7 +106,8 @@ class RecordingService:
                         workspace_id=user.current_workspace_id,
                     )
             if not recording_created:
-                self._storage.delete_file(storage_path)
+                if not uploaded_file_retained:
+                    self._storage.delete_file(storage_path)
                 return recording, PipelineRunId(processing_id)
             run_id = PipelineRunId(processing_id)
             self._remember_processing(recording_id, run_id)
@@ -120,14 +121,19 @@ class RecordingService:
     def _remember_processing(self, recording_id: UUID, processing_id: UUID) -> None:
         if self._processing_state_store is None:
             return
+        state_key = f"processing:{processing_id}:state"
+        existing = self._processing_state_store.get_state(state_key)
+        if existing is not None and str(existing.get("subject_id")) != str(recording_id):
+            # The deterministic processing ID can be reused after an old recording is deleted.
+            # Do not let its terminal Redis state mask the new recording.
+            self._processing_state_store.delete(
+                state_key,
+                f"processing:{processing_id}:events",
+                f"task:{processing_id}:cancel",
+            )
         self._processing_state_store.set_state_if_absent(
-            f"processing:{processing_id}:state",
-            queued_processing_state(
-                processing_id,
-                recording_id,
-                self._processing_definition.name,
-                self._processing_definition.version,
-            ),
+            state_key,
+            queued_processing_state(processing_id, recording_id, self._processing_definition.name, self._processing_definition.version),
         )
         self._processing_state_store.set_state(
             f"recording:{recording_id}:processing",
@@ -358,7 +364,7 @@ class RecordingService:
                     "required": node.required,
                     "status": stage.get("status", "pending"),
                     "attempt_count": stage.get("attempt", 0),
-                    "max_attempts": node.retry_policy.max_attempts,
+                    "max_attempts": node.retry_policy.max_attempts or 3,
                     "progress_percent": stage.get("progress_percent"),
                     "progress_message": stage.get("progress_message"),
                     "progress_updated_at": stage.get("progress_updated_at"),
@@ -375,11 +381,32 @@ class RecordingService:
 
     async def retry_failed_recording(self, user: CurrentUser, recording_id: UUID) -> PipelineRunId:
         self._access.require_edit(recording_id, user)
-        processing_id = uuid4()
+        if self._processing_state_store is None:
+            raise RecordingNotRetryableError("Processing state is unavailable")
+        mapping = self._processing_state_store.get_state(f"recording:{recording_id}:processing")
+        if mapping is None or mapping.get("processing_id") is None:
+            raise RecordingNotRetryableError(f"Recording {recording_id} has no processing run")
+        processing_id = UUID(str(mapping["processing_id"]))
+        state = self._processing_state_store.get_state(f"processing:{processing_id}:state")
+        if state is None:
+            raise RecordingNotRetryableError(f"Processing state for recording {recording_id} has expired")
+        processing_status = str(state.get("status"))
+        if processing_status not in {"failed", "partial_failed"}:
+            raise RecordingNotRetryableError(
+                f"Recording {recording_id} processing has status {processing_status!r}, not 'failed' or 'partial_failed'"
+            )
+        if (state.get("pipeline_name"), state.get("pipeline_version")) != (
+            self._processing_definition.name,
+            self._processing_definition.version,
+        ):
+            raise RecordingNotRetryableError("Processing definition has changed; upload the recording again to run the new pipeline")
         with self._engine.begin() as connection:
             row = (
                 connection.execute(
-                    text("select status, storage_path, file_name, mime_type from recordings where id = :recording_id for update"),
+                    text(
+                        "select status, storage_path, file_name, mime_type, content_md5 "
+                        "from recordings where id = :recording_id for update"
+                    ),
                     {"recording_id": recording_id},
                 )
                 .mappings()
@@ -388,15 +415,15 @@ class RecordingService:
             if row is None:
                 raise RecordingNotFoundError(str(recording_id))
             status = cast(str, row["status"])
-            if status != "failed":
-                raise RecordingNotRetryableError(f"Recording {recording_id} has status {status!r}, not 'failed'")
+            if status not in {"failed", "completed"}:
+                raise RecordingNotRetryableError(f"Recording {recording_id} has status {status!r}, not retryable")
             if self._processing_publisher is None:
                 raise RuntimeError("Processing outbox publisher is unavailable")
             connection.execute(
                 text("update recordings set status = 'processing', error_message = null, updated_at = now() where id = :recording_id"),
                 {"recording_id": recording_id},
             )
-            self._processing_publisher.enqueue_recording(
+            self._processing_publisher.enqueue_recording_retry(
                 connection,
                 recording_id,
                 self._processing_definition.name,
@@ -575,7 +602,7 @@ class RecordingService:
         processing_id: UUID,
         pipeline_name: str,
         pipeline_version: str,
-    ) -> tuple[DatabaseRow, bool]:
+    ) -> tuple[DatabaseRow, bool, bool]:
         inserted = (
             connection.execute(
                 text(
@@ -613,7 +640,7 @@ class RecordingService:
             .one_or_none()
         )
         if inserted is not None:
-            return dict(inserted), True
+            return dict(inserted), True, True
         existing = (
             connection.execute(
                 text("select * from recordings where processing_id = :processing_id"),
@@ -622,7 +649,56 @@ class RecordingService:
             .mappings()
             .one()
         )
-        return dict(existing), False
+        existing_recording = dict(existing)
+        if self._source_audio_exists(str(existing_recording["storage_path"])):
+            return existing_recording, False, False
+
+        repaired = (
+            connection.execute(
+                text(
+                    """
+                    update recordings
+                    set storage_path = :replacement_storage_path,
+                        updated_at = now()
+                    where id = :recording_id
+                      and storage_path = :missing_storage_path
+                    returning *
+                    """
+                ),
+                {
+                    "recording_id": existing_recording["id"],
+                    "missing_storage_path": existing_recording["storage_path"],
+                    "replacement_storage_path": storage_path,
+                },
+            )
+            .mappings()
+            .one_or_none()
+        )
+        if repaired is not None:
+            repaired_recording = dict(repaired)
+            logger.info(
+                "Restored missing source audio from duplicate upload recording_id=%s old_storage_path=%s new_storage_path=%s",
+                repaired_recording["id"],
+                existing_recording["storage_path"],
+                storage_path,
+            )
+            return repaired_recording, False, True
+
+        # Another simultaneous duplicate upload repaired the source first.  Keep that
+        # canonical file and clean up this upload in the caller.
+        current = (
+            connection.execute(text("select * from recordings where processing_id = :processing_id"), {"processing_id": processing_id})
+            .mappings()
+            .one()
+        )
+        return dict(current), False, False
+
+    def _source_audio_exists(self, storage_path: str) -> bool:
+        try:
+            self._storage.get_file_by_key(storage_path)
+        except FileNotFoundError:
+            return False
+        return True
 
     @staticmethod
     def _source_audio_artifact(recording: DatabaseRow) -> ArtifactRef:
@@ -630,7 +706,12 @@ class RecordingService:
             artifact_type="audio.source",
             artifact_version="1",
             uri=str(recording["storage_path"]),
-            metadata={"file_name": str(recording["file_name"]), "mime_type": str(recording["mime_type"])},
+            checksum=f"md5:{recording['content_md5']}",
+            metadata={
+                "file_name": str(recording["file_name"]),
+                "mime_type": str(recording["mime_type"]),
+                "checksum_algorithm": "md5",
+            },
         )
 
     @staticmethod

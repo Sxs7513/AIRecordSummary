@@ -34,6 +34,8 @@ class PreprocessAsrAudioStage:
             self.version,
             "audio.asr_preprocessed",
             NormalizedAudioOutput,
+            input_fingerprint=context.input_fingerprint,
+            allow_legacy_restore=context.allow_legacy_restore,
         )
         if restored is None:
             return None

@@ -150,6 +150,7 @@ class SearchChunkBuilder:
         return SearchChunk(
             chunk_index=chunk_index,
             text=SearchChunkBuilder._render_text(pieces),
+            original_text=SearchChunkBuilder._render_original_text(pieces),
             start_ms=ordered_utterances[0].start_ms,
             end_ms=ordered_utterances[-1].end_ms,
             speaker_labels=list(dict.fromkeys(item.speaker_label for item in ordered_utterances)),
@@ -164,3 +165,16 @@ class SearchChunkBuilder:
             topic_section_index=topic_section_index,
             build_method=build_method,
         )
+
+    @staticmethod
+    def _render_original_text(pieces: Sequence[_ChunkPiece]) -> str:
+        texts: list[str] = []
+        seen_utterances: set[int] = set()
+        for piece in pieces:
+            utterance = piece.utterance
+            if utterance.utterance_index in seen_utterances:
+                continue
+            seen_utterances.add(utterance.utterance_index)
+            if utterance.original_text and utterance.original_text.strip():
+                texts.append(utterance.original_text.strip())
+        return "\n".join(texts)

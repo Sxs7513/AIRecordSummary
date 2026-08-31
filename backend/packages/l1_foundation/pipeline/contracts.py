@@ -58,6 +58,8 @@ class StageContext:
     pipeline_run_id: PipelineRunId
     stage_run_id: StageRunId
     attempt_count: int
+    input_fingerprint: str = ""
+    allow_legacy_restore: bool = False
     progress_reporter: StageProgressReporter | None = None
 
     def report_progress(self, percent: int, message: str) -> None:

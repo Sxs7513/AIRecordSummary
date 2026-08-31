@@ -130,7 +130,14 @@ class GenerateSummaryStage:
 
     async def try_restore(self, context: StageContext, _input_payload: GenerateSummaryInput) -> StageResult[RecordingSummaryOutput] | None:
         return self._artifact_store.try_restore_json(
-            context.pipeline_run_id, context.stage_run_id, self.name, self.version, "summary.recording", RecordingSummaryOutput
+            context.pipeline_run_id,
+            context.stage_run_id,
+            self.name,
+            self.version,
+            "summary.recording",
+            RecordingSummaryOutput,
+            input_fingerprint=context.input_fingerprint,
+            allow_legacy_restore=context.allow_legacy_restore,
         )
 
     async def run(self, context: StageContext, input_payload: GenerateSummaryInput) -> StageResult[RecordingSummaryOutput]:

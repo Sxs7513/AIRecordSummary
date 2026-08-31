@@ -22,22 +22,21 @@ def create_database_if_missing(settings: Settings) -> None:
             cursor.execute(sql.SQL("create database {}").format(sql.Identifier(settings.db_name)))
 
 
-def rebuild_schema(settings: Settings) -> None:
-    """Discard the development schema and rebuild the repository's final schema."""
+def apply_schema(settings: Settings) -> None:
+    """Apply the repository's idempotent schema without deleting existing data."""
     database_url = settings.sqlalchemy_database_url.replace("postgresql+psycopg://", "postgresql://", 1)
     schema = BASE_SCHEMA_PATH.read_text(encoding="utf-8")
     with psycopg.connect(database_url) as connection:
         connection.execute("select pg_advisory_xact_lock(hashtext('ai_record_summary_schema_init'))")
-        connection.execute("drop schema if exists public cascade")
-        connection.execute("create schema public")
+        connection.execute("create schema if not exists public")
         connection.execute("set local search_path to public")
         connection.execute(schema)  # pyright: ignore[reportCallIssue, reportArgumentType]  # Static repository-owned SQL.
 
 
 def initialize_database(settings: Settings) -> None:
-    """Create the database when needed, then rebuild its application schema."""
+    """Create the database when needed, then apply its application schema."""
     create_database_if_missing(settings)
-    rebuild_schema(settings)
+    apply_schema(settings)
     engine = create_database_engine(settings)
     try:
         AuthService(engine, settings.session_ttl_days).bootstrap_local_admin(

@@ -181,7 +181,7 @@ class CorrectAsrWindowsStage:
     """Moderately correct each ASR window before it is forced-aligned."""
 
     name = "correct_asr_windows"
-    version = "4"
+    version = "7"
     retry_policy = RetryPolicy(initial_backoff_seconds=30)
     input_model = CorrectAsrWindowsInput
 
@@ -211,6 +211,8 @@ class CorrectAsrWindowsStage:
             self.version,
             "transcript.corrected_windows",
             CorrectedAsrWindowTranscriptOutput,
+            input_fingerprint=context.input_fingerprint,
+            allow_legacy_restore=context.allow_legacy_restore,
         )
 
     async def run(self, context: StageContext, input_payload: CorrectAsrWindowsInput) -> StageResult[CorrectedAsrWindowTranscriptOutput]:
@@ -221,6 +223,7 @@ class CorrectAsrWindowsStage:
                 raise ValueError("Window corrector did not preserve window count")
             windows: list[CorrectedAsrWindowTranscript] = []
             for item, corrected in zip(raw.windows, texts, strict=True):
+                corrected = self._normalize_latex_notation(corrected)
                 edit_ratio = self._edit_ratio(item.text, corrected)
                 final_text = corrected if edit_ratio <= self._max_edit_ratio else item.text
                 if final_text == item.text and corrected != item.text:
@@ -257,6 +260,33 @@ class CorrectAsrWindowsStage:
                 current.append(min(current[-1] + 1, previous[right_index] + 1, previous[right_index - 1] + (left != right)))
             previous = current
         return previous[-1] / max(1, len(original))
+
+    @staticmethod
+    def _normalize_latex_notation(value: str) -> str:
+        """Keep transcript text readable when a corrector emits inline LaTeX."""
+
+        replacements = {
+            r"\Delta": "Δ",
+            r"\delta": "δ",
+            r"\alpha": "α",
+            r"\beta": "β",
+            r"\gamma": "γ",
+            r"\lambda": "λ",
+            r"\mu": "μ",
+            r"\times": "×",
+        }
+
+        def replace_math(match: re.Match[str]) -> str:
+            content = match.group(1)
+            if "\\" not in content:
+                return match.group(0)
+            for source, target in replacements.items():
+                content = content.replace(source, target)
+            content = re.sub(r"_\{([^{}]+)\}", r"_\1", content)
+            content = re.sub(r"\^\{([^{}]+)\}", r"^\1", content)
+            return content.replace("{", "").replace("}", "")
+
+        return re.sub(r"\$([^$\n]+)\$", replace_math, value)
 
 
 __all__ = ["CorrectAsrWindowsStage", "LocalTextCorrector"]

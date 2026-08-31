@@ -9,7 +9,9 @@ def test_base_schema_declares_only_the_final_tables_and_indexes() -> None:
     schema = database_script.BASE_SCHEMA_PATH.read_text(encoding="utf-8").lower()
 
     assert database_script.REPOSITORY_ROOT.name == "AIRecordSummary"
+    assert "drop schema" not in schema
     assert "drop table" not in schema
+    assert "truncate" not in schema
     assert "delete from" not in schema
     assert "schema_migrations" not in schema
     assert "create table if not exists recording_speaker_mappings" in schema
@@ -26,7 +28,7 @@ def test_base_schema_declares_only_the_final_tables_and_indexes() -> None:
     assert "processing_pipeline_version text not null" in recordings
 
 
-def test_rebuild_schema_drops_old_runtime_tables_with_public_schema(monkeypatch: Any, tmp_path: Path) -> None:
+def test_apply_schema_preserves_existing_public_schema(monkeypatch: Any, tmp_path: Path) -> None:
     statements: list[str] = []
 
     class FakeConnection:
@@ -58,12 +60,12 @@ def test_rebuild_schema_drops_old_runtime_tables_with_public_schema(monkeypatch:
         }
     )
 
-    database_script.rebuild_schema(settings)
+    database_script.apply_schema(settings)
 
-    assert statements[:4] == [
+    assert statements[:3] == [
         "select pg_advisory_xact_lock(hashtext('ai_record_summary_schema_init'))",
-        "drop schema if exists public cascade",
-        "create schema public",
+        "create schema if not exists public",
         "set local search_path to public",
     ]
     assert "create table if not exists example" in statements[-1]
+    assert all("drop schema" not in statement.lower() for statement in statements)

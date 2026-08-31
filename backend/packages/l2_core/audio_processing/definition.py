@@ -19,7 +19,7 @@ def build_recording_processing(asr_provider: AsrProvider = "qwen_asr") -> Pipeli
     }[asr_provider]
     return PipelineDefinition(
         name="recording_processing",
-        version="25",
+        version="26",
         nodes=(
             PipelineNode(
                 "normalize_audio",
@@ -62,7 +62,7 @@ def build_recording_processing(asr_provider: AsrProvider = "qwen_asr") -> Pipeli
             PipelineNode(
                 "correct_asr_windows",
                 "correct_asr_windows",
-                "4",
+                "7",
                 GPU_RETRY,
                 depends_on=(asr_stage_name,),
                 input_artifacts=(ArtifactBinding("transcript", "transcript.asr_windows", asr_stage_name),),
@@ -71,7 +71,7 @@ def build_recording_processing(asr_provider: AsrProvider = "qwen_asr") -> Pipeli
             PipelineNode(
                 "align_transcript",
                 "align_transcript",
-                "2",
+                "9",
                 GPU_RETRY,
                 depends_on=("correct_asr_windows", "preprocess_asr_audio", "diarize_pyannote"),
                 input_artifacts=(
@@ -84,7 +84,7 @@ def build_recording_processing(asr_provider: AsrProvider = "qwen_asr") -> Pipeli
             PipelineNode(
                 "build_utterances",
                 "build_utterances",
-                "4",
+                "9",
                 CPU_RETRY,
                 depends_on=("align_transcript",),
                 input_artifacts=(ArtifactBinding("transcript", "transcript.aligned", "align_transcript"),),
@@ -93,7 +93,7 @@ def build_recording_processing(asr_provider: AsrProvider = "qwen_asr") -> Pipeli
             PipelineNode(
                 "build_search_chunks",
                 "build_search_chunks",
-                "4",
+                "10",
                 GPU_RETRY,
                 depends_on=("build_utterances",),
                 input_artifacts=(ArtifactBinding("utterances", "utterances.final", "build_utterances"),),
@@ -102,7 +102,7 @@ def build_recording_processing(asr_provider: AsrProvider = "qwen_asr") -> Pipeli
             PipelineNode(
                 "embedding_indexing",
                 "embedding_indexing",
-                "3",
+                "8",
                 GPU_RETRY,
                 depends_on=("build_search_chunks",),
                 required=False,

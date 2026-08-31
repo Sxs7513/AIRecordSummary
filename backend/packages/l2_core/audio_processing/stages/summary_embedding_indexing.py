@@ -81,6 +81,8 @@ class SummaryEmbeddingIndexingStage:
             self.version,
             "summary.embedding_index",
             SummaryEmbeddingIndexingOutput,
+            input_fingerprint=context.input_fingerprint,
+            allow_legacy_restore=context.allow_legacy_restore,
         )
 
     async def run(

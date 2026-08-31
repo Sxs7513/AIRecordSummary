@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from contextlib import AbstractContextManager
 from typing import Any, cast
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 from sqlalchemy import Engine
 
@@ -65,7 +65,7 @@ def test_search_chunks_prioritizes_exact_normalized_keyword_matches() -> None:
     assert service.search_chunks(user, query="  \uff21\uff30\uff29 \u7248\u672c  ") == []
 
     sql, values = connection.executions[0]
-    assert "position(:query in chunks.normalized_text) > 0" in sql
-    assert "or word_similarity(:query, chunks.normalized_text) > 0" in sql
-    assert "order by (position(:query in chunks.normalized_text) > 0) desc" in sql
+    assert "chunks.normalized_original_text" in sql
+    assert "or word_similarity(:query, coalesce" in sql
+    assert "order by (position(:query in coalesce" in sql
     assert values["query"] == "api \u7248\u672c"

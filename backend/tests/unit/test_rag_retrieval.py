@@ -298,7 +298,7 @@ def test_chunk_context_expansion_loads_all_candidates_in_one_batch_query() -> No
 
 
 def test_normalize_search_text_applies_nfkc_case_and_whitespace_rules() -> None:
-    assert normalize_search_text("  ＡＰＩ\t版本１２３ \n 发布  ") == "api 版本123 发布"
+    assert normalize_search_text("  ＡＰＩ：版本１２３，\n 发布！  ") == "api 版本123 发布"
 
 
 def test_recording_scope_is_resolved_with_one_recording_query() -> None:
@@ -364,12 +364,12 @@ def test_lexical_candidates_apply_resolved_scope_and_chunk_filters() -> None:
 
     assert result == []
     sql, values = connection.executions[0]
-    assert "position(:query in chunks.normalized_text) > 0" in sql
-    assert "word_similarity(:query, chunks.normalized_text)" in sql
+    assert "chunks.normalized_original_text" in sql
+    assert "word_similarity(:query, coalesce" in sql
     assert "as exact_match" in sql
     assert "then 1.0" in sql
-    assert "order by (position(:query in chunks.normalized_text) > 0) desc" in sql
-    assert ":query <<-> chunks.normalized_text" in sql
+    assert "order by (position(:query in coalesce" in sql
+    assert ":query <<-> coalesce" in sql
     assert "chunks.recording_id = any" in sql
     assert "chunk_speakers.speaker_profile_id" in sql
     assert values["query"] == "api 版本"

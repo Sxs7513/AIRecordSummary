@@ -78,6 +78,7 @@ def test_embedding_projection_replaces_chunks_idempotently() -> None:
             EmbeddedSearchChunk(
                 chunk_index=0,
                 text="  Speaker A:  测试内容  ",
+                original_text="嗯，原始  ASR。\n内容！",
                 start_ms=100,
                 end_ms=200,
                 speaker_labels=["Speaker A"],
@@ -100,7 +101,9 @@ def test_embedding_projection_replaces_chunks_idempotently() -> None:
     assert deletes == [{"recording_id": recording_id}, {"recording_id": recording_id}]
     assert len(inserts) == 2
     assert inserts[0]["embedding_model_id"] == embedding_model_id
-    assert inserts[0]["normalized_text"] == "主题:公司营收 标准术语:营收、收入 语义上下文:询问公司目前达到的营收规模 正文:speaker a: 测试内容"
+    assert inserts[0]["original_text"] == "嗯，原始  ASR。\n内容！"
+    assert inserts[0]["normalized_original_text"] == "嗯 原始 asr 内容"
+    assert inserts[0]["normalized_text"] == "主题 公司营收 标准术语 营收 收入 语义上下文 询问公司目前达到的营收规模 正文 speaker a 测试内容"
     metadata = json.loads(cast(str, inserts[0]["metadata"]))
     assert metadata["topic"] == "公司营收"
     assert metadata["terms"] == ["营收", "收入"]

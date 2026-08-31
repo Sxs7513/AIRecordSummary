@@ -76,7 +76,14 @@ class QwenAsrTranscribeStage:
 
     async def try_restore(self, context: StageContext, _input_payload: TranscribeQwenAsrInput) -> StageResult[AsrWindowTranscriptOutput] | None:
         return self._artifact_store.try_restore_json(
-            context.pipeline_run_id, context.stage_run_id, self.name, self.version, "transcript.asr_windows", AsrWindowTranscriptOutput
+            context.pipeline_run_id,
+            context.stage_run_id,
+            self.name,
+            self.version,
+            "transcript.asr_windows",
+            AsrWindowTranscriptOutput,
+            input_fingerprint=context.input_fingerprint,
+            allow_legacy_restore=context.allow_legacy_restore,
         )
 
     async def run(self, context: StageContext, input_payload: TranscribeQwenAsrInput) -> StageResult[AsrWindowTranscriptOutput]:

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from typing import Any, cast
 from uuid import UUID, uuid4
 
+from l1_foundation.infrastructure.storage.local import LocalStorage
 from l1_foundation.messaging import EventEnvelope, KafkaEventProducer, new_event
 from l1_foundation.pipeline.contracts import ArtifactRef, RetryPolicy, StageContext, StageResult
 from l1_foundation.pipeline.definitions.graph import ArtifactBinding, PipelineDefinition, PipelineNode
@@ -33,6 +35,14 @@ class _Redis:
 
     def request_cancel(self, task_id: str) -> None:
         self.cancelled.add(task_id)
+
+    def delete(self, *keys: str) -> int:
+        deleted = 0
+        for key in keys:
+            if key in self.states:
+                del self.states[key]
+                deleted += 1
+        return deleted
 
     def is_cancel_requested(self, task_id: str) -> bool:
         return task_id in self.cancelled
@@ -68,6 +78,7 @@ class _Stage:
 
     def __init__(self, *, block: bool = False, restored: StageResult[dict[str, object]] | None = None) -> None:
         self.calls = 0
+        self.attempt_counts: list[int] = []
         self.block = block
         self.restored = restored
         self.started = asyncio.Event()
@@ -76,8 +87,9 @@ class _Stage:
     async def try_restore(self, _context: StageContext, _input: object) -> StageResult[dict[str, object]] | None:
         return self.restored
 
-    async def run(self, _context: StageContext, _input: object) -> StageResult[dict[str, object]]:
+    async def run(self, context: StageContext, _input: object) -> StageResult[dict[str, object]]:
         self.calls += 1
+        self.attempt_counts.append(context.attempt_count)
         self.started.set()
         if self.block:
             try:
@@ -107,6 +119,24 @@ def _command(processing_id: UUID, subject_id: UUID) -> EventEnvelope:
     )
     return new_event(
         "processing.requested",
+        "test",
+        processing_id=processing_id,
+        correlation_id=processing_id,
+        payload=item.model_dump(mode="json"),
+    )
+
+
+def _retry_command(processing_id: UUID, subject_id: UUID) -> EventEnvelope:
+    item = ProcessingWorkItem(
+        processing_id=processing_id,
+        subject_type="recording",
+        subject_id=subject_id,
+        pipeline_name="test_pipeline",
+        pipeline_version="1",
+        initial_artifacts=[],
+    )
+    return new_event(
+        "processing.retry.requested",
         "test",
         processing_id=processing_id,
         correlation_id=processing_id,
@@ -153,13 +183,14 @@ def _handler(redis: _Redis, producer: _Producer, hooks: _Hooks, stage: _Stage) -
 
 def test_terminal_processing_redelivery_is_skipped() -> None:
     processing_id = uuid4()
+    subject_id = uuid4()
     redis = _Redis()
-    redis.states[processing_state_key(processing_id)] = {"status": "succeeded"}
+    redis.states[processing_state_key(processing_id)] = {"status": "succeeded", "subject_id": str(subject_id)}
     producer = _Producer()
     hooks = _Hooks()
     stage = _Stage()
 
-    asyncio.run(_handler(redis, producer, hooks, stage).handle(_command(processing_id, uuid4())))
+    asyncio.run(_handler(redis, producer, hooks, stage).handle(_command(processing_id, subject_id)))
 
     assert stage.calls == 0
     assert producer.events == []
@@ -178,6 +209,125 @@ def test_restored_stage_skips_execution_and_replays_projection() -> None:
     assert stage.calls == 0
     assert hooks.stage_outputs == [{"restored": True}]
     assert redis.states[processing_state_key(processing_id)]["stages"]["test_node"]["reused"] is True
+
+
+def test_retry_reuses_successful_stage_artifact_from_the_same_run(tmp_path: Path) -> None:
+    processing_id = uuid4()
+    subject_id = uuid4()
+    artifact = ArtifactRef(
+        artifact_type="test.output",
+        artifact_version="1",
+        producer_stage="test_node",
+        uri="artifacts/test-output.json",
+    )
+    storage = LocalStorage(tmp_path)
+    source = tmp_path / "source.json"
+    source.write_text("{}", encoding="utf-8")
+    storage.put_file(source, key=artifact.uri)
+    redis = _Redis()
+    redis.states[processing_state_key(processing_id)] = {
+        "processing_id": str(processing_id),
+        "subject_id": str(subject_id),
+        "pipeline_name": "test_pipeline",
+        "pipeline_version": "1",
+        "status": "partial_failed",
+        "stages": {
+            "test_node": {
+                "status": "succeeded",
+                "attempt": 1,
+                "artifacts": [artifact.model_dump(mode="json")],
+            }
+        },
+        "created_at": "2026-01-01T00:00:00+00:00",
+    }
+    stage = _Stage(restored=StageResult(output={}, artifacts=(artifact,)))
+    definition = PipelineDefinition(
+        name="test_pipeline",
+        version="1",
+        nodes=(PipelineNode("test_node", stage.name, stage.version, stage.retry_policy, output_artifacts=("test.output",)),),
+    )
+    handler = ProcessingCommandHandler(
+        definition,
+        cast(StageRegistry, _Registry(stage)),
+        ArtifactStore(storage),
+        cast(SyncRedisStreamStore, redis),
+        cast(KafkaEventProducer, _Producer()),
+        cast(RecordingProcessingHooks, _Hooks()),
+    )
+
+    asyncio.run(handler.handle(_retry_command(processing_id, subject_id)))
+
+    state = redis.states[processing_state_key(processing_id)]
+    assert stage.calls == 0
+    assert state["stages"]["test_node"]["reused"] is True
+    assert state["status"] == "succeeded"
+
+
+def test_retry_continues_attempt_number_after_a_terminal_failure(tmp_path: Path) -> None:
+    processing_id = uuid4()
+    subject_id = uuid4()
+    redis = _Redis()
+    redis.states[processing_state_key(processing_id)] = {
+        "processing_id": str(processing_id),
+        "subject_id": str(subject_id),
+        "pipeline_name": "test_pipeline",
+        "pipeline_version": "1",
+        "status": "failed",
+        "stages": {"test_node": {"status": "failed", "error": "previous failure"}},
+        "created_at": "2026-01-01T00:00:00+00:00",
+    }
+    stage = _Stage()
+    handler = ProcessingCommandHandler(
+        PipelineDefinition(
+            name="test_pipeline",
+            version="1",
+            nodes=(PipelineNode("test_node", stage.name, stage.version, RetryPolicy(max_attempts=3)),),
+        ),
+        cast(StageRegistry, _Registry(stage)),
+        ArtifactStore(LocalStorage(tmp_path)),
+        cast(SyncRedisStreamStore, redis),
+        cast(KafkaEventProducer, _Producer()),
+        cast(RecordingProcessingHooks, _Hooks()),
+    )
+
+    asyncio.run(handler.handle(_retry_command(processing_id, subject_id)))
+
+    assert stage.attempt_counts == [4]
+    assert redis.states[processing_state_key(processing_id)]["stages"]["test_node"]["attempt"] == 4
+
+
+def test_completed_retry_event_redelivery_is_skipped(tmp_path: Path) -> None:
+    processing_id = uuid4()
+    subject_id = uuid4()
+    command = _retry_command(processing_id, subject_id)
+    redis = _Redis()
+    redis.states[processing_state_key(processing_id)] = {
+        "processing_id": str(processing_id),
+        "subject_id": str(subject_id),
+        "pipeline_name": "test_pipeline",
+        "pipeline_version": "1",
+        "status": "succeeded",
+        "retry_event_id": str(command.event_id),
+        "stages": {},
+    }
+    stage = _Stage()
+
+    asyncio.run(
+        ProcessingCommandHandler(
+            PipelineDefinition(
+                name="test_pipeline",
+                version="1",
+                nodes=(PipelineNode("test_node", stage.name, stage.version, stage.retry_policy),),
+            ),
+            cast(StageRegistry, _Registry(stage)),
+            ArtifactStore(LocalStorage(tmp_path)),
+            cast(SyncRedisStreamStore, redis),
+            cast(KafkaEventProducer, _Producer()),
+            cast(RecordingProcessingHooks, _Hooks()),
+        ).handle(command)
+    )
+
+    assert stage.calls == 0
 
 
 def test_cancelled_processing_stops_before_the_first_stage() -> None:

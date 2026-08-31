@@ -237,11 +237,15 @@ create table if not exists transcriptions (
     language text,
     model_name text not null,
     full_text text not null default '',
+    original_full_text text,
     segment_count integer not null default 0 check (segment_count >= 0),
     created_at timestamptz not null default now(),
     updated_at timestamptz not null default now(),
     unique (recording_id)
 );
+
+alter table transcriptions
+    add column if not exists original_full_text text;
 
 comment on table transcriptions is
     '整条录音的转写结果主表，保存 Whisper 生成的完整文本和模型信息。';
@@ -255,6 +259,8 @@ comment on column transcriptions.model_name is
     '实际执行转写时使用的模型名称，例如 whisper-large-v3。';
 comment on column transcriptions.full_text is
     '整条录音合并后的完整转写文本，便于详情页直接展示和后续检索使用。';
+comment on column transcriptions.original_full_text is
+    'ASR 模型输出的整条原始文本，按窗口顺序保存，未经文本润色和时间对齐。';
 comment on column transcriptions.segment_count is
     '该录音被拆分出的转写片段数量，对应 transcription_segments 的条数。';
 comment on column transcriptions.created_at is
@@ -422,6 +428,7 @@ create table if not exists transcription_segments (
     start_ms integer not null check (start_ms >= 0),
     end_ms integer not null check (end_ms >= start_ms),
     text text not null,
+    original_text text,
     speaker_label text,
     speaker_cluster_id text,
     speaker_confidence numeric(5,4) check (
@@ -438,6 +445,9 @@ create table if not exists transcription_segments (
     unique (transcription_id, segment_index)
 );
 
+alter table transcription_segments
+    add column if not exists original_text text;
+
 comment on table transcription_segments is
     '转写片段表，保存 Whisper 输出的时间片段文本，并回写对应说话人和目标人物识别结果。';
 comment on column transcription_segments.id is
@@ -453,7 +463,9 @@ comment on column transcription_segments.start_ms is
 comment on column transcription_segments.end_ms is
     '转写片段结束时间，单位毫秒。';
 comment on column transcription_segments.text is
-    '该时间片段对应的转写文本内容。';
+    '该时间片段对应的润色后转写文本内容，用于对齐、默认展示和向量检索。';
+comment on column transcription_segments.original_text is
+    '该分段涉及的 ASR 源窗口原文，未经文本润色；原文不单独执行时间对齐。';
 comment on column transcription_segments.speaker_label is
     '对齐后得到的匿名说话人标签，例如 Speaker A。';
 comment on column transcription_segments.speaker_cluster_id is
@@ -648,7 +660,9 @@ create table if not exists recording_search_chunks (
     embedding_model_id uuid not null references embedding_models(id) on delete restrict,
     chunk_index integer not null check (chunk_index >= 0),
     text text not null,
+    original_text text not null default '',
     normalized_text text not null,
+    normalized_original_text text not null default '',
     start_ms integer not null check (start_ms >= 0),
     end_ms integer not null check (end_ms >= start_ms),
     speaker_labels text[] not null default '{}',
@@ -664,6 +678,10 @@ create table if not exists recording_search_chunks (
     unique (recording_id, embedding_model_id, chunk_index)
 );
 
+alter table recording_search_chunks
+    add column if not exists original_text text not null default '',
+    add column if not exists normalized_original_text text not null default '';
+
 create index if not exists recording_search_chunks_recording_id_idx
     on recording_search_chunks (recording_id);
 create index if not exists recording_search_chunks_time_idx
@@ -674,6 +692,10 @@ create index if not exists recording_search_chunks_text_trgm_idx
     on recording_search_chunks using gin (normalized_text gin_trgm_ops);
 create index if not exists recording_search_chunks_text_trgm_gist_idx
     on recording_search_chunks using gist (normalized_text gist_trgm_ops(siglen=64));
+create index if not exists recording_search_chunks_original_text_trgm_idx
+    on recording_search_chunks using gin (normalized_original_text gin_trgm_ops);
+create index if not exists recording_search_chunks_original_text_trgm_gist_idx
+    on recording_search_chunks using gist (normalized_original_text gist_trgm_ops(siglen=64));
 create index if not exists recording_search_chunks_embedding_hnsw_idx
     on recording_search_chunks using hnsw (embedding halfvec_cosine_ops);
 

@@ -101,6 +101,7 @@ class TranscriptSegment(BaseModel):
     start_ms: int = Field(ge=0)
     end_ms: int = Field(ge=0)
     text: str
+    original_text: str | None = None
     speaker_cluster_id: str
     speaker_label: str
 
@@ -122,6 +123,7 @@ class TranscriptOutput(BaseModel):
     model_name: str
     language: str | None
     segments: list[TranscriptSegment]
+    original_full_text: str | None = None
     alignment_tokens: list[AlignedTranscriptToken] | None = None
     alignment_model_name: str | None = None
 
@@ -135,6 +137,7 @@ class Utterance(BaseModel):
     start_ms: int = Field(ge=0)
     end_ms: int = Field(ge=0)
     text: str
+    original_text: str | None = None
     speaker_cluster_id: str
     speaker_label: str
     source_segment_indexes: list[int] = Field(default_factory=lambda: [])
@@ -152,6 +155,7 @@ class BuildSearchChunksInput(BaseModel):
 class SearchChunk(BaseModel):
     chunk_index: int = Field(ge=0)
     text: str
+    original_text: str = ""
     start_ms: int = Field(ge=0)
     end_ms: int = Field(ge=0)
     speaker_labels: list[str]
@@ -166,6 +170,14 @@ class SearchChunk(BaseModel):
 
     def retrieval_text(self) -> str:
         return build_retrieval_text(self.text, self.topic, self.terms, self.search_context)
+
+    def lexical_text(self) -> str:
+        """Raw ASR text used exclusively by keyword retrieval.
+
+        Unlike ``retrieval_text``, this deliberately has no fallback to the
+        polished text and carries no generated topic/context metadata.
+        """
+        return self.original_text
 
 
 class SearchChunksOutput(BaseModel):

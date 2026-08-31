@@ -35,6 +35,7 @@ class FactLookupStrategy:
         rerank_enabled: bool,
         query_term_expansion_enabled: bool,
         render_evidence: Callable[[list[Evidence]], str],
+        report_phase: Callable[[str, str], None],
     ) -> None:
         self._chunk_evidence_pipeline = chunk_evidence_pipeline
         self._render_evidence = render_evidence
@@ -42,6 +43,7 @@ class FactLookupStrategy:
         self._rerank_enabled = rerank_enabled
         self._adjudication_enabled = adjudication_enabled
         self._retry_without_history_scope = retry_without_history_scope
+        self._report_phase = report_phase
         builder = cast(Any, StateGraph(RagGraphState))
         if adjudication_enabled:
             builder.add_node(
@@ -205,6 +207,8 @@ class FactLookupStrategy:
             "done" if target == "finalize" else "adjudication_agent" if target == "adjudicate" else "grade",
             "retrieval_terminal" if target == "finalize" else "query_correction_risk" if target == "adjudicate" else "evidence_ready",
         )
+        if target == "adjudicate":
+            self._report_phase("correcting_asr", "正在尝试纠正 ASR 错误")
         return target
 
     def _after_grade(self, state: RagGraphState) -> Literal["retry", "finalize"]:

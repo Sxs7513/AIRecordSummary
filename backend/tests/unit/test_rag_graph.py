@@ -663,14 +663,19 @@ def test_langgraph_routes_retrieves_validates_and_streams_only_final_answer() ->
     model = FakeModel()
     graph = _graph(FakeRetriever(), model)
     deltas: list[str] = []
-    phases: list[str] = []
+    phases: list[tuple[str, str, int | None]] = []
 
     answer, sources, not_enough_evidence, message, _confirmation = asyncio.run(
-        graph.run("交付风险是什么", 10, [uuid4()], lambda name, _label, _progress: phases.append(name), deltas.append)
+        graph.run("交付风险是什么", 10, [uuid4()], lambda name, label, progress: phases.append((name, label, progress)), deltas.append)
     )
 
     assert answer == "交付风险是供应延期[1]。"
-    assert "routing" in phases and "generating" in phases
+    assert phases == [
+        ("routing", "正在理解问题", None),
+        ("searching", "正在搜索资料", None),
+        ("grading", "正在核验资料", None),
+        ("generating", "正在生成回答", None),
+    ]
     assert "".join(deltas) == answer
     assert not not_enough_evidence
     assert message is None

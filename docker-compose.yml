@@ -1,6 +1,7 @@
 services:
   kafka:
     image: apache/kafka:3.9.1
+    restart: unless-stopped
     hostname: kafka
     ports:
       - "${KAFKA_PORT:-9092}:9092"
@@ -27,6 +28,7 @@ services:
 
   redis:
     image: redis:7.4-alpine
+    restart: unless-stopped
     ports:
       - "${REDIS_PORT:-6379}:6379"
     command:

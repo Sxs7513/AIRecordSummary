@@ -1,7 +1,7 @@
 "use client";
 
 import { Fragment, useEffect, useMemo, useState } from "react";
-import type { SpeakerProfile, TranscriptionToken, UtteranceSegment } from "@/app/shared/models";
+import type { SpeakerProfile, TranscriptionSegment, TranscriptionToken, UtteranceSegment } from "@/app/shared/models";
 import { formatMs } from "@/app/shared/format";
 
 interface PlaybackPositionEventDetail {
@@ -90,10 +90,20 @@ function assignTokensToSegments(segments: UtteranceSegment[], tokens: Transcript
   return assigned;
 }
 
-export function UtteranceList({ segments, tokens = [], speakerProfiles, highlightRange, highlightText = null }: { segments: UtteranceSegment[]; tokens?: TranscriptionToken[]; speakerProfiles: SpeakerProfile[]; highlightRange: HighlightRange | null; highlightText?: string | null }) {
+export function UtteranceList({ segments, transcriptionSegments = [], tokens = [], speakerProfiles, highlightRange, highlightText = null }: { segments: UtteranceSegment[]; transcriptionSegments?: TranscriptionSegment[]; tokens?: TranscriptionToken[]; speakerProfiles: SpeakerProfile[]; highlightRange: HighlightRange | null; highlightText?: string | null }) {
   const [activeTokenId, setActiveTokenId] = useState<string | null>(null);
+  const [originalVisibleIds, setOriginalVisibleIds] = useState<Set<string>>(() => new Set());
   const sortedTokens = useMemo(() => [...tokens].sort((left, right) => left.startMs - right.startMs || left.endMs - right.endMs), [tokens]);
   const tokensBySegmentId = useMemo(() => assignTokensToSegments(segments, sortedTokens), [segments, sortedTokens]);
+  const originalByUtteranceId = useMemo(() => {
+    const transcriptionById = new Map(transcriptionSegments.map((segment) => [segment.id, segment]));
+    return new Map(segments.map((segment) => {
+      const texts = segment.sourceTranscriptionSegmentIds
+        .map((id) => transcriptionById.get(id)?.originalText?.trim())
+        .filter((text): text is string => Boolean(text));
+      return [segment.id, [...new Set(texts)].join("\n") || null];
+    }));
+  }, [segments, transcriptionSegments]);
   const expressionFound = useMemo(() => Boolean(highlightText) && segments.some((segment) => {
     const inRange = highlightRange === null || (segment.startMs <= highlightRange.endMs && segment.endMs >= highlightRange.startMs);
     return inRange && highlightOffsets(segment.text, highlightText).size > 0;
@@ -116,62 +126,79 @@ export function UtteranceList({ segments, tokens = [], speakerProfiles, highligh
   const profileById = new Map(speakerProfiles.map((profile) => [profile.id, profile]));
   if (segments.length === 0) return <div className="empty">连续发言尚未生成</div>;
   return (
-    <div className="segments">
-      {segments.map((segment) => {
-        const profile = segment.matchedSpeakerProfileId ? profileById.get(segment.matchedSpeakerProfileId) : null;
-        const highlighted = highlightRange !== null
-          && segment.startMs <= highlightRange.endMs
-          && segment.endMs >= highlightRange.startMs;
-        const expressionOffsets = highlighted ? highlightOffsets(segment.text, highlightText) : new Set<number>();
-        const showRangeHighlight = highlighted && (!highlightText || !expressionFound);
-        return (
-          <article
-            className={`segment utterance-segment ${segment.isTargetPerson ? "target" : ""} ${showRangeHighlight ? "highlight" : ""}`}
-            id={`utterance-${segment.id}`}
-            key={segment.id}
-          >
-            <div className="segment-head">
-              <div className="meta">
-                <span>
-                  {formatMs(segment.startMs)} - {formatMs(segment.endMs)}
-                </span>
-                <strong>{segment.speakerLabel || "Unknown Speaker"}</strong>
-              </div>
-              {segment.isTargetPerson ? (
-                <span className="badge matched">
-                  目标人物 {profile?.displayName || ""} {segment.targetPersonConfidence ? `${(segment.targetPersonConfidence * 100).toFixed(0)}%` : ""}
-                </span>
-              ) : null}
-            </div>
-            <div>{(() => {
-              const segmentTokens = tokensBySegmentId.get(segment.id) ?? [];
-              const reconstructedText = segmentTokens.map((token) => token.text).join("");
-              if (segmentTokens.length > 0 && reconstructedText === segment.text) {
-                let offset = 0;
-                return segmentTokens.map((token) => {
-                  const tokenOffset = offset;
-                  offset += Array.from(token.text).length;
-                  return (
+    <div className="transcript-views">
+      <div className="segments">
+          {segments.map((segment) => {
+            const profile = segment.matchedSpeakerProfileId ? profileById.get(segment.matchedSpeakerProfileId) : null;
+            const originalText = originalByUtteranceId.get(segment.id);
+            const showOriginal = originalVisibleIds.has(segment.id);
+            const highlighted = highlightRange !== null
+              && segment.startMs <= highlightRange.endMs
+              && segment.endMs >= highlightRange.startMs;
+            const expressionOffsets = highlighted ? highlightOffsets(segment.text, highlightText) : new Set<number>();
+            const showRangeHighlight = highlighted && (!highlightText || !expressionFound);
+            return (
+              <article
+                className={`segment utterance-segment ${segment.isTargetPerson ? "target" : ""} ${showRangeHighlight ? "highlight" : ""}`}
+                id={`utterance-${segment.id}`}
+                key={segment.id}
+              >
+                <div className="segment-head">
+                  <div className="meta">
+                    <span>
+                      {formatMs(segment.startMs)} - {formatMs(segment.endMs)}
+                    </span>
+                    <strong>{segment.speakerLabel || "Unknown Speaker"}</strong>
+                  </div>
+                  {segment.isTargetPerson ? (
+                    <span className="badge matched">
+                      目标人物 {profile?.displayName || ""} {segment.targetPersonConfidence ? `${(segment.targetPersonConfidence * 100).toFixed(0)}%` : ""}
+                    </span>
+                  ) : null}
+                  {originalText ? (
                     <button
-                      key={token.id}
+                      className="secondary"
+                      onClick={() => setOriginalVisibleIds((current) => {
+                        const next = new Set(current);
+                        if (next.has(segment.id)) next.delete(segment.id); else next.add(segment.id);
+                        return next;
+                      })}
                       type="button"
-                      className="token"
-                      onClick={() => {
-                        window.dispatchEvent(
-                          new CustomEvent("recording-play-segment", { detail: { startMs: token.startMs } })
-                        );
-                      }}
                     >
-                      {tokenContent(token.text, token.id === activeTokenId, expressionOffsets, tokenOffset)}
+                      {showOriginal ? "返回润色" : "查看原文"}
                     </button>
-                  );
-                });
-              }
-              return tokenContent(segment.text, false, expressionOffsets, 0);
-            })()}</div>
-          </article>
-        );
-      })}
+                  ) : null}
+                </div>
+                <div>{showOriginal ? originalText : (() => {
+                  const segmentTokens = tokensBySegmentId.get(segment.id) ?? [];
+                  const reconstructedText = segmentTokens.map((token) => token.text).join("");
+                  if (segmentTokens.length > 0 && reconstructedText === segment.text) {
+                    let offset = 0;
+                    return segmentTokens.map((token) => {
+                      const tokenOffset = offset;
+                      offset += Array.from(token.text).length;
+                      return (
+                        <button
+                          key={token.id}
+                          type="button"
+                          className="token"
+                          onClick={() => {
+                            window.dispatchEvent(
+                              new CustomEvent("recording-play-segment", { detail: { startMs: token.startMs } })
+                            );
+                          }}
+                        >
+                          {tokenContent(token.text, token.id === activeTokenId, expressionOffsets, tokenOffset)}
+                        </button>
+                      );
+                    });
+                  }
+                  return tokenContent(segment.text, false, expressionOffsets, 0);
+                })()}</div>
+              </article>
+            );
+          })}
+      </div>
     </div>
   );
 }

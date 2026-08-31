@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import re
 from collections.abc import Sequence
 
@@ -18,25 +19,48 @@ from l2_core.audio_processing.stages.build_search_chunks.contracts import TopicS
 from l2_core.audio_processing.stages.build_search_chunks.prompt import build_topic_boundary_prompt
 from l2_core.audio_processing.stages.recording_models import Utterance
 
+logger = logging.getLogger("audio_processing")
+
 
 class TopicBoundaryDetector:
     """Detect continuous topic sections; invalid model output triggers deterministic fallback."""
+
+    _LOCAL_MAX_BATCH_CHARS = 3500
+    _ONLINE_MAX_BATCH_CHARS = 50_000
+    _LOCAL_MAX_OUTPUT_TOKENS = 3072
+    _ONLINE_MAX_OUTPUT_TOKENS = 8192
+    _VALIDATION_ATTEMPTS = 2
 
     def __init__(
         self,
         worker_client: SyncWorkerClient,
         provider: LlmProvider,
         context_size: int,
-        max_batch_chars: int = 3500,
+        max_batch_chars: int | None = None,
     ) -> None:
         self._worker_client = worker_client
         self._provider = provider
         self._context_size = context_size
-        self._max_batch_chars = max_batch_chars
+        self._max_batch_chars = max_batch_chars or (
+            self._LOCAL_MAX_BATCH_CHARS if provider == LlmProvider.LOCAL else self._ONLINE_MAX_BATCH_CHARS
+        )
+        self._max_output_tokens = (
+            self._LOCAL_MAX_OUTPUT_TOKENS if provider == LlmProvider.LOCAL else self._ONLINE_MAX_OUTPUT_TOKENS
+        )
 
     def detect(self, utterances: Sequence[Utterance]) -> list[TopicSection]:
         if not utterances:
             return []
+        for attempt in range(1, self._VALIDATION_ATTEMPTS + 1):
+            try:
+                return self._detect_and_validate(utterances)
+            except ValueError:
+                if attempt >= self._VALIDATION_ATTEMPTS:
+                    raise
+                logger.warning("检索分块：主题识别输出校验失败，重新请求模型")
+        raise AssertionError("unreachable")
+
+    def _detect_and_validate(self, utterances: Sequence[Utterance]) -> list[TopicSection]:
         sections: list[TopicSection] = []
         for batch in self._batches(utterances):
             sections.extend(self._detect_batch(batch))
@@ -49,14 +73,14 @@ class TopicBoundaryDetector:
                 self._provider,
                 [ChatMessage(ChatRole.USER, build_topic_boundary_prompt(utterances))],
                 CompletionOptions(
-                    max_tokens=max(384, min(3072, len(utterances) * 80)),
-                temperature=0,
-                response_format=ResponseFormat(
-                    type=ResponseFormatType.JSON_SCHEMA,
-                    json_schema=TopicSectionsOutput.model_json_schema(),
-                    strict=False,
+                    max_tokens=max(384, min(self._max_output_tokens, len(utterances) * 80)),
+                    temperature=0,
+                    response_format=ResponseFormat(
+                        type=ResponseFormatType.JSON_SCHEMA,
+                        json_schema=TopicSectionsOutput.model_json_schema(),
+                        strict=False,
+                    ),
                 ),
-            ),
                 context_size=self._context_size,
                 stream=False,
             ),

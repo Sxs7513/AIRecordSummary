@@ -69,10 +69,14 @@ class RecordingProjectionService:
                 connection.execute(
                     text(
                         """
-                        insert into transcriptions (recording_id, language, model_name, full_text, segment_count)
-                        values (:recording_id, :language, :model_name, :full_text, :segment_count)
+                        insert into transcriptions (
+                            recording_id, language, model_name, full_text, original_full_text, segment_count
+                        ) values (
+                            :recording_id, :language, :model_name, :full_text, :original_full_text, :segment_count
+                        )
                         on conflict (recording_id) do update set
                             language = excluded.language, model_name = excluded.model_name, full_text = excluded.full_text,
+                            original_full_text = excluded.original_full_text,
                             segment_count = excluded.segment_count, updated_at = now()
                         returning id
                         """
@@ -82,6 +86,7 @@ class RecordingProjectionService:
                         "language": output.language,
                         "model_name": output.model_name,
                         "full_text": "".join(segment.text for segment in output.segments),
+                        "original_full_text": output.original_full_text,
                         "segment_count": len(output.segments),
                     },
                 ).scalar_one(),
@@ -110,10 +115,10 @@ class RecordingProjectionService:
                     text(
                         """
                         insert into transcription_segments (
-                            recording_id, transcription_id, segment_index, start_ms, end_ms, text,
+                            recording_id, transcription_id, segment_index, start_ms, end_ms, text, original_text,
                             speaker_label, speaker_cluster_id, diarization_segment_id
                         ) values (
-                            :recording_id, :transcription_id, :segment_index, :start_ms, :end_ms, :text,
+                            :recording_id, :transcription_id, :segment_index, :start_ms, :end_ms, :text, :original_text,
                             :speaker_label, :speaker_cluster_id, :diarization_segment_id
                         )
                         """
@@ -125,6 +130,7 @@ class RecordingProjectionService:
                         "start_ms": segment.start_ms,
                         "end_ms": segment.end_ms,
                         "text": segment.text,
+                        "original_text": segment.original_text,
                         "speaker_label": segment.speaker_label,
                         "speaker_cluster_id": segment.speaker_cluster_id,
                         "diarization_segment_id": diarization_id,
@@ -291,12 +297,12 @@ class RecordingProjectionService:
                     text(
                         """
                         insert into recording_search_chunks (
-                            recording_id, embedding_model_id, chunk_index, text, normalized_text,
+                            recording_id, embedding_model_id, chunk_index, text, original_text, normalized_text, normalized_original_text,
                             start_ms, end_ms, speaker_labels, speaker_cluster_ids,
                             source_utterance_segment_ids, source_transcription_segment_ids,
                             is_target_person, matched_speaker_profile_ids, metadata, embedding
                         ) values (
-                            :recording_id, :embedding_model_id, :chunk_index, :text, :normalized_text,
+                            :recording_id, :embedding_model_id, :chunk_index, :text, :original_text, :normalized_text, :normalized_original_text,
                             :start_ms, :end_ms, :speaker_labels, :speaker_cluster_ids,
                             :source_utterance_segment_ids, :source_transcription_segment_ids,
                             false, cast(:matched_speaker_profile_ids as uuid[]), cast(:metadata as jsonb),
@@ -309,7 +315,9 @@ class RecordingProjectionService:
                         "embedding_model_id": embedding_model_id,
                         "chunk_index": chunk.chunk_index,
                         "text": chunk.text,
+                        "original_text": chunk.original_text,
                         "normalized_text": normalize_search_text(chunk.retrieval_text()),
+                        "normalized_original_text": normalize_search_text(chunk.original_text),
                         "start_ms": chunk.start_ms,
                         "end_ms": chunk.end_ms,
                         "speaker_labels": chunk.speaker_labels,

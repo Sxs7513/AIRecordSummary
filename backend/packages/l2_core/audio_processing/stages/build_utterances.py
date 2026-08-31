@@ -9,7 +9,7 @@ class BuildUtterancesStage:
     """Project aligned transcript segments one-to-one into business utterances."""
 
     name = "build_utterances"
-    version = "4"
+    version = "9"
     retry_policy = RetryPolicy(initial_backoff_seconds=10)
     input_model = BuildUtterancesInput
 
@@ -24,6 +24,8 @@ class BuildUtterancesStage:
             self.version,
             "utterances.final",
             UtterancesOutput,
+            input_fingerprint=context.input_fingerprint,
+            allow_legacy_restore=context.allow_legacy_restore,
         )
 
     async def run(self, context: StageContext, input_payload: BuildUtterancesInput) -> StageResult[UtterancesOutput]:
@@ -38,6 +40,7 @@ class BuildUtterancesStage:
                     start_ms=segment.start_ms,
                     end_ms=segment.end_ms,
                     text=segment.text,
+                    original_text=segment.original_text,
                     speaker_cluster_id=segment.speaker_cluster_id,
                     speaker_label=segment.speaker_label,
                     source_segment_indexes=[source_index],

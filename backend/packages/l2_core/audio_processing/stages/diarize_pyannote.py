@@ -100,6 +100,8 @@ class PyannoteDiarizeStage:
             self.version,
             "diarization.pyannote",
             DiarizationOutput,
+            input_fingerprint=context.input_fingerprint,
+            allow_legacy_restore=context.allow_legacy_restore,
         )
 
     async def run(self, context: StageContext, input_payload: DiarizeInput) -> StageResult[DiarizationOutput]:

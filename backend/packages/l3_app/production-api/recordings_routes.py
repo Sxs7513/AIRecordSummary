@@ -85,6 +85,7 @@ class TranscriptionResponse(ApiModel):
     language: str | None
     model_name: str
     full_text: str
+    original_full_text: str | None
     segment_count: int
     created_at: datetime
     updated_at: datetime
@@ -108,6 +109,7 @@ class TranscriptionSegmentResponse(ApiModel):
     start_ms: int
     end_ms: int
     text: str
+    original_text: str | None = None
     speaker_label: str | None
     speaker_cluster_id: str | None
     speaker_confidence: Decimal | None
@@ -363,7 +365,7 @@ def get_pipeline_run(run_id: UUID, service: RecordingServiceDependency, user: Cu
 
 @router.post("/{recording_id}/retry", response_model=RetryRecordingResponse, status_code=status.HTTP_201_CREATED)
 async def retry_recording(recording_id: UUID, service: RecordingServiceDependency, user: CurrentUserDependency) -> RetryRecordingResponse:
-    """Create a new run for a failed recording without overwriting the failed run's history."""
+    """Reopen a failed or partially failed run and reuse its persisted stage artifacts."""
     try:
         result = service.retry_failed_recording(user, recording_id)
         run_id = await result if isawaitable(result) else result

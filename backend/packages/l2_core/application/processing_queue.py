@@ -131,6 +131,45 @@ class ProcessingCommandPublisher:
         )
         return processing_id
 
+    def enqueue_recording_retry(
+        self,
+        connection: Connection,
+        subject_id: UUID,
+        pipeline_name: str,
+        pipeline_version: str,
+        source: ArtifactRef,
+        *,
+        processing_id: UUID,
+        workspace_id: UUID | None = None,
+    ) -> UUID:
+        """Reopen one terminal processing run while retaining its artifact identity."""
+        item = ProcessingWorkItem(
+            processing_id=processing_id,
+            subject_type="recording",
+            subject_id=subject_id,
+            pipeline_name=pipeline_name,
+            pipeline_version=pipeline_version,
+            initial_artifacts=[source],
+        )
+        event = new_event(
+            "processing.retry.requested",
+            "production-api",
+            correlation_id=processing_id,
+            workspace_id=workspace_id,
+            processing_id=processing_id,
+            payload=item.model_dump(mode="json"),
+        )
+        self._outbox.enqueue(
+            connection,
+            channel="processing-command",
+            topic=Topics.PROCESSING_COMMANDS,
+            partition_key=str(processing_id),
+            aggregate_type="processing",
+            aggregate_id=processing_id,
+            event=event,
+        )
+        return processing_id
+
     def enqueue_cancel(self, connection: Connection, subject_id: UUID) -> None:
         item = ProcessingCancelWorkItem(subject_type="recording", subject_id=subject_id)
         event = new_event(

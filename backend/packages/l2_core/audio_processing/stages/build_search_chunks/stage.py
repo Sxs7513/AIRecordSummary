@@ -21,7 +21,7 @@ class BuildSearchChunksStage:
     """Build bounded, topic-aware retrieval chunks from final utterances."""
 
     name = "build_search_chunks"
-    version = "4"
+    version = "10"
     retry_policy = RetryPolicy(initial_backoff_seconds=30)
     input_model = BuildSearchChunksInput
 
@@ -39,6 +39,14 @@ class BuildSearchChunksStage:
     ) -> None:
         self._artifact_store = artifact_store
         self._builder = SearchChunkBuilder(token_counter, max_tokens, max_duration_ms, max_utterances)
+        self._cache_config: dict[str, object] = {
+            "max_tokens": max_tokens,
+            "max_duration_ms": max_duration_ms,
+            "max_utterances": max_utterances,
+            "topic_detection_enabled": topic_detection_enabled,
+            "topic_provider": topic_provider.value if topic_provider is not None else None,
+            "topic_context_size": topic_context_size,
+        }
         self._detector = (
             TopicBoundaryDetector(worker_client, topic_provider, topic_context_size)
             if topic_detection_enabled and worker_client is not None and topic_provider is not None
@@ -46,9 +54,22 @@ class BuildSearchChunksStage:
         )
 
     async def try_restore(self, context: StageContext, _input_payload: BuildSearchChunksInput) -> StageResult[SearchChunksOutput] | None:
-        return self._artifact_store.try_restore_json(
-            context.pipeline_run_id, context.stage_run_id, self.name, self.version, "search.chunks", SearchChunksOutput
+        restored = self._artifact_store.try_restore_json(
+            context.pipeline_run_id,
+            context.stage_run_id,
+            self.name,
+            self.version,
+            "search.chunks",
+            SearchChunksOutput,
+            input_fingerprint=context.input_fingerprint,
+            allow_legacy_restore=context.allow_legacy_restore,
         )
+        if restored is not None and self._detector is not None and restored.output.build_method == "deterministic_fallback":
+            return None
+        return restored
+
+    def cache_config(self) -> dict[str, object]:
+        return self._cache_config
 
     async def run(self, context: StageContext, input_payload: BuildSearchChunksInput) -> StageResult[SearchChunksOutput]:
         utterances = UtterancesOutput.model_validate(self._artifact_store.read_json(input_payload.utterances)).segments

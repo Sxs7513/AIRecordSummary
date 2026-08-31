@@ -61,3 +61,7 @@ def test_correct_asr_windows_preserves_funasr_source_metadata(tmp_path: Path) ->
     assert result.output.asr_model_name == "FunAudioLLM/Fun-ASR-Nano-2512"
     assert result.output.language == "Chinese"
     assert result.output.windows[0].text == "测试文本。"
+
+
+def test_correct_asr_windows_normalizes_inline_latex_to_plain_text() -> None:
+    assert CorrectAsrWindowsStage._normalize_latex_notation("参数为 $\\Delta T_{1}$ 和 $\\Delta T_{2}$。") == "参数为 Δ T_1 和 Δ T_2。"  # pyright: ignore[reportPrivateUsage]

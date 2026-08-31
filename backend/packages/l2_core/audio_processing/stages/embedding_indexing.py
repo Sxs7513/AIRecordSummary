@@ -29,7 +29,12 @@ class EmbeddingIndexingStage:
     """Create normalized local Qwen embeddings; persistence is handled by the projection service."""
 
     name = "embedding_indexing"
-    version = "3"
+    # Version 8 invalidates embedding artifacts created before raw ASR text
+    # and polished text formatting were restored from speaker-level alignment.
+    # Embeddings still use only
+    # retrieval_text; invalidation is required because this artifact is also
+    # the payload used to project chunk metadata into PostgreSQL.
+    version = "8"
     retry_policy = RetryPolicy(initial_backoff_seconds=30)
     input_model = EmbeddingIndexingInput
 
@@ -58,6 +63,8 @@ class EmbeddingIndexingStage:
             self.version,
             "search.embedding_index",
             EmbeddingIndexingOutput,
+            input_fingerprint=context.input_fingerprint,
+            allow_legacy_restore=context.allow_legacy_restore,
         )
 
     async def run(self, context: StageContext, input_payload: EmbeddingIndexingInput) -> StageResult[EmbeddingIndexingOutput]:

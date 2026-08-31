@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Generator, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar, Token
 from typing import Any, Literal, Protocol, cast
 from uuid import UUID
 
@@ -75,6 +77,8 @@ from l2_core.rag.token_budget import RagTokenBudgetMiddleware
 from l2_core.rag.workflows.chunk_evidence import ChunkEvidencePipeline
 
 AnswerVariant = Literal["original", "corrected"]
+PhaseReporter = Callable[[str, str, int | None], None]
+_CURRENT_PHASE_REPORTER: ContextVar[PhaseReporter | None] = ContextVar("rag_phase_reporter", default=None)
 
 
 class AggregateAnswerStream(Protocol):
@@ -100,6 +104,15 @@ INSUFFICIENT_EVIDENCE_ANSWER = "没有在录音中找到足够依据。"
 GRADE_MAX_OUTPUT_TOKENS = 500
 GRADE_CONTEXT_SAFETY_TOKENS = 256
 GRADE_EVIDENCE_TRUNCATION_MARKER = "\n\n[后续证据因上下文长度限制已截断]"
+
+
+@contextmanager
+def _rag_phase_scope(reporter: PhaseReporter) -> Generator[None]:
+    token: Token[PhaseReporter | None] = _CURRENT_PHASE_REPORTER.set(reporter)
+    try:
+        yield
+    finally:
+        _CURRENT_PHASE_REPORTER.reset(token)
 
 
 class RagGraph:
@@ -183,6 +196,7 @@ class RagGraph:
                     rerank_enabled=bool(getattr(retriever, "rerank_enabled", False)),
                     query_term_expansion_enabled=query_term_expansion_enabled,
                     render_evidence=self._evidence_text,
+                    report_phase=self._report_phase,
                 ),
                 MetadataLookupStrategy(
                     retriever,
@@ -247,7 +261,7 @@ class RagGraph:
         adjudication_user_decision: ClaimConfirmationDecision | None = None,
         force_correction: bool = False,
     ) -> tuple[str, list[EvidenceSource], bool, str | None, AdjudicationConfirmationBlock | None]:
-        with rag_execution_hook_scope(hook):
+        with rag_execution_hook_scope(hook), _rag_phase_scope(on_phase):
             return await self._run(
                 query,
                 limit,
@@ -291,7 +305,7 @@ class RagGraph:
             scope_recording_count=len(scope_recording_ids),
             history_messages=len(history or []),
         )
-        on_phase("routing", "正在理解问题", 10)
+        self._report_phase("routing", "正在理解问题")
         try:
             initial_state = self._initial_state(
                 trace_id,
@@ -378,7 +392,7 @@ class RagGraph:
         adjudication = state.get("adjudication_agent_state")
         if adjudication is not None and adjudication.pending_confirmation is not None:
             return "", strategy_result.sources, False, None, adjudication.pending_confirmation
-        on_phase("generating", "正在生成回答", 75)
+        self._report_phase("generating", "正在生成回答")
         answer_started = self._node_started(state, "answer")
         original_answerable = bool(strategy_result.answer_context)
         corrected_available = strategy_result.corrected_answer_context is not None
@@ -752,6 +766,12 @@ class RagGraph:
         if node in {"retrieve", "rerank"}:
             return "local"
         return "none"
+
+    @staticmethod
+    def _report_phase(name: str, label: str) -> None:
+        reporter = _CURRENT_PHASE_REPORTER.get()
+        if reporter is not None:
+            reporter(name, label, None)
 
     @staticmethod
     def _operation_completed(
@@ -1156,6 +1176,7 @@ class RagGraph:
 
     def _strategy_node(self, strategy_id: StrategyId) -> Callable[[RagGraphState], object]:
         async def invoke(state: RagGraphState) -> object:
+            self._report_phase("searching", "正在搜索资料")
             return await self._strategies.get(strategy_id).invoke(state)
 
         return invoke
@@ -1287,6 +1308,7 @@ class RagGraph:
         return "grade"
 
     async def _grade(self, state: RagGraphState) -> RagStateUpdate:
+        self._report_phase("grading", "正在核验资料")
         evidence = state.get("answer_evidence") or state["evidence"]
         grade, token_usage = await self._grade_evidence(state, evidence, node="grade")
         return {"grade": grade, "original_grade": grade, "corrected_grade": None, "token_usage": token_usage}
@@ -1294,6 +1316,7 @@ class RagGraph:
     async def _grade_variants(self, state: RagGraphState) -> RagStateUpdate:
         """Grade original and adjudicated evidence concurrently after correction is final."""
 
+        self._report_phase("grading", "正在核验资料")
         original_evidence = state.get("answer_evidence") or state["evidence"]
         adjudication = state.get("adjudication_agent_state")
         if adjudication is None or not adjudication.overlays:

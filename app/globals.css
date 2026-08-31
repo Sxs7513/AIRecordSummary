@@ -412,6 +412,28 @@ th {
   gap: 10px;
 }
 
+.transcript-views {
+  display: grid;
+  gap: 12px;
+}
+
+.transcript-view-toolbar {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.original-transcript {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  line-height: 1.75;
+  padding: 16px;
+  white-space: pre-wrap;
+}
+
+.original-transcript .subtle {
+  margin-top: 0;
+}
+
 .segment {
   border: 1px solid var(--line);
   border-radius: 8px;

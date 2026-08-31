@@ -4,6 +4,7 @@ import contextlib
 import gc
 import subprocess
 import tempfile
+import unicodedata
 from collections.abc import Callable, Generator, Sequence
 from importlib import import_module
 from pathlib import Path
@@ -41,10 +42,10 @@ class ForcedAlignItem(Protocol):
 
 
 class AlignTranscriptStage:
-    """Align final window text once, then attribute aligned tokens to pyannote turns."""
+    """Align polished and raw ASR window text, then attribute both to pyannote turns."""
 
     name = "align_transcript"
-    version = "2"
+    version = "9"
     retry_policy = RetryPolicy(initial_backoff_seconds=30)
     input_model = AlignTranscriptInput
 
@@ -71,6 +72,8 @@ class AlignTranscriptStage:
             self.version,
             "transcript.aligned",
             TranscriptOutput,
+            input_fingerprint=context.input_fingerprint,
+            allow_legacy_restore=context.allow_legacy_restore,
         )
 
     async def run(self, context: StageContext, input_payload: AlignTranscriptInput) -> StageResult[TranscriptOutput]:
@@ -84,6 +87,7 @@ class AlignTranscriptStage:
             raise RuntimeError("AlignTranscriptStage requires WorkerClient")
         audio_path = self._resolve_storage_path(audio_storage_path)
         source_windows = [window for window in corrected.windows if window.text.strip()]
+        raw_windows = [window for window in source_windows if window.original_text.strip()]
         if source_windows:
             with tempfile.TemporaryDirectory(prefix="alignment-input-") as directory, contextlib.ExitStack() as stack:
                 clips = [
@@ -91,17 +95,27 @@ class AlignTranscriptStage:
                 ]
                 batch_id = uuid4().hex
                 input_keys = [self._file_store.put_file(clip, key=f"compute-inputs/{batch_id}/{index}.wav") for index, clip in enumerate(clips)]
+                input_key_by_window_index = {window.window_index: key for window, key in zip(source_windows, input_keys, strict=True)}
                 try:
                     inference = await self._worker_client.execute(
                         alignment_inference_batch_command(
                             [
                                 AlignmentInferenceItem(
-                                    item_id=str(window.window_index),
+                                    item_id=f"polished:{window.window_index}",
                                     audio_storage_path=key,
                                     text=window.text,
                                     language=window.language or "Chinese",
                                 )
                                 for window, key in zip(source_windows, input_keys, strict=True)
+                            ]
+                            + [
+                                AlignmentInferenceItem(
+                                    item_id=f"original:{window.window_index}",
+                                    audio_storage_path=input_key_by_window_index[window.window_index],
+                                    text=window.original_text,
+                                    language=window.language or "Chinese",
+                                )
+                                for window in raw_windows
                             ]
                         ),
                         result_type=AlignmentInferenceBatchResult,
@@ -112,7 +126,7 @@ class AlignTranscriptStage:
                         self._file_store.delete_file(key)
         else:
             inference = AlignmentInferenceBatchResult(model_name=self._model_name, items=[])
-        output = self._build_output(diarization.segments, corrected, source_windows, inference)
+        output = self._build_output(diarization.segments, corrected, source_windows, raw_windows, inference)
         return StageResult(
             output=output,
             artifacts=(ArtifactPayload(artifact_type="transcript.aligned", data=output.model_dump(mode="json")),),
@@ -126,51 +140,41 @@ class AlignTranscriptStage:
         progress: Callable[[int, str], None],
     ) -> TranscriptOutput:
         aligner = self._load(progress)
-        tokens: list[AlignedTranscriptToken] = []
+        inference_items: list[AlignmentInferenceItemResult] = []
         total = max(1, len(corrected.windows))
         for index, window in enumerate(corrected.windows, start=1):
             progress(15 + round(75 * (index - 1) / total), f"对齐窗口 {index}/{len(corrected.windows)}")
             if not window.text.strip():
                 continue
             with self._cropped_wav(audio, window.input_start_ms, window.input_end_ms) as clip:
-                results = cast(
+                polished_results = cast(
                     list[list[ForcedAlignItem]],
                     aligner.align(audio=str(clip), text=window.text, language=window.language or "Chinese"),
                 )
-            if len(results) != 1:
+                raw_results = cast(
+                    list[list[ForcedAlignItem]],
+                    aligner.align(audio=str(clip), text=window.original_text, language=window.language or "Chinese"),
+                ) if window.original_text.strip() else [[]]
+            if len(polished_results) != 1 or len(raw_results) != 1:
                 raise RuntimeError(f"ForcedAligner result count mismatch for window {window.window_index}")
-            aligned_items = results[0]
-            display_texts = self._restore_unaligned_text(window.text, [item.text for item in aligned_items])
-            for item, display_text in zip(aligned_items, display_texts, strict=True):
-                start_ms = window.input_start_ms + round(float(item.start_time) * 1000)
-                end_ms = window.input_start_ms + round(float(item.end_time) * 1000)
-                midpoint = (start_ms + end_ms) // 2
-                if not (window.core_start_ms <= midpoint < window.core_end_ms):
-                    continue
-                speaker, status = self._speaker_for(start_ms, end_ms, diarization)
-                tokens.append(
-                    AlignedTranscriptToken(
-                        token_index=len(tokens),
-                        text=display_text,
-                        start_ms=start_ms,
-                        end_ms=max(start_ms, end_ms),
-                        speaker_cluster_id=speaker.speaker_cluster_id if speaker else None,
-                        speaker_label=speaker.speaker_label if speaker else None,
-                        attribution_status=status,
-                        source_window_index=window.window_index,
-                        source_diarization_segment_id=speaker.id if speaker else None,
-                    )
-                )
-        segments = self._segments_from_tokens(tokens, diarization)
-        progress(95, "整理说话人转写结果")
-        return TranscriptOutput(
-            provider=corrected.asr_provider,
-            model_name=corrected.asr_model_name,
-            language=corrected.language,
-            segments=segments,
-            alignment_tokens=tokens,
-            alignment_model_name=self._model_name,
+            inference_items.append(AlignmentInferenceItemResult(
+                item_id=f"polished:{window.window_index}",
+                tokens=[AlignmentTokenResult(text=item.text, start_time=float(item.start_time), end_time=float(item.end_time)) for item in polished_results[0]],
+            ))
+            if window.original_text.strip():
+                inference_items.append(AlignmentInferenceItemResult(
+                    item_id=f"original:{window.window_index}",
+                    tokens=[AlignmentTokenResult(text=item.text, start_time=float(item.start_time), end_time=float(item.end_time)) for item in raw_results[0]],
+                ))
+        output = self._build_output(
+            diarization,
+            corrected,
+            [window for window in corrected.windows if window.text.strip()],
+            [window for window in corrected.windows if window.text.strip() and window.original_text.strip()],
+            AlignmentInferenceBatchResult(model_name=self._model_name, items=inference_items),
         )
+        progress(95, "整理说话人转写结果")
+        return output
 
     def compute(
         self,
@@ -214,18 +218,41 @@ class AlignTranscriptStage:
         self,
         diarization: Sequence[DiarizationSegment],
         corrected: CorrectedAsrWindowTranscriptOutput,
-        windows: Sequence[CorrectedAsrWindowTranscript],
+        polished_windows: Sequence[CorrectedAsrWindowTranscript],
+        raw_windows: Sequence[CorrectedAsrWindowTranscript],
         inference: AlignmentInferenceBatchResult,
     ) -> TranscriptOutput:
-        window_by_id = {str(window.window_index): window for window in corrected.windows}
-        if len(inference.items) != len(windows):
-            raise RuntimeError(f"Alignment inference result count mismatch: expected {len(windows)}, got {len(inference.items)}")
+        polished_by_id = {f"polished:{window.window_index}": window for window in polished_windows}
+        raw_by_id = {f"original:{window.window_index}": window for window in raw_windows}
+        if len(inference.items) != len(polished_by_id) + len(raw_by_id):
+            raise RuntimeError(
+                f"Alignment inference result count mismatch: expected {len(polished_by_id) + len(raw_by_id)}, got {len(inference.items)}"
+            )
+        polished_tokens = self._tokens_from_inference(inference.items, polished_by_id, diarization, lambda window: window.text)
+        raw_tokens = self._tokens_from_inference(inference.items, raw_by_id, diarization, lambda window: window.original_text)
+        return TranscriptOutput(
+            provider=corrected.asr_provider,
+            model_name=corrected.asr_model_name,
+            language=corrected.language,
+            segments=self._segments_from_tokens(polished_tokens, diarization, raw_tokens),
+            original_full_text=self._original_full_text(corrected.windows),
+            alignment_tokens=polished_tokens,
+            alignment_model_name=inference.model_name,
+        )
+
+    def _tokens_from_inference(
+        self,
+        items: Sequence[AlignmentInferenceItemResult],
+        windows_by_id: dict[str, CorrectedAsrWindowTranscript],
+        diarization: Sequence[DiarizationSegment],
+        source_text: Callable[[CorrectedAsrWindowTranscript], str],
+    ) -> list[AlignedTranscriptToken]:
         tokens: list[AlignedTranscriptToken] = []
-        for item in inference.items:
-            window = window_by_id.get(item.item_id)
+        for item in items:
+            window = windows_by_id.get(item.item_id)
             if window is None:
-                raise RuntimeError(f"Alignment inference returned unknown item {item.item_id}")
-            display_texts = self._restore_unaligned_text(window.text, [token.text for token in item.tokens])
+                continue
+            display_texts = self._restore_unaligned_text(source_text(window), [token.text for token in item.tokens])
             for aligned, display_text in zip(item.tokens, display_texts, strict=True):
                 start_ms = window.input_start_ms + round(aligned.start_time * 1000)
                 end_ms = window.input_start_ms + round(aligned.end_time * 1000)
@@ -246,14 +273,12 @@ class AlignTranscriptStage:
                         source_diarization_segment_id=speaker.id if speaker else None,
                     )
                 )
-        return TranscriptOutput(
-            provider=corrected.asr_provider,
-            model_name=corrected.asr_model_name,
-            language=corrected.language,
-            segments=self._segments_from_tokens(tokens, diarization),
-            alignment_tokens=tokens,
-            alignment_model_name=inference.model_name,
-        )
+        return tokens
+
+    @staticmethod
+    def _original_full_text(windows: Sequence[CorrectedAsrWindowTranscript]) -> str | None:
+        texts = [window.original_text.strip() for window in sorted(windows, key=lambda item: item.window_index) if window.original_text.strip()]
+        return "\n".join(texts) or None
 
     @staticmethod
     def _speaker_for(
@@ -291,19 +316,22 @@ class AlignTranscriptStage:
 
     @staticmethod
     def _restore_unaligned_text(original: str, aligned_texts: Sequence[str]) -> list[str]:
-        """Attach punctuation and whitespace omitted by ForcedAligner to nearby timed tokens."""
+        """Attach source punctuation and whitespace to normalized ForcedAligner tokens."""
         if not aligned_texts:
             return []
 
+        searchable, source_indexes = AlignTranscriptStage._searchable_text(original)
         positions: list[tuple[int, int]] = []
         cursor = 0
-        lowered = original.lower()
         for aligned_text in aligned_texts:
-            position = lowered.find(aligned_text.lower(), cursor)
+            token, _ = AlignTranscriptStage._searchable_text(aligned_text)
+            if not token:
+                return list(aligned_texts)
+            position = searchable.find(token, cursor)
             if position < 0:
                 return list(aligned_texts)
-            end = position + len(aligned_text)
-            positions.append((position, end))
+            end = position + len(token)
+            positions.append((source_indexes[position], source_indexes[end - 1] + 1))
             cursor = end
 
         restored = [original[start:end] for start, end in positions]
@@ -320,24 +348,52 @@ class AlignTranscriptStage:
         return restored
 
     @staticmethod
-    def _segments_from_tokens(tokens: Sequence[AlignedTranscriptToken], diarization: Sequence[DiarizationSegment]) -> list[TranscriptSegment]:
+    def _searchable_text(value: str) -> tuple[str, list[int]]:
+        """Return alphanumeric text plus indexes into the original source string.
+
+        ForcedAligner commonly removes punctuation and whitespace. Matching
+        only speech characters lets us recover those omitted characters from
+        the source text without changing the aligned time spans.
+        """
+        characters: list[str] = []
+        source_indexes: list[int] = []
+        for source_index, source_character in enumerate(value):
+            for character in unicodedata.normalize("NFKC", source_character).lower():
+                if character.isalnum():
+                    characters.append(character)
+                    source_indexes.append(source_index)
+        return "".join(characters), source_indexes
+
+    @staticmethod
+    def _segments_from_tokens(
+        tokens: Sequence[AlignedTranscriptToken],
+        diarization: Sequence[DiarizationSegment],
+        original_tokens: Sequence[AlignedTranscriptToken] = (),
+    ) -> list[TranscriptSegment]:
         tokens_by_segment_id: dict[str, list[AlignedTranscriptToken]] = {}
         for token in tokens:
             if token.source_diarization_segment_id is None:
                 continue
             tokens_by_segment_id.setdefault(token.source_diarization_segment_id, []).append(token)
 
+        original_tokens_by_segment_id: dict[str, list[AlignedTranscriptToken]] = {}
+        for token in original_tokens:
+            if token.source_diarization_segment_id is not None:
+                original_tokens_by_segment_id.setdefault(token.source_diarization_segment_id, []).append(token)
+
         output: list[TranscriptSegment] = []
         for segment in sorted(diarization, key=lambda item: (item.start_ms, item.end_ms)):
             segment_tokens = tokens_by_segment_id.get(segment.id)
             if not segment_tokens:
                 continue
+            original_parts = [token.text for token in original_tokens_by_segment_id.get(segment.id, [])]
             output.append(
                 TranscriptSegment(
                     source_diarization_segment_id=segment.id,
                     start_ms=segment.start_ms,
                     end_ms=segment.end_ms,
                     text="".join(token.text for token in segment_tokens),
+                    original_text="".join(original_parts) or None,
                     speaker_cluster_id=segment.speaker_cluster_id,
                     speaker_label=segment.speaker_label,
                 )
