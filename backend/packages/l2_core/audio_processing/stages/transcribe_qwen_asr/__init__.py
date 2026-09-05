@@ -16,12 +16,12 @@ from l2_core.audio_processing.stages.recording_models import (
     DiarizationOutput,
     TranscribeQwenAsrInput,
 )
-from l2_core.audio_processing.stages.transcribe_qwen_asr.engine import QwenAsrConfig, QwenAsrEngine
+from l2_core.audio_processing.stages.transcribe_qwen_asr.engine import QwenAsrWindowConfig, QwenAsrWindowPreparer
 from l2_core.audio_processing.worker_tasks import AsrInferenceBatchResult, asr_inference_batch_command
 
 
 class QwenAsrTranscribeStage:
-    """Transcribe standardized pyannote speaker segments with an in-process Qwen model."""
+    """Prepare diarization-aware windows and delegate Qwen inference to the compute worker."""
 
     name = "transcribe_qwen_asr"
     version = "11"
@@ -37,10 +37,6 @@ class QwenAsrTranscribeStage:
         file_store: FileStore,
         artifact_store: ArtifactStore,
         model_name: str,
-        language: str,
-        model_cache_root: Path,
-        context: str = "",
-        max_inference_batch_size: int = 1,
         speech_window_target_duration_ms: int = 30_000,
         speech_window_max_duration_ms: int = 80_000,
         speech_window_overlap_ms: int = 500,
@@ -49,20 +45,14 @@ class QwenAsrTranscribeStage:
         low_volume_rms_threshold: float = 0.01,
         low_volume_peak_threshold: float = 0.08,
         low_volume_max_gain_db: float = 9.0,
-        num_beams: int = 2,
         worker_client: WorkerClient | None = None,
     ) -> None:
         self._file_store = file_store
         self._artifact_store = artifact_store
         self._worker_client = worker_client
-        self._engine = QwenAsrEngine(
-            QwenAsrConfig(
-                model_name=model_name,
-                language=language,
-                model_cache_root=model_cache_root,
-                context=context,
-                max_inference_batch_size=1,
-                num_beams=num_beams,
+        self._model_name = model_name
+        self._window_preparer = QwenAsrWindowPreparer(
+            QwenAsrWindowConfig(
                 speech_window_target_duration_ms=speech_window_target_duration_ms,
                 speech_window_max_duration_ms=speech_window_max_duration_ms,
                 speech_window_overlap_ms=speech_window_overlap_ms,
@@ -98,14 +88,14 @@ class QwenAsrTranscribeStage:
         input_keys: list[str] = []
         with (
             tempfile.TemporaryDirectory(prefix="qwen-asr-input-") as directory,
-            self._engine.prepare_inference_batch(audio_path, diarization.segments, Path(directory)) as (windows, paths),
+            self._window_preparer.prepare_inference_batch(audio_path, diarization.segments, Path(directory)) as (windows, paths),
         ):
             if paths:
                 batch_id = uuid4().hex
                 input_keys = [self._file_store.put_file(path, key=f"compute-inputs/{batch_id}/{path.name}") for path in paths]
                 try:
                     inference = await self._worker_client.execute(
-                        asr_inference_batch_command("qwen_asr", input_keys),
+                        asr_inference_batch_command(input_keys),
                         result_type=AsrInferenceBatchResult,
                         on_progress=lambda progress, message: context.report_progress(round(progress * 100), message or "Qwen ASR"),
                     )
@@ -113,7 +103,7 @@ class QwenAsrTranscribeStage:
                     for key in input_keys:
                         self._file_store.delete_file(key)
             else:
-                inference = AsrInferenceBatchResult(provider="qwen_asr", model_name=self._engine.model_name, items=[])
+                inference = AsrInferenceBatchResult(provider="qwen_asr", model_name=self._model_name, items=[])
         if len(inference.items) != len(windows):
             raise RuntimeError(f"Qwen ASR inference result count mismatch: expected {len(windows)}, got {len(inference.items)}")
         output = AsrWindowTranscriptOutput(

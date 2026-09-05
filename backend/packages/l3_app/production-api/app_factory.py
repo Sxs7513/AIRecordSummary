@@ -217,6 +217,6 @@ def create_app(
     app.state.injected_worker_client = worker_client
     app.state.injected_sync_worker_client = sync_worker_client
     app.state.injected_kafka_producer = kafka_producer
-    app.state.recording_processing_definition = build_recording_processing(configured_settings.asr_provider)
+    app.state.recording_processing_definition = build_recording_processing()
     app.include_router(router or production_router, prefix=configured_settings.api_prefix)
     return app

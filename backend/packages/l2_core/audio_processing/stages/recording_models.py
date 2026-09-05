@@ -7,7 +7,7 @@ from pydantic import BaseModel, Field
 from l1_foundation.pipeline.contracts import ArtifactRef
 from l2_core.rag.search_document import build_retrieval_text
 
-type AsrProvider = Literal["qwen_asr", "funasr_nano"]
+type AsrProvider = Literal["qwen_asr"]
 
 
 class NormalizeAudioInput(BaseModel):

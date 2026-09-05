@@ -26,7 +26,6 @@ const stageLabels: Record<string, string> = {
   diarize_pyannote: "说话人分离",
   preprocess_asr_audio: "ASR 音频预处理",
   transcribe_qwen_asr: "Qwen ASR 转写",
-  transcribe_funasr_nano: "Fun-ASR-Nano 转写",
   correct_asr_windows: "文本校正与润色",
   correct_text: "文本校正与润色（旧版）",
   align_transcript: "文字与录音时间轴对齐",

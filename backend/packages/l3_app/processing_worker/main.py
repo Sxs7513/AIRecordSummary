@@ -57,7 +57,7 @@ async def run() -> None:
         summary_stage=summary_stage,
         engine=engine,
     )
-    definition = build_recording_processing(settings.asr_provider)
+    definition = build_recording_processing()
     handler = ProcessingCommandHandler(definition, registry, artifact_store, redis, producer, RecordingProcessingHooks(engine))
     consumer = KafkaEventConsumer(
         [Topics.PROCESSING_COMMANDS, Topics.PROCESSING_RETRY],

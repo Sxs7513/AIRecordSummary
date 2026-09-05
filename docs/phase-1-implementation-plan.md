@@ -153,32 +153,7 @@ Qwen3-ASR 支持 `context`，项目会从 `config/initial-prompt.json` 中读取
 
 如果本地 HuggingFace 缓存中已经有完整模型快照，Qwen provider 会自动启用 HuggingFace 离线模式，避免每次启动时访问远端 metadata。
 
-### 4.2 SenseVoiceSmall
-
-`sensevoice` provider 使用 FunASR `FunAudioLLM/SenseVoiceSmall`。
-
-当前实现：
-
-- 使用 `fsmn-vad` 做语音活动检测
-- 对 VAD 片段做可配置合并
-- 逐段调用 SenseVoiceSmall
-- 支持 `SENSEVOICE_LANGUAGE=auto`
-- 支持 `SENSEVOICE_USE_ITN=true`
-
-SenseVoiceSmall 是当前效果很稳的备选路线。
-
-### 4.3 Paraformer
-
-`paraformer` provider 使用 FunASR `paraformer-zh`。
-
-当前实现：
-
-- 使用 `fsmn-vad`
-- 使用 `ct-punc-c`
-- 显式指定 `model_revision=v2.0.4`
-- 支持从 `config/initial-prompt.json` 读取 `terms + protectTerms` 作为 hotword
-
-### 4.4 HF Whisper / BELLE Whisper
+### 4.2 HF Whisper / BELLE Whisper
 
 `hf_whisper` provider 用于 HuggingFace Whisper 类模型，例如 BELLE 中文微调模型。
 

@@ -751,8 +751,4 @@ class RecordingService:
         if pipeline_name != definition.name:
             return stages
         node_order = {node.name: index for index, node in enumerate(definition.topologically_sorted_nodes())}
-        selected_asr_name = "transcribe_funasr_nano" if "transcribe_funasr_nano" in node_order else "transcribe_qwen_asr"
-        asr_index = node_order[selected_asr_name]
-        node_order.setdefault("transcribe_qwen_asr", asr_index)
-        node_order.setdefault("transcribe_funasr_nano", asr_index)
         return sorted(stages, key=lambda stage: (node_order.get(cast(str, stage["node_name"]), len(node_order)), cast(str, stage["node_name"])))

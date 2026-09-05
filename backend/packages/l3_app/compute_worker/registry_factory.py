@@ -30,7 +30,6 @@ from l3_app.compute_worker.audio_handlers import (
     AlignmentInferenceBatchHandler,
     EmbeddingEncodeHandler,
     PyannoteInferenceHandler,
-    build_funasr_handler,
     build_qwen_asr_handler,
 )
 from l3_app.compute_worker.registry import ComputeOperationRegistry, ComputeOperationSpec
@@ -79,8 +78,7 @@ def build_compute_operation_registry(settings: Settings, file_store: FileStore |
         )
     diarize = PyannoteInferenceHandler(settings, artifact_store)
     qwen_asr = build_qwen_asr_handler(settings, file_store)
-    funasr = build_funasr_handler(settings, file_store)
-    align = AlignmentInferenceBatchHandler(settings, artifact_store)
+    align = AlignmentInferenceBatchHandler(settings, file_store)
     embedding = EmbeddingEncodeHandler(settings, artifact_store)
     rerank = RerankHandler(settings)
     registry.register(
@@ -103,17 +101,6 @@ def build_compute_operation_registry(settings: Settings, file_store: FileStore |
             AsrInferenceBatchResult,
             qwen_asr,
             qwen_asr.release,
-        )
-    )
-    registry.register(
-        ComputeOperationSpec(
-            "asr.funasr_nano.infer_batch",
-            "1",
-            ResourceQueue.GPU_HIGH,
-            AsrInferenceBatchInput,
-            AsrInferenceBatchResult,
-            funasr,
-            funasr.release,
         )
     )
     registry.register(

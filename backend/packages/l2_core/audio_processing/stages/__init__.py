@@ -9,7 +9,6 @@ from l2_core.audio_processing.stages.normalize_audio import NormalizeAudioStage
 from l2_core.audio_processing.stages.preprocess_asr_audio import PreprocessAsrAudioStage
 from l2_core.audio_processing.stages.summary.stage import GenerateSummaryStage
 from l2_core.audio_processing.stages.summary_embedding_indexing import SummaryEmbeddingIndexer, SummaryEmbeddingIndexingStage
-from l2_core.audio_processing.stages.transcribe_funasr_nano import FunAsrNanoTranscribeStage
 from l2_core.audio_processing.stages.transcribe_qwen_asr import QwenAsrTranscribeStage
 
 __all__ = [
@@ -22,7 +21,6 @@ __all__ = [
     "GenerateSummaryStage",
     "SummaryEmbeddingIndexer",
     "SummaryEmbeddingIndexingStage",
-    "FunAsrNanoTranscribeStage",
     "NoopStage",
     "NormalizeAudioStage",
     "PreprocessAsrAudioStage",

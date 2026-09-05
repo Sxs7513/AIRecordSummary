@@ -36,7 +36,7 @@ ASR 原始片段
 ```text
 normalize_audio
   → diarize_pyannote
-  → transcribe_qwen_asr / transcribe_funasr_nano
+  → transcribe_qwen_asr
   → correct_text
   → build_utterances
       ├→ build_search_chunks
@@ -125,7 +125,7 @@ class TranscriptSegment(BaseModel):
 
 
 class TranscriptOutput(BaseModel):
-    provider: Literal["qwen_asr", "funasr_nano"]
+    provider: Literal["qwen_asr"]
     model_name: str
     language: str | None
     segments: list[TranscriptSegment]

@@ -1,18 +1,15 @@
 from __future__ import annotations
 
 import contextlib
-import gc
 import subprocess
 import tempfile
 import unicodedata
 from collections.abc import Callable, Generator, Sequence
-from importlib import import_module
 from pathlib import Path
-from typing import Any, Literal, Protocol, cast
+from typing import Literal
 from uuid import uuid4
 
 from l1_foundation.files import FileStore
-from l1_foundation.infrastructure.huggingface import resolve_local_snapshot
 from l1_foundation.pipeline.contracts import ArtifactPayload, ArtifactRef, RetryPolicy, StageContext, StageResult
 from l1_foundation.pipeline.runtime.artifact_store import ArtifactStore
 from l1_foundation.worker import WorkerClient
@@ -30,15 +27,8 @@ from l2_core.audio_processing.worker_tasks import (
     AlignmentInferenceBatchResult,
     AlignmentInferenceItem,
     AlignmentInferenceItemResult,
-    AlignmentTokenResult,
     alignment_inference_batch_command,
 )
-
-
-class ForcedAlignItem(Protocol):
-    text: str
-    start_time: float
-    end_time: float
 
 
 class AlignTranscriptStage:
@@ -54,14 +44,11 @@ class AlignTranscriptStage:
         file_store: FileStore,
         artifact_store: ArtifactStore,
         model_name: str,
-        model_cache_root: Path,
         worker_client: WorkerClient | None = None,
     ) -> None:
         self._file_store = file_store
         self._artifact_store = artifact_store
         self._model_name = model_name
-        self._model_cache_root = model_cache_root
-        self._aligner: Any | None = None
         self._worker_client = worker_client
 
     async def try_restore(self, context: StageContext, _input_payload: AlignTranscriptInput) -> StageResult[TranscriptOutput] | None:
@@ -131,88 +118,6 @@ class AlignTranscriptStage:
             output=output,
             artifacts=(ArtifactPayload(artifact_type="transcript.aligned", data=output.model_dump(mode="json")),),
         )
-
-    def _align(
-        self,
-        audio: Path,
-        diarization: Sequence[DiarizationSegment],
-        corrected: CorrectedAsrWindowTranscriptOutput,
-        progress: Callable[[int, str], None],
-    ) -> TranscriptOutput:
-        aligner = self._load(progress)
-        inference_items: list[AlignmentInferenceItemResult] = []
-        total = max(1, len(corrected.windows))
-        for index, window in enumerate(corrected.windows, start=1):
-            progress(15 + round(75 * (index - 1) / total), f"对齐窗口 {index}/{len(corrected.windows)}")
-            if not window.text.strip():
-                continue
-            with self._cropped_wav(audio, window.input_start_ms, window.input_end_ms) as clip:
-                polished_results = cast(
-                    list[list[ForcedAlignItem]],
-                    aligner.align(audio=str(clip), text=window.text, language=window.language or "Chinese"),
-                )
-                raw_results = cast(
-                    list[list[ForcedAlignItem]],
-                    aligner.align(audio=str(clip), text=window.original_text, language=window.language or "Chinese"),
-                ) if window.original_text.strip() else [[]]
-            if len(polished_results) != 1 or len(raw_results) != 1:
-                raise RuntimeError(f"ForcedAligner result count mismatch for window {window.window_index}")
-            inference_items.append(AlignmentInferenceItemResult(
-                item_id=f"polished:{window.window_index}",
-                tokens=[AlignmentTokenResult(text=item.text, start_time=float(item.start_time), end_time=float(item.end_time)) for item in polished_results[0]],
-            ))
-            if window.original_text.strip():
-                inference_items.append(AlignmentInferenceItemResult(
-                    item_id=f"original:{window.window_index}",
-                    tokens=[AlignmentTokenResult(text=item.text, start_time=float(item.start_time), end_time=float(item.end_time)) for item in raw_results[0]],
-                ))
-        output = self._build_output(
-            diarization,
-            corrected,
-            [window for window in corrected.windows if window.text.strip()],
-            [window for window in corrected.windows if window.text.strip() and window.original_text.strip()],
-            AlignmentInferenceBatchResult(model_name=self._model_name, items=inference_items),
-        )
-        progress(95, "整理说话人转写结果")
-        return output
-
-    def compute(
-        self,
-        audio: Path,
-        diarization: Sequence[DiarizationSegment],
-        corrected: CorrectedAsrWindowTranscriptOutput,
-        progress: Callable[[int, str], None],
-    ) -> TranscriptOutput:
-        return self._align(audio, diarization, corrected, progress)
-
-    def release(self) -> None:
-        self._release()
-
-    def infer_batch(
-        self,
-        items: Sequence[tuple[AlignmentInferenceItem, Path]],
-        progress: Callable[[int, str], None],
-        check_cancelled: Callable[[], None] | None = None,
-    ) -> AlignmentInferenceBatchResult:
-        """Run only ForcedAligner inference; orchestration and attribution stay in the Stage."""
-        aligner = self._load(progress)
-        results: list[AlignmentInferenceItemResult] = []
-        total = len(items)
-        for index, (item, path) in enumerate(items):
-            if check_cancelled is not None:
-                check_cancelled()
-            progress(15 + round(80 * index / max(1, total)), f"ForcedAligner 推理 {index + 1}/{total}")
-            aligned = cast(list[list[ForcedAlignItem]], aligner.align(audio=str(path), text=item.text, language=item.language))
-            if len(aligned) != 1:
-                raise RuntimeError(f"ForcedAligner result count mismatch for item {item.item_id}")
-            results.append(
-                AlignmentInferenceItemResult(
-                    item_id=item.item_id,
-                    tokens=[AlignmentTokenResult(text=token.text, start_time=token.start_time, end_time=token.end_time) for token in aligned[0]],
-                )
-            )
-        progress(100, f"ForcedAligner 推理 {total}/{total}")
-        return AlignmentInferenceBatchResult(model_name=self._model_name, items=results)
 
     def _build_output(
         self,
@@ -399,35 +304,6 @@ class AlignTranscriptStage:
                 )
             )
         return output
-
-    def _load(self, progress: Callable[[int, str], None]) -> Any:
-        if self._aligner is not None:
-            return self._aligner
-        progress(5, f"加载 ForcedAligner {self._model_name}")
-        torch = cast(Any, import_module("torch"))
-        qwen_asr = cast(Any, import_module("qwen_asr"))
-        if bool(torch.cuda.is_available()):
-            device_map, dtype = "cuda:0", torch.bfloat16
-        elif bool(torch.backends.mps.is_available()):
-            device_map, dtype = "mps", torch.float16
-        else:
-            device_map, dtype = "cpu", torch.float32
-        model_path = resolve_local_snapshot(self._model_name, self._model_cache_root)
-        self._aligner = qwen_asr.Qwen3ForcedAligner.from_pretrained(str(model_path), dtype=dtype, device_map=device_map, local_files_only=True)
-        progress(15, "ForcedAligner 加载完成")
-        return self._aligner
-
-    def _release(self) -> None:
-        self._aligner = None
-        gc.collect()
-        try:
-            torch = import_module("torch")
-            if bool(torch.cuda.is_available()):
-                torch.cuda.empty_cache()
-            if bool(torch.backends.mps.is_available()):
-                torch.mps.empty_cache()
-        except ImportError, RuntimeError, AttributeError:
-            pass
 
     def _audio_path(self, artifact: ArtifactRef) -> Path:
         descriptor = self._artifact_store.read_json(artifact)

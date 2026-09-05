@@ -1,22 +1,13 @@
 """The declared production graph for one uploaded recording."""
 
-from typing import Literal
-
 from l1_foundation.pipeline.contracts import RetryPolicy
 from l1_foundation.pipeline.definitions.graph import ArtifactBinding, PipelineDefinition, PipelineNode
 
 CPU_RETRY = RetryPolicy(initial_backoff_seconds=10)
 GPU_RETRY = RetryPolicy(initial_backoff_seconds=30)
 
-type AsrProvider = Literal["qwen_asr", "funasr_nano"]
-
-
-def build_recording_processing(asr_provider: AsrProvider = "qwen_asr") -> PipelineDefinition:
-    """Assemble the business pipeline with the configured ASR stage plugin."""
-    asr_stage_name, asr_stage_version = {
-        "qwen_asr": ("transcribe_qwen_asr", "11"),
-        "funasr_nano": ("transcribe_funasr_nano", "3"),
-    }[asr_provider]
+def build_recording_processing() -> PipelineDefinition:
+    """Assemble the recording business pipeline with Qwen ASR."""
     return PipelineDefinition(
         name="recording_processing",
         version="26",
@@ -48,9 +39,9 @@ def build_recording_processing(asr_provider: AsrProvider = "qwen_asr") -> Pipeli
                 output_artifacts=("audio.asr_preprocessed",),
             ),
             PipelineNode(
-                asr_stage_name,
-                asr_stage_name,
-                asr_stage_version,
+                "transcribe_qwen_asr",
+                "transcribe_qwen_asr",
+                "11",
                 GPU_RETRY,
                 depends_on=("preprocess_asr_audio", "diarize_pyannote"),
                 input_artifacts=(
@@ -64,8 +55,8 @@ def build_recording_processing(asr_provider: AsrProvider = "qwen_asr") -> Pipeli
                 "correct_asr_windows",
                 "7",
                 GPU_RETRY,
-                depends_on=(asr_stage_name,),
-                input_artifacts=(ArtifactBinding("transcript", "transcript.asr_windows", asr_stage_name),),
+                depends_on=("transcribe_qwen_asr",),
+                input_artifacts=(ArtifactBinding("transcript", "transcript.asr_windows", "transcribe_qwen_asr"),),
                 output_artifacts=("transcript.corrected_windows",),
             ),
             PipelineNode(
