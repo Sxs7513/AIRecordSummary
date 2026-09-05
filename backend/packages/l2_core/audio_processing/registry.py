@@ -18,10 +18,7 @@ from l2_core.audio_processing.stages.normalize_audio import NormalizeAudioStage
 from l2_core.audio_processing.stages.preprocess_asr_audio import PreprocessAsrAudioStage
 from l2_core.audio_processing.stages.summary.stage import GenerateSummaryStage
 from l2_core.audio_processing.stages.summary_embedding_indexing import SummaryEmbeddingIndexer, SummaryEmbeddingIndexingStage
-from l2_core.audio_processing.stages.transcribe_funasr_nano import FunAsrNanoTranscribeStage
-from l2_core.audio_processing.stages.transcribe_funasr_nano.context import build_funasr_hotwords
 from l2_core.audio_processing.stages.transcribe_qwen_asr import QwenAsrTranscribeStage
-from l2_core.audio_processing.stages.transcribe_qwen_asr.context import build_qwen_asr_context
 from l2_core.generation.service import GenerationService
 
 
@@ -79,10 +76,6 @@ def build_recording_stage_registry(
             file_store,
             artifact_store,
             settings.qwen_asr_model,
-            settings.qwen_asr_language,
-            settings.resolved_huggingface_hub_cache_dir,
-            build_qwen_asr_context(settings.resolved_qwen_asr_context_config, settings.qwen_asr_max_context_items, settings.qwen_asr_context),
-            settings.qwen_asr_max_inference_batch_size,
             settings.asr_speech_window_target_duration_ms,
             settings.asr_speech_window_max_duration_ms,
             settings.asr_speech_window_overlap_ms,
@@ -91,24 +84,6 @@ def build_recording_stage_registry(
             settings.qwen_asr_low_volume_rms_threshold,
             settings.qwen_asr_low_volume_peak_threshold,
             settings.qwen_asr_low_volume_max_gain_db,
-            settings.qwen_asr_num_beams,
-            async_worker_client,
-        )
-    )
-    funasr_hotwords = build_funasr_hotwords(settings.resolved_qwen_asr_context_config, settings.qwen_asr_max_context_items)
-    registry.register(
-        FunAsrNanoTranscribeStage(
-            file_store,
-            artifact_store,
-            settings.funasr_nano_model,
-            settings.qwen_asr_language,
-            settings.resolved_funasr_nano_cache_dir,
-            "、".join(funasr_hotwords),
-            settings.qwen_asr_max_inference_batch_size,
-            settings.asr_speech_window_target_duration_ms,
-            settings.asr_speech_window_max_duration_ms,
-            settings.asr_speech_window_overlap_ms,
-            funasr_hotwords,
             async_worker_client,
         )
     )
@@ -144,7 +119,6 @@ def build_recording_stage_registry(
             file_store,
             artifact_store,
             settings.transcript_alignment_model,
-            settings.resolved_huggingface_hub_cache_dir,
             async_worker_client,
         )
     )

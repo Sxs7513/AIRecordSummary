@@ -32,20 +32,6 @@ def test_recording_processing_uses_diarization_segments_for_qwen_asr() -> None:
     assert nodes["build_search_chunks"].stage_version == BuildSearchChunksStage.version
 
 
-def test_recording_processing_can_select_funasr_without_changing_downstream_contracts() -> None:
-    definition = build_recording_processing("funasr_nano")
-    nodes = {node.name: node for node in definition.nodes}
-
-    assert "transcribe_qwen_asr" not in nodes
-    assert nodes["transcribe_funasr_nano"].depends_on == ("preprocess_asr_audio", "diarize_pyannote")
-    assert nodes["transcribe_funasr_nano"].stage_version == "3"
-    assert nodes["transcribe_funasr_nano"].output_artifacts == ("transcript.asr_windows",)
-    assert nodes["correct_asr_windows"].depends_on == ("transcribe_funasr_nano",)
-    assert nodes["correct_asr_windows"].input_artifacts[0].from_node == "transcribe_funasr_nano"
-    assert nodes["align_transcript"].depends_on == ("correct_asr_windows", "preprocess_asr_audio", "diarize_pyannote")
-    assert nodes["build_utterances"].depends_on == ("align_transcript",)
-
-
 def test_recording_processing_indexes_and_summarizes_in_parallel() -> None:
     nodes = {node.name: node for node in recording_processing.nodes}
 

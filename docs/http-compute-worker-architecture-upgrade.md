@@ -232,7 +232,6 @@ backend/packages/
 |---|---|---|
 | `diarization.pyannote.infer` | GPU | 只执行 Pyannote 推理；片段平滑和合并留在 Stage。 |
 | `asr.qwen_asr.infer_batch` | GPU | 接收准备好的窗口列表，逐条执行 Qwen ASR 推理。 |
-| `asr.funasr_nano.infer_batch` | GPU | 接收准备好的窗口列表，逐条执行 FunASR 推理。 |
 | `alignment.qwen.infer_batch` | GPU | 只执行 ForcedAligner；说话人归属和结果整理留在 Stage。 |
 | `embedding.encode` | GPU | 输入文本并返回向量；数据库写入仍由业务层完成。 |
 | `llm.generate.local` | GPU | 本地 Qwen 的流式或非流式生成。 |
@@ -888,7 +887,7 @@ Worker 是 Production API 的必选基础设施，不提供 `COMPUTE_WORKER_ENAB
 
 ### Phase 3：迁移 ASR（已完成）
 
-1. 注册 `asr.qwen_asr.infer_batch` 和 `asr.funasr_nano.infer_batch`。
+1. 注册 `asr.qwen_asr.infer_batch`。
 2. ASR Stage 只保留输入准备、progress 映射和 StageResult 构造。
 3. ASR progress 和增量文本使用 SSE。
 4. Worker 先原子提交最终产物，再发出 `completed`。
@@ -903,7 +902,7 @@ Worker 是 Production API 的必选基础设施，不提供 `COMPUTE_WORKER_ENAB
 3. 音频预处理和对齐中值得隔离的重计算。
 4. RAG 中仍直接运行在 API 进程里的本地 Embedding 等重计算。
 
-已迁移音频标准化、ASR 前置处理、Diarization、Qwen/FunASR、对齐、录音索引 Embedding 与 RAG query Embedding。
+已迁移音频标准化、ASR 前置处理、Diarization、Qwen ASR、对齐、录音索引 Embedding 与 RAG query Embedding。
 
 ### Phase 5：移除旧调度方式（已完成）
 

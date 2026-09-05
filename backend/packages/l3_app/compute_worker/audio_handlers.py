@@ -3,23 +3,28 @@ from __future__ import annotations
 from collections.abc import Callable
 from pathlib import Path
 
+from l1_foundation.asr import (
+    QwenAsrConfig,
+    QwenAsrEngine,
+    QwenForcedAlignmentConfig,
+    QwenForcedAlignmentEngine,
+    QwenForcedAlignmentRequest,
+)
 from l1_foundation.files import FileStore
 from l1_foundation.pipeline.runtime.artifact_store import ArtifactStore
 from l1_foundation.settings import Settings
 from l1_foundation.worker import WorkerExecutionContext
-from l2_core.audio_processing.stages.align_transcript import AlignTranscriptStage
 from l2_core.audio_processing.stages.diarize_pyannote import PyannoteDiarizeStage
 from l2_core.audio_processing.stages.embedding_indexing import EmbeddingIndexingStage
 from l2_core.audio_processing.stages.recording_models import (
     DiarizationOutput,
 )
-from l2_core.audio_processing.stages.transcribe_funasr_nano.context import build_funasr_hotwords
-from l2_core.audio_processing.stages.transcribe_funasr_nano.engine import FunAsrNanoConfig, FunAsrNanoEngine
 from l2_core.audio_processing.stages.transcribe_qwen_asr.context import build_qwen_asr_context
-from l2_core.audio_processing.stages.transcribe_qwen_asr.engine import QwenAsrConfig, QwenAsrEngine
 from l2_core.audio_processing.worker_tasks import (
     AlignmentInferenceBatchInput,
     AlignmentInferenceBatchResult,
+    AlignmentInferenceItemResult,
+    AlignmentTokenResult,
     AsrInferenceBatchInput,
     AsrInferenceBatchResult,
     AsrInferenceItemResult,
@@ -60,7 +65,7 @@ class PyannoteInferenceHandler:
 
 
 class AsrInferenceBatchHandler:
-    def __init__(self, engine: QwenAsrEngine | FunAsrNanoEngine, provider: str, file_store: FileStore) -> None:
+    def __init__(self, engine: QwenAsrEngine, provider: str, file_store: FileStore) -> None:
         self._engine = engine
         self._provider = provider
         self._file_store = file_store
@@ -93,20 +98,30 @@ class AsrInferenceBatchHandler:
 
 
 class AlignmentInferenceBatchHandler:
-    def __init__(self, settings: Settings, artifact_store: ArtifactStore) -> None:
-        self._file_store = artifact_store.file_store
-        self._aligner = AlignTranscriptStage(
-            self._file_store,
-            artifact_store,
-            settings.transcript_alignment_model,
-            settings.resolved_huggingface_hub_cache_dir,
+    def __init__(self, settings: Settings, file_store: FileStore) -> None:
+        self._file_store = file_store
+        self._aligner = QwenForcedAlignmentEngine(
+            QwenForcedAlignmentConfig(settings.transcript_alignment_model, settings.resolved_huggingface_hub_cache_dir)
         )
 
     def __call__(self, value: AlignmentInferenceBatchInput, context: WorkerExecutionContext) -> AlignmentInferenceBatchResult:
-        return self._aligner.infer_batch(
-            [(item, self._resolve(item.audio_storage_path)) for item in value.items],
+        results = self._aligner.infer_batch(
+            [
+                QwenForcedAlignmentRequest(item.item_id, self._resolve(item.audio_storage_path), item.text, item.language)
+                for item in value.items
+            ],
             _progress(context),
             context.raise_if_cancelled,
+        )
+        return AlignmentInferenceBatchResult(
+            model_name=self._aligner.model_name,
+            items=[
+                AlignmentInferenceItemResult(
+                    item_id=result.item_id,
+                    tokens=[AlignmentTokenResult(token.text, token.start_time, token.end_time) for token in result.tokens],
+                )
+                for result in results
+            ],
         )
 
     def release(self) -> None:
@@ -164,31 +179,6 @@ def build_qwen_asr_handler(settings: Settings, file_store: FileStore) -> AsrInfe
             ),
             max_inference_batch_size=1,
             num_beams=settings.qwen_asr_num_beams,
-            speech_window_target_duration_ms=settings.asr_speech_window_target_duration_ms,
-            speech_window_max_duration_ms=settings.asr_speech_window_max_duration_ms,
-            speech_window_overlap_ms=settings.asr_speech_window_overlap_ms,
-            tempo=settings.qwen_asr_tempo,
-            enhance_low_volume_segments=settings.qwen_asr_enhance_low_volume_segments,
-            low_volume_rms_threshold=settings.qwen_asr_low_volume_rms_threshold,
-            low_volume_peak_threshold=settings.qwen_asr_low_volume_peak_threshold,
-            low_volume_max_gain_db=settings.qwen_asr_low_volume_max_gain_db,
         )
     )
     return AsrInferenceBatchHandler(engine, "qwen_asr", file_store)
-
-
-def build_funasr_handler(settings: Settings, file_store: FileStore) -> AsrInferenceBatchHandler:
-    hotwords = build_funasr_hotwords(settings.resolved_qwen_asr_context_config, settings.qwen_asr_max_context_items)
-    engine = FunAsrNanoEngine(
-        FunAsrNanoConfig(
-            settings.funasr_nano_model,
-            settings.qwen_asr_language,
-            settings.resolved_funasr_nano_cache_dir,
-            hotwords,
-            1,
-            settings.asr_speech_window_target_duration_ms,
-            settings.asr_speech_window_max_duration_ms,
-            settings.asr_speech_window_overlap_ms,
-        )
-    )
-    return AsrInferenceBatchHandler(engine, "funasr_nano", file_store)

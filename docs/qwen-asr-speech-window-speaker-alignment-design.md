@@ -58,7 +58,7 @@ align_transcript
 - 不由 Qwen 或 ForcedAligner 识别 speaker。speaker 身份仍完全来自 pyannote。
 - 不在第一版处理真正的双人重叠语音分离；重叠区域须显式标记为不确定或按既定主 speaker 规则处理。
 - 不在第一版实现逐字编辑，也不试图让 LLM 校正后的新增/改写文字沿用原始字级时间戳。
-- 第一版只为 Qwen ASR 接入连续窗口输出；`align_transcript` 的契约保持 provider 无关，Fun-ASR-Nano 可在后续复用。
+- 连续窗口输出固定由 Qwen ASR 提供；`align_transcript` 的契约保持 provider 无关。
 
 ## 3. 模型能力与约束
 
@@ -245,7 +245,7 @@ class AlignedTranscriptToken(BaseModel):
     source_window_index: int
 
 class TranscriptOutput(BaseModel):
-    provider: Literal["qwen_asr", "funasr_nano"]
+    provider: Literal["qwen_asr"]
     model_name: str
     language: str | None
     segments: list[TranscriptSegment]

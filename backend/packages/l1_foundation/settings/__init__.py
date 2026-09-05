@@ -71,9 +71,7 @@ class Settings(BaseSettings):
         validation_alias="ASR_LAB_PROJECT_DATASET_ROOT",
     )
     audio_model_cache_root: Path = Field(default=Path("model-cache"), validation_alias="AUDIO_MODEL_CACHE_ROOT")
-    asr_provider: Literal["qwen_asr", "funasr_nano"] = Field(default="qwen_asr", validation_alias="ASR_PROVIDER")
     qwen_asr_model: str = Field(default="Qwen/Qwen3-ASR-1.7B", validation_alias="QWEN_ASR_MODEL")
-    funasr_nano_model: str = Field(default="FunAudioLLM/Fun-ASR-Nano-2512", validation_alias="FUNASR_NANO_MODEL")
     qwen_asr_language: str = Field(default="auto", validation_alias="QWEN_ASR_LANGUAGE")
     qwen_asr_context_config: Path = Field(default=Path("config/initial-prompt.json"), validation_alias="QWEN_ASR_CONTEXT_CONFIG")
     qwen_asr_context: str = Field(default="", validation_alias="QWEN_ASR_CONTEXT")
@@ -388,10 +386,6 @@ class Settings(BaseSettings):
         # interpreter. Resolving that symlink would bypass the venv's
         # site-packages when the executable is passed to subprocess.
         return candidate.absolute()
-
-    @property
-    def resolved_funasr_nano_cache_dir(self) -> Path:
-        return self.resolved_huggingface_hub_cache_dir
 
     @property
     def resolved_embedding_model_cache_dir(self) -> Path:

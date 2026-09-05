@@ -10,7 +10,7 @@ from l2_core.audio_processing.worker_tasks import (
 def test_non_streaming_audio_commands_do_not_wait_for_sse_subscriber() -> None:
     commands = (
         audio_diarize_command("recordings/audio.wav"),
-        asr_inference_batch_command("qwen_asr", ["compute-inputs/window.wav"]),
+        asr_inference_batch_command(["compute-inputs/window.wav"]),
         alignment_inference_batch_command(
             [
                 AlignmentInferenceItem(

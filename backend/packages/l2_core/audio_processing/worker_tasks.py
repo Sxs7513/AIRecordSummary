@@ -107,14 +107,11 @@ def audio_diarize_command(audio_storage_path: str) -> ComputeCommand[AudioDiariz
 
 
 def asr_inference_batch_command(
-    provider: str,
     audio_storage_paths: Sequence[str],
 ) -> ComputeCommand[AsrInferenceBatchInput]:
-    if provider not in {"qwen_asr", "funasr_nano"}:
-        raise ValueError(f"Unsupported ASR provider: {provider}")
     return ComputeCommand(
         task_id=uuid4(),
-        operation=f"asr.{provider}.infer_batch",
+        operation="asr.qwen_asr.infer_batch",
         operation_version="1",
         resource_queue=ResourceQueue.GPU_HIGH,
         input=AsrInferenceBatchInput(items=[AsrInferenceItem(item_id=str(index), audio_storage_path=path) for index, path in enumerate(audio_storage_paths)]),

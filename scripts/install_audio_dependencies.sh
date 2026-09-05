@@ -149,12 +149,10 @@ load_env_file() {
   LOCAL_LLM_MODEL_REPO="${LOCAL_LLM_MODEL_REPO:-${LLM_CORRECTION_MODEL_REPO:-Qwen/Qwen2.5-7B-Instruct-GGUF}}"
   LOCAL_LLM_MODEL_FILE="${LOCAL_LLM_MODEL_FILE:-${LLM_CORRECTION_MODEL_FILE:-qwen2.5-7b-instruct-q4_k_m-00001-of-00002.gguf,qwen2.5-7b-instruct-q4_k_m-00002-of-00002.gguf}}"
   AUDIO_MODEL_CACHE_ROOT="${AUDIO_MODEL_CACHE_ROOT:-model-cache}"
-  ASR_PROVIDER="${ASR_PROVIDER:-qwen_asr}"
   QWEN_ASR_MODEL="${QWEN_ASR_MODEL:-Qwen/Qwen3-ASR-1.7B}"
   QWEN_ASR_TRAINING_MODEL="${QWEN_ASR_TRAINING_MODEL:-Qwen/Qwen3-ASR-1.7B-hf}"
   TRANSCRIPT_ALIGNMENT_ENABLED="${TRANSCRIPT_ALIGNMENT_ENABLED:-true}"
   TRANSCRIPT_ALIGNMENT_MODEL="${TRANSCRIPT_ALIGNMENT_MODEL:-Qwen/Qwen3-ForcedAligner-0.6B}"
-  FUNASR_NANO_MODEL="${FUNASR_NANO_MODEL:-FunAudioLLM/Fun-ASR-Nano-2512}"
   EMBEDDING_ENABLED="${EMBEDDING_ENABLED:-true}"
   EMBEDDING_MODEL="${EMBEDDING_MODEL:-Qwen/Qwen3-Embedding-4B}"
   EMBEDDING_MODEL_CACHE_DIR="${EMBEDDING_MODEL_CACHE_DIR:-model-cache/embedding}"
@@ -717,34 +715,7 @@ ensure_huggingface_snapshot() {
   "${VENV_PYTHON}" -u "${ROOT_DIR}/scripts/ensure_hf_snapshot.py" "${model_name}" "${cache_dir}"
 }
 
-ensure_funasr_nano() {
-  if [[ "${ASR_PROVIDER}" != "funasr_nano" ]]; then
-    log "Skipping Fun-ASR-Nano setup because ASR_PROVIDER is not funasr_nano."
-    return
-  fi
-
-  if python_has_module funasr; then
-    if "${VENV_PYTHON}" -c 'from importlib.metadata import version; parts = tuple(int(part) for part in version("funasr").split(".")[:3]); raise SystemExit(0 if parts >= (1, 3, 3) else 1)' >/dev/null 2>&1; then
-      log "funasr already installed."
-    else
-      log "Installed FunASR is too old for Fun-ASR-Nano; upgrading it."
-      pip_install_with_pypi_fallback "funasr>=1.3.3" modelscope huggingface_hub
-    fi
-  else
-    log "Installing FunASR via ${PIP_INDEX_URL}."
-    pip_install_with_pypi_fallback "funasr>=1.3.3" modelscope huggingface_hub
-  fi
-
-  local hf_hub_cache="${ROOT_DIR}/${AUDIO_MODEL_CACHE_ROOT}/huggingface/hub"
-  ensure_huggingface_snapshot "${FUNASR_NANO_MODEL}" "${hf_hub_cache}" "Fun-ASR-Nano"
-}
-
 ensure_qwen_asr() {
-  if [[ "${ASR_PROVIDER}" != "qwen_asr" ]]; then
-    log "Skipping Qwen3-ASR setup because ASR_PROVIDER is not qwen_asr."
-    return
-  fi
-
   local python_version
   python_version="$("${VENV_PYTHON}" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
   if ! python_meets_min_version "${VENV_PYTHON}"; then
@@ -979,7 +950,6 @@ main() {
   ensure_torch
   ensure_numba_runtime
   ensure_whisper
-  ensure_funasr_nano
   ensure_qwen_asr
   ensure_qwen_asr_trainer
   ensure_pyannote

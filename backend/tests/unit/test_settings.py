@@ -21,10 +21,9 @@ def settings_payload(**overrides: object) -> dict[str, object]:
     return payload
 
 
-def test_default_asr_provider_is_qwen() -> None:
+def test_qwen_asr_defaults() -> None:
     settings = Settings(_env_file=None, **settings_payload())
 
-    assert settings.asr_provider == "qwen_asr"
     assert settings.qwen_asr_model == "Qwen/Qwen3-ASR-1.7B"
     assert settings.qwen_asr_num_beams == 2
     assert settings.qwen_asr_tempo == 1.0
@@ -68,15 +67,6 @@ def test_asr_tempo_and_pyannote_absorb_gap_can_be_configured() -> None:
     assert settings.qwen_asr_low_volume_peak_threshold == 0.03
     assert settings.qwen_asr_low_volume_max_gain_db == 6
     assert settings.pyannote_short_segment_absorb_max_gap_ms == 1_500
-
-
-def test_funasr_nano_can_be_selected_as_the_recording_asr_provider() -> None:
-    settings = Settings(_env_file=None, **settings_payload(ASR_PROVIDER="funasr_nano"))
-
-    assert settings.asr_provider == "funasr_nano"
-    assert settings.funasr_nano_model == "FunAudioLLM/Fun-ASR-Nano-2512"
-    assert settings.resolved_huggingface_hub_cache_dir == REPOSITORY_ROOT / "model-cache" / "huggingface" / "hub"
-    assert settings.resolved_funasr_nano_cache_dir == REPOSITORY_ROOT / "model-cache" / "huggingface" / "hub"
 
 
 def test_database_url_encodes_credentials() -> None:

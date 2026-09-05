@@ -5,7 +5,6 @@ from typing import Any, cast
 from uuid import UUID, uuid4
 
 from l2_core.application.recordings import RecordingService
-from l2_core.audio_processing.definition import build_recording_processing
 
 
 def test_recording_processing_stages_follow_the_declared_graph_order() -> None:
@@ -28,22 +27,6 @@ def test_recording_processing_stages_follow_the_declared_graph_order() -> None:
         "generate_summary",
         "summary_embedding_indexing",
     ]
-
-
-def test_historical_qwen_stage_keeps_asr_position_after_switching_to_funasr() -> None:
-    stages = [
-        {"node_name": "correct_asr_windows"},
-        {"node_name": "transcribe_qwen_asr"},
-        {"node_name": "normalize_audio"},
-    ]
-
-    ordered = RecordingService.order_stage_rows(
-        "recording_processing",
-        stages,
-        build_recording_processing("funasr_nano"),
-    )
-
-    assert [stage["node_name"] for stage in ordered] == ["normalize_audio", "transcribe_qwen_asr", "correct_asr_windows"]
 
 
 def test_recording_detail_falls_back_to_database_processing_projection_without_redis() -> None:
