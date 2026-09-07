@@ -15,6 +15,7 @@ from l1_foundation.pipeline.contracts import ArtifactRef, PipelineRunId, StageRu
 from l1_foundation.pipeline.definitions.graph import PipelineDefinition
 from l1_foundation.streaming import SyncRedisStreamStore
 from l2_core.access.recordings import RecordingAccessService
+from l2_core.application.pipeline_runs import PipelineRunRepository
 from l2_core.application.processing_queue import ProcessingCommandPublisher, queued_processing_state, stable_recording_processing_id
 from l2_core.audio_processing.contracts import RecordingId
 from l2_core.audio_processing.definition import recording_processing
@@ -53,6 +54,7 @@ class RecordingService:
         self._processing_definition = processing_definition
         self._processing_publisher = processing_publisher
         self._processing_state_store = processing_state_store
+        self._pipeline_runs = PipelineRunRepository(engine, processing_definition)
 
     async def create_from_upload(self, user: CurrentUser, upload: UploadFile, title: str | None, location: str | None) -> tuple[DatabaseRow, PipelineRunId]:
         """Persist an uploaded file, create its recording, then enqueue the declared pipeline."""
@@ -289,14 +291,24 @@ class RecordingService:
         return dict(row)
 
     def get_pipeline_run(self, user: CurrentUser, run_id: UUID) -> dict[str, Any]:
-        if self._processing_state_store is None:
+        detail = self._pipeline_runs.detail(run_id)
+        if detail is None:
             raise RecordingNotFoundError(str(run_id))
-        state = self._processing_state_store.get_state(f"processing:{run_id}:state")
-        if state is None:
-            raise RecordingNotFoundError(str(run_id))
+        state, stages = detail
         recording_id = UUID(str(state["subject_id"]))
         self._access.require_view(recording_id, user)
-        return {"run": self._runtime_run(state), "stages": self._runtime_stages(state)}
+        live = None if self._processing_state_store is None else self._processing_state_store.get_state(f"processing:{run_id}:state")
+        if live is not None:
+            live_stages = cast(dict[str, dict[str, Any]], live.get("stages", {}))
+            for stage in stages:
+                current = live_stages.get(cast(str, stage["node_name"]))
+                if current is not None:
+                    stage.update(
+                        progress_percent=current.get("progress_percent"),
+                        progress_message=current.get("progress_message"),
+                        progress_updated_at=current.get("progress_updated_at"),
+                    )
+        return {"run": self._runtime_run(state), "stages": stages}
 
     def _runtime_pipeline_runs(self, recording: DatabaseRow) -> list[DatabaseRow]:
         if self._processing_state_store is not None:
@@ -305,6 +317,10 @@ class RecordingService:
                 state = self._processing_state_store.get_state(f"processing:{mapping['processing_id']}:state")
                 if state is not None:
                     return [self._runtime_run(state)]
+        repository = getattr(self, "_pipeline_runs", None)
+        persisted = None if repository is None else repository.latest_state(UUID(str(recording["id"])))
+        if persisted is not None:
+            return [self._runtime_run(persisted)]
         return [self._database_pipeline_run(recording)]
 
     @staticmethod
@@ -387,14 +403,12 @@ class RecordingService:
         if mapping is None or mapping.get("processing_id") is None:
             raise RecordingNotRetryableError(f"Recording {recording_id} has no processing run")
         processing_id = UUID(str(mapping["processing_id"]))
-        state = self._processing_state_store.get_state(f"processing:{processing_id}:state")
+        state = self._processing_state_store.get_state(f"processing:{processing_id}:state") or self._pipeline_runs.state(processing_id)
         if state is None:
-            raise RecordingNotRetryableError(f"Processing state for recording {recording_id} has expired")
+            raise RecordingNotRetryableError(f"Processing run for recording {recording_id} was not found")
         processing_status = str(state.get("status"))
         if processing_status not in {"failed", "partial_failed"}:
-            raise RecordingNotRetryableError(
-                f"Recording {recording_id} processing has status {processing_status!r}, not 'failed' or 'partial_failed'"
-            )
+            raise RecordingNotRetryableError(f"Recording {recording_id} processing has status {processing_status!r}, not 'failed' or 'partial_failed'")
         if (state.get("pipeline_name"), state.get("pipeline_version")) != (
             self._processing_definition.name,
             self._processing_definition.version,
@@ -403,10 +417,7 @@ class RecordingService:
         with self._engine.begin() as connection:
             row = (
                 connection.execute(
-                    text(
-                        "select status, storage_path, file_name, mime_type, content_md5 "
-                        "from recordings where id = :recording_id for update"
-                    ),
+                    text("select status, storage_path, file_name, mime_type, content_md5 from recordings where id = :recording_id for update"),
                     {"recording_id": recording_id},
                 )
                 .mappings()
@@ -432,7 +443,6 @@ class RecordingService:
                 processing_id=processing_id,
                 workspace_id=user.current_workspace_id,
             )
-        self._remember_processing(recording_id, processing_id)
         return PipelineRunId(processing_id)
 
     async def retry_embedding_indexing(self, user: CurrentUser, recording_id: UUID) -> StageRunId:
@@ -446,9 +456,9 @@ class RecordingService:
         if mapping is None or mapping.get("processing_id") is None:
             raise RecordingStageNotRetryableError("Recording has no reusable processing run")
         processing_id = UUID(str(mapping["processing_id"]))
-        state = self._processing_state_store.get_state(f"processing:{processing_id}:state")
+        state = self._processing_state_store.get_state(f"processing:{processing_id}:state") or self._pipeline_runs.state(processing_id)
         if state is None:
-            raise RecordingStageNotRetryableError("Processing state has expired; search chunks cannot be reused")
+            raise RecordingStageNotRetryableError("Processing run was not found; search chunks cannot be reused")
         stages = cast(dict[str, dict[str, Any]], state.get("stages", {}))
         chunk_stage = stages.get("build_search_chunks")
         if chunk_stage is None or chunk_stage.get("status") != "succeeded":
@@ -575,9 +585,13 @@ class RecordingService:
             if self._processing_publisher is None:
                 raise RuntimeError("Processing outbox publisher is unavailable")
             self._processing_publisher.enqueue_cancel(connection, recording_id)
-            deleted = connection.execute(
-                text("delete from recordings where id = :recording_id returning id, storage_path, processing_id"), {"recording_id": recording_id}
-            ).mappings().one_or_none()
+            deleted = (
+                connection.execute(
+                    text("delete from recordings where id = :recording_id returning id, storage_path, processing_id"), {"recording_id": recording_id}
+                )
+                .mappings()
+                .one_or_none()
+            )
         if deleted is None:
             raise RecordingNotFoundError(str(recording_id))
         self._storage.delete_file(str(deleted["storage_path"]))
@@ -686,11 +700,7 @@ class RecordingService:
 
         # Another simultaneous duplicate upload repaired the source first.  Keep that
         # canonical file and clean up this upload in the caller.
-        current = (
-            connection.execute(text("select * from recordings where processing_id = :processing_id"), {"processing_id": processing_id})
-            .mappings()
-            .one()
-        )
+        current = connection.execute(text("select * from recordings where processing_id = :processing_id"), {"processing_id": processing_id}).mappings().one()
         return dict(current), False, False
 
     def _source_audio_exists(self, storage_path: str) -> bool:

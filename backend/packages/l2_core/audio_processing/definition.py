@@ -106,7 +106,6 @@ def build_recording_processing() -> PipelineDefinition:
                 "2",
                 GPU_RETRY,
                 depends_on=("build_utterances",),
-                required=False,
                 input_artifacts=(ArtifactBinding("utterances", "utterances.final", "build_utterances"),),
                 output_artifacts=("summary.recording",),
             ),

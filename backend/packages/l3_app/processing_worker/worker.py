@@ -17,12 +17,24 @@ from l1_foundation.pipeline.registry import StageRegistry
 from l1_foundation.pipeline.runtime.artifact_store import ArtifactStore, build_input_fingerprint
 from l1_foundation.streaming import SyncRedisStreamStore
 from l1_foundation.worker import ExecutionScope, execution_scope
+from l2_core.application.pipeline_runs import PipelineRunRepository
 from l2_core.application.processing_queue import EmbeddingReindexWorkItem, ProcessingCancelWorkItem, ProcessingWorkItem
 from l2_core.audio_processing.hooks import RecordingProcessingHooks
 
 logger = logging.getLogger("audio_processing")
 TERMINAL_PROCESSING_STATUSES = frozenset({"succeeded", "partial_failed", "failed", "cancelled"})
 PROCESSING_CANCEL_POLL_SECONDS = 0.2
+
+
+class _NoopPipelineRunRepository:
+    def start(self, _state: dict[str, Any]) -> None: ...
+
+    def stage(self, _run_id: UUID, _recording_id: UUID, _node: PipelineNode, _stage: dict[str, Any], *, fingerprint: str | None = None) -> None: ...
+
+    def finish(self, _state: dict[str, Any]) -> None: ...
+
+    def state(self, _run_id: UUID) -> dict[str, Any] | None:
+        return None
 
 
 class ProcessingCancelledError(Exception):
@@ -81,6 +93,7 @@ class ProcessingCommandHandler:
         redis: SyncRedisStreamStore,
         producer: KafkaEventProducer,
         hooks: RecordingProcessingHooks,
+        run_repository: PipelineRunRepository | None = None,
     ) -> None:
         self._definition = definition
         self._registry = registry
@@ -88,6 +101,7 @@ class ProcessingCommandHandler:
         self._redis_event_store = redis
         self._kafka_producer = producer
         self._hooks = hooks
+        self._run_repository: PipelineRunRepository | _NoopPipelineRunRepository = run_repository or _NoopPipelineRunRepository()
 
     async def handle(self, event: EventEnvelope) -> None:
         if event.event_type == "processing.embedding-index.requested":
@@ -97,7 +111,7 @@ class ProcessingCommandHandler:
             return
         is_retry = event.event_type == "processing.retry.requested"
         item = ProcessingWorkItem.model_validate(event.payload)
-        existing = self._redis_event_store.get_state(processing_state_key(item.processing_id))
+        existing = self._redis_event_store.get_state(processing_state_key(item.processing_id)) or self._run_repository.state(item.processing_id)
         existing_is_same_subject = existing is not None and str(existing.get("subject_id")) == str(item.subject_id)
         retry_is_redelivery = is_retry and existing is not None and existing.get("retry_event_id") == str(event.event_id)
         if existing is not None and existing_is_same_subject and existing.get("status") in TERMINAL_PROCESSING_STATUSES and not is_retry:
@@ -113,9 +127,7 @@ class ProcessingCommandHandler:
             if retry_is_redelivery and existing.get("status") in TERMINAL_PROCESSING_STATUSES:
                 logger.info("processing：跳过已完成的重试消息 processing_id=%s event_id=%s", item.processing_id, event.event_id)
                 return
-            if existing.get("status") not in TERMINAL_PROCESSING_STATUSES and not (
-                retry_is_redelivery and existing.get("status") == "running"
-            ):
+            if existing.get("status") not in TERMINAL_PROCESSING_STATUSES and not (retry_is_redelivery and existing.get("status") == "running"):
                 raise ValueError(f"Processing retry requires a terminal run: {item.processing_id}")
         if existing is not None and not existing_is_same_subject:
             # A deterministic processing ID may be reused after an old recording is deleted.
@@ -146,6 +158,7 @@ class ProcessingCommandHandler:
             raw_retry_count = existing.get("retry_count", 0)
             previous_retry_count = raw_retry_count if isinstance(raw_retry_count, int) else 0
             state["retry_count"] = previous_retry_count if retry_is_redelivery else previous_retry_count + 1
+        self._run_repository.start(state)
         if self._is_cancel_requested(item):
             await self._complete_cancelled(event, item, state)
             return
@@ -183,6 +196,7 @@ class ProcessingCommandHandler:
                     "attempt": previous_stage.get("attempt", 0),
                     "error": str(error)[:2000],
                 }
+                self._run_repository.stage(item.processing_id, item.subject_id, node, state["stages"][node.name])
                 await self._state(event, item, state, "processing.stage.failed")
                 if node.required:
                     required_failure = str(error) or type(error).__name__
@@ -196,6 +210,7 @@ class ProcessingCommandHandler:
         else:
             state.update(status="partial_failed" if optional_failure else "succeeded", finished_at=datetime.now(UTC).isoformat())
         self._hooks.run_state_changed(item.subject_id, cast(str, state["status"]), cast(str | None, state.get("error_message")))
+        self._run_repository.finish(state)
         await self._state(event, item, state, "processing.completed")
         self._redis_event_store.finish(processing_state_key(item.processing_id), processing_stream_key(item.processing_id))
 
@@ -243,6 +258,7 @@ class ProcessingCommandHandler:
             )
             state.update(status="partial_failed" if remaining_failures else "succeeded", finished_at=datetime.now(UTC).isoformat())
         self._hooks.run_state_changed(request.subject_id, cast(str, state["status"]), cast(str | None, state.get("error_message")))
+        self._run_repository.finish(state)
         await self._state(event, item, state, "processing.completed")
         self._redis_event_store.finish(processing_state_key(request.processing_id), processing_stream_key(request.processing_id))
 
@@ -265,6 +281,7 @@ class ProcessingCommandHandler:
             retry_attempt += 1
             attempt = attempt_offset + retry_attempt
             state["stages"][node.name] = {"status": "running", "attempt": attempt}
+            self._run_repository.stage(item.processing_id, item.subject_id, node, state["stages"][node.name])
             await self._state(event, item, state, "processing.stage.started")
             try:
                 payload: dict[str, Any] = dict(node.input_payload or {})
@@ -335,6 +352,7 @@ class ProcessingCommandHandler:
                     "reused": reused,
                     "artifacts": [artifact.model_dump(mode="json") for artifact in written],
                 }
+                self._run_repository.stage(item.processing_id, item.subject_id, node, state["stages"][node.name], fingerprint=input_fingerprint)
                 await self._state(event, item, state, "processing.stage.succeeded")
                 return reused
             except ProcessingCancelledError:
@@ -373,6 +391,10 @@ class ProcessingCommandHandler:
             state["stages"][active_node] = stage
         state.update(status="cancelled", error_message=None, finished_at=datetime.now(UTC).isoformat())
         self._hooks.run_state_changed(item.subject_id, "cancelled", None)
+        if active_node is not None:
+            node = next(candidate for candidate in self._definition.nodes if candidate.name == active_node)
+            self._run_repository.stage(item.processing_id, item.subject_id, node, state["stages"][active_node])
+        self._run_repository.finish(state)
         await self._state(command, item, state, "processing.completed")
         self._redis_event_store.finish(processing_state_key(item.processing_id), processing_stream_key(item.processing_id))
 

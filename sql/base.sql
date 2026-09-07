@@ -178,6 +178,45 @@ create index if not exists recordings_created_at_idx on recordings (created_at d
 create index if not exists recordings_content_md5_idx on recordings (workspace_id, owner_user_id, content_md5);
 create index if not exists recordings_location_trgm_idx on recordings using gin (location gin_trgm_ops);
 
+-- Durable processing facts. Redis holds only the short-lived live-progress overlay.
+create table if not exists pipeline_runs (
+    id uuid primary key,
+    recording_id uuid not null references recordings(id) on delete cascade,
+    pipeline_name text not null,
+    pipeline_version text not null,
+    status text not null check (status in ('queued', 'running', 'succeeded', 'partial_failed', 'failed', 'cancelled')),
+    error_message text,
+    retry_count integer not null default 0 check (retry_count >= 0),
+    started_at timestamptz,
+    finished_at timestamptz,
+    created_at timestamptz not null default now(),
+    updated_at timestamptz not null default now()
+);
+create index if not exists pipeline_runs_recording_created_idx on pipeline_runs (recording_id, created_at desc);
+
+create table if not exists pipeline_stage_runs (
+    id uuid primary key,
+    pipeline_run_id uuid not null references pipeline_runs(id) on delete cascade,
+    recording_id uuid not null references recordings(id) on delete cascade,
+    node_name text not null,
+    stage_name text not null,
+    stage_version text not null,
+    required boolean not null,
+    status text not null check (status in ('pending', 'running', 'succeeded', 'failed', 'cancelled')),
+    attempt_count integer not null default 0 check (attempt_count >= 0),
+    max_attempts integer,
+    reused boolean not null default false,
+    input_fingerprint text,
+    artifacts jsonb not null default '[]'::jsonb,
+    error_message text,
+    started_at timestamptz,
+    finished_at timestamptz,
+    created_at timestamptz not null default now(),
+    updated_at timestamptz not null default now(),
+    unique (pipeline_run_id, node_name)
+);
+create index if not exists pipeline_stage_runs_run_idx on pipeline_stage_runs (pipeline_run_id, created_at, node_name);
+
 -- Transactional outbox shared by business domains that atomically enqueue Kafka commands.
 create table if not exists integration_outbox (
     event_id uuid primary key,

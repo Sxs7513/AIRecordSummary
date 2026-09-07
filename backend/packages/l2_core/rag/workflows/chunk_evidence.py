@@ -11,6 +11,7 @@ from l1_foundation.observability import finish_invocation, finish_span, start_in
 from l1_foundation.observability.context import current_span
 from l2_core.rag.contracts import Evidence, RagGraphState, RagStateUpdate, ResolvedFilters, RetrievalCandidateRow
 from l2_core.rag.execution_middleware import rag_execution_middleware
+from l2_core.rag.normalization import expand_spoken_digit_variants
 from l2_core.rag.observability import elapsed_ms, log_event, started_at
 from l2_core.rag.retrieval import RagRetriever
 
@@ -195,24 +196,42 @@ class ChunkEvidencePipeline:
 
         async def lexical_search(variant_query: str) -> list[RetrievalCandidateRow]:
             operation_started = started_at()
-            try:
-                rows = await asyncio.to_thread(self._retriever.retrieve_lexical_candidates, variant_query, filters)
-            except Exception as error:
+            query_variants = expand_spoken_digit_variants(variant_query)
+            raw_results = await asyncio.gather(
+                *(asyncio.to_thread(self._retriever.retrieve_lexical_candidates, query_variant, filters) for query_variant in query_variants),
+                return_exceptions=True,
+            )
+            errors = [result for result in raw_results if isinstance(result, BaseException)]
+            successful_results = [(index, result) for index, result in enumerate(raw_results) if isinstance(result, list)]
+            if not successful_results:
+                error = errors[0] if errors else RuntimeError("Lexical retrieval produced no result")
                 self._operation_completed(
                     "retrieve",
                     "retrieve.lexical.term",
                     [],
                     operation_started,
                     status="failed",
-                    details={"query_variant": "term", "query": variant_query, "error_type": type(error).__name__},
+                    details={
+                        "query_variant": "term",
+                        "query": variant_query,
+                        "query_variants": query_variants,
+                        "error_type": type(error).__name__,
+                    },
                 )
-                raise
+                raise error
+            rows = _merge_lexical_variant_results(successful_results)
             self._operation_completed(
                 "retrieve",
                 "retrieve.lexical.term",
                 rows,
                 operation_started,
-                details={"query_variant": "term", "query": variant_query},
+                status="degraded" if errors else "succeeded",
+                details={
+                    "query_variant": "term",
+                    "query": variant_query,
+                    "query_variants": query_variants,
+                    "failed_variant_count": len(errors),
+                },
             )
             return rows
 
@@ -522,6 +541,31 @@ def _candidate_refs(rows: list[RetrievalCandidateRow]) -> list[dict[str, object]
         }
         for row in rows
     ]
+
+
+def _merge_lexical_variant_results(
+    results: list[tuple[int, list[RetrievalCandidateRow]]],
+) -> list[RetrievalCandidateRow]:
+    """Merge aliases for one logical keyword without creating extra RRF lanes."""
+
+    best_by_chunk: dict[str, tuple[tuple[int, float, int, int], RetrievalCandidateRow]] = {}
+    for variant_index, rows in results:
+        variant_weight = 1.0 if variant_index == 0 else 0.95
+        for rank, row in enumerate(rows, start=1):
+            adjusted = row.copy()
+            adjusted["score"] = float(row["score"]) * variant_weight
+            quality = (
+                1 if row.get("exact_match") is True else 0,
+                float(adjusted["score"]),
+                -variant_index,
+                -rank,
+            )
+            chunk_id = str(row["chunk_id"])
+            previous = best_by_chunk.get(chunk_id)
+            if previous is None or quality > previous[0]:
+                best_by_chunk[chunk_id] = (quality, adjusted)
+    ordered = sorted(best_by_chunk.values(), key=lambda item: item[0], reverse=True)
+    return [row for _quality, row in ordered]
 
 
 def _retain_protected_lexical_candidates(

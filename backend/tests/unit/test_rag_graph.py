@@ -397,7 +397,55 @@ def test_extracted_terms_are_each_sent_to_lexical_retrieval() -> None:
         )
     )
 
-    assert lexical_queries == ["项目答辩", "路演"]
+    assert sorted(lexical_queries) == ["路演", "项目答辩"]
+
+
+def test_numeric_keyword_variants_share_one_lexical_rrf_lane() -> None:
+    recording_id = uuid4()
+    chunk_id = uuid4()
+    searched_queries: list[str] = []
+    fused_lexical_lists: list[list[dict[str, object]]] = []
+
+    class NumericHybridRetriever:
+        hybrid_search_enabled = True
+
+        def generate_query_embeddings(self, queries: list[str]) -> list[list[float]]:
+            return [[0.1] for _query in queries]
+
+        def retrieve_vector_candidates(self, _embedding: list[float], _filters: ResolvedFilters) -> list[dict[str, object]]:
+            return []
+
+        def retrieve_lexical_candidates(self, query: str, _filters: ResolvedFilters) -> list[dict[str, object]]:
+            searched_queries.append(query)
+            if query == "幺零幺七":
+                return [{"chunk_id": chunk_id, "recording_id": recording_id, "score": 1.0, "exact_match": True}]
+            return []
+
+        def fuse_candidate_lists(
+            self,
+            _vector_lists: list[list[dict[str, object]]],
+            lexical_lists: list[list[dict[str, object]]],
+            _limit: int,
+        ) -> list[dict[str, object]]:
+            fused_lexical_lists.extend(lexical_lists)
+            return list(lexical_lists[0])
+
+    graph = _graph(NumericHybridRetriever(), FakeModel())
+    candidates = asyncio.run(
+        graph._retrieve_candidates(  # pyright: ignore[reportPrivateUsage]
+            "1017会议室在哪",
+            ResolvedFilters(recording_scope_resolved=True, recording_ids=[recording_id]),
+            10,
+            str(uuid4()),
+            lexical_queries=["1017"],
+            protected_lexical_queries=["1017"],
+        )
+    )
+
+    assert set(searched_queries) == {"1017", "一零一七", "幺零幺七", "幺零一七", "一零幺七"}
+    assert len(fused_lexical_lists) == 1
+    assert [row["chunk_id"] for row in fused_lexical_lists[0]] == [chunk_id]
+    assert candidates[0]["protected_lexical_terms"] == ["1017"]
 
 
 def test_vector_queries_are_embedded_in_one_worker_batch() -> None:

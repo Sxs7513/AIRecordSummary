@@ -10,6 +10,7 @@ from l1_foundation.pipeline.runtime.artifact_store import ArtifactStore
 from l1_foundation.settings import get_settings
 from l1_foundation.streaming import RedisStreamStore, SyncRedisStreamStore
 from l1_foundation.worker import KafkaWorkerClient, SyncKafkaWorkerClient
+from l2_core.application.pipeline_runs import PipelineRunRepository
 from l2_core.audio_processing.definition import build_recording_processing
 from l2_core.audio_processing.hooks import RecordingProcessingHooks
 from l2_core.audio_processing.registry import build_recording_stage_registry, build_recording_summary_stage
@@ -58,7 +59,15 @@ async def run() -> None:
         engine=engine,
     )
     definition = build_recording_processing()
-    handler = ProcessingCommandHandler(definition, registry, artifact_store, redis, producer, RecordingProcessingHooks(engine))
+    handler = ProcessingCommandHandler(
+        definition,
+        registry,
+        artifact_store,
+        redis,
+        producer,
+        RecordingProcessingHooks(engine),
+        PipelineRunRepository(engine, definition),
+    )
     consumer = KafkaEventConsumer(
         [Topics.PROCESSING_COMMANDS, Topics.PROCESSING_RETRY],
         bootstrap_servers=settings.kafka_bootstrap_servers,

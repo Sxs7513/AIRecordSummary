@@ -12,7 +12,7 @@ from sqlalchemy import Engine
 from l1_foundation.settings import Settings
 from l1_foundation.worker import SyncWorkerClient
 from l2_core.rag.contracts import ResolvedFilters
-from l2_core.rag.normalization import normalize_search_text
+from l2_core.rag.normalization import expand_spoken_digit_variants, normalize_search_text
 from l2_core.rag.retrieval import RagRetriever
 
 
@@ -299,6 +299,25 @@ def test_chunk_context_expansion_loads_all_candidates_in_one_batch_query() -> No
 
 def test_normalize_search_text_applies_nfkc_case_and_whitespace_rules() -> None:
     assert normalize_search_text("  ＡＰＩ：版本１２３，\n 发布！  ") == "api 版本123 发布"
+
+
+def test_spoken_digit_variants_include_standard_yao_and_mixed_readings() -> None:
+    assert expand_spoken_digit_variants("会议室１０１７") == [
+        "会议室1017",
+        "会议室一零一七",
+        "会议室幺零幺七",
+        "会议室幺零一七",
+        "会议室一零幺七",
+    ]
+
+
+def test_spoken_digit_variants_are_bounded_and_leave_text_keywords_unchanged() -> None:
+    assert expand_spoken_digit_variants("项目答辩") == ["项目答辩"]
+    variants = expand_spoken_digit_variants("111111", max_variants=4)
+    assert variants[0] == "111111"
+    assert "一一一一一一" in variants
+    assert "幺幺幺幺幺幺" in variants
+    assert len(variants) == 4
 
 
 def test_recording_scope_is_resolved_with_one_recording_query() -> None:
