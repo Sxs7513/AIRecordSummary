@@ -100,16 +100,11 @@ class AsrInferenceBatchHandler:
 class AlignmentInferenceBatchHandler:
     def __init__(self, settings: Settings, file_store: FileStore) -> None:
         self._file_store = file_store
-        self._aligner = QwenForcedAlignmentEngine(
-            QwenForcedAlignmentConfig(settings.transcript_alignment_model, settings.resolved_huggingface_hub_cache_dir)
-        )
+        self._aligner = QwenForcedAlignmentEngine(QwenForcedAlignmentConfig(settings.transcript_alignment_model, settings.resolved_huggingface_hub_cache_dir))
 
     def __call__(self, value: AlignmentInferenceBatchInput, context: WorkerExecutionContext) -> AlignmentInferenceBatchResult:
         results = self._aligner.infer_batch(
-            [
-                QwenForcedAlignmentRequest(item.item_id, self._resolve(item.audio_storage_path), item.text, item.language)
-                for item in value.items
-            ],
+            [QwenForcedAlignmentRequest(item.item_id, self._resolve(item.audio_storage_path), item.text, item.language) for item in value.items],
             _progress(context),
             context.raise_if_cancelled,
         )
@@ -118,10 +113,7 @@ class AlignmentInferenceBatchHandler:
             items=[
                 AlignmentInferenceItemResult(
                     item_id=result.item_id,
-                    tokens=[
-                        AlignmentTokenResult(text=token.text, start_time=token.start_time, end_time=token.end_time)
-                        for token in result.tokens
-                    ],
+                    tokens=[AlignmentTokenResult(text=token.text, start_time=token.start_time, end_time=token.end_time) for token in result.tokens],
                 )
                 for result in results
             ],
@@ -136,6 +128,7 @@ class AlignmentInferenceBatchHandler:
 
 class EmbeddingEncodeHandler:
     def __init__(self, settings: Settings, artifact_store: ArtifactStore) -> None:
+        self._embedding_profile = settings.embedding_profile
         self._model_name = settings.embedding_model
         self._dimensions = settings.embedding_dimensions
         self._batch_size = settings.embedding_inference_batch_size
@@ -144,9 +137,12 @@ class EmbeddingEncodeHandler:
             settings.embedding_model,
             settings.resolved_embedding_model_cache_dir,
             settings.embedding_dimensions,
+            settings.embedding_profile,
         )
 
     def __call__(self, value: EmbeddingEncodeTaskInput, context: WorkerExecutionContext) -> EmbeddingEncodeTaskResult:
+        if value.embedding_profile != self._embedding_profile:
+            raise ValueError(f"Embedding profile mismatch: requested={value.embedding_profile}, worker_active={self._embedding_profile}")
         context.report_progress(0.05, "加载 Embedding 模型")
         vectors: list[list[float]] = []
         total = len(value.texts)
@@ -160,8 +156,10 @@ class EmbeddingEncodeHandler:
         context.report_progress(1, "Embedding 编码完成")
         return EmbeddingEncodeTaskResult(
             provider="sentence_transformers",
+            embedding_profile=self._embedding_profile,
             model_name=self._model_name,
             dimensions=self._dimensions,
+            distance_metric="cosine",
             vectors=vectors,
         )
 

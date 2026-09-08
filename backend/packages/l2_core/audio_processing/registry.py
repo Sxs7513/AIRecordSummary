@@ -128,6 +128,7 @@ def build_recording_stage_registry(
             settings.embedding_model,
             settings.resolved_embedding_model_cache_dir,
             settings.embedding_dimensions,
+            settings.embedding_profile,
             worker_client=async_worker_client,
         )
     )
@@ -166,6 +167,7 @@ def build_summary_embedding_indexer(settings: Settings, worker_client: SyncWorke
         worker_client,
         EmbeddingTokenCounter(settings.embedding_model, settings.resolved_embedding_model_cache_dir),
         settings.embedding_dimensions,
+        settings.embedding_profile,
         settings.recording_summary_embedding_max_tokens,
     )
 

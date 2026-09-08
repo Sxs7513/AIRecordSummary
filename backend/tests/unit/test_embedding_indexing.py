@@ -67,13 +67,21 @@ def test_embedding_indexing_adds_topic_to_model_input_without_changing_chunk_tex
     class FakeWorkerClient:
         async def execute(self, command: Any, *, result_type: type[EmbeddingEncodeTaskResult], **_kwargs: object) -> EmbeddingEncodeTaskResult:
             embedded_texts.extend(command.input.texts)
-            return result_type(provider="sentence_transformers", model_name="test/model", dimensions=2, vectors=[[0.1, 0.2] for _ in command.input.texts])
+            return result_type(
+                provider="sentence_transformers",
+                embedding_profile="test-profile",
+                model_name="test/model",
+                dimensions=2,
+                distance_metric="cosine",
+                vectors=[[0.1, 0.2] for _ in command.input.texts],
+            )
 
     stage = EmbeddingIndexingStage(
         storage,
         "test/model",
         tmp_path,
         dimensions=2,
+        embedding_profile="test-profile",
         worker_client=cast(WorkerClient, FakeWorkerClient()),
     )
 
@@ -94,7 +102,7 @@ def test_embedding_indexing_adds_topic_to_model_input_without_changing_chunk_tex
 
 
 def test_embedding_device_prefers_cuda_then_mps(monkeypatch: Any, tmp_path: Path) -> None:
-    stage = EmbeddingIndexingStage(ArtifactStore(tmp_path), "test/model", tmp_path, dimensions=2)
+    stage = EmbeddingIndexingStage(ArtifactStore(tmp_path), "test/model", tmp_path, dimensions=2, embedding_profile="test-profile")
 
     class FakeTorch:
         class cuda:
@@ -117,7 +125,7 @@ def test_embedding_device_prefers_cuda_then_mps(monkeypatch: Any, tmp_path: Path
 
 
 def test_embedding_device_uses_mps_when_cuda_is_unavailable(monkeypatch: Any, tmp_path: Path) -> None:
-    stage = EmbeddingIndexingStage(ArtifactStore(tmp_path), "test/model", tmp_path, dimensions=2)
+    stage = EmbeddingIndexingStage(ArtifactStore(tmp_path), "test/model", tmp_path, dimensions=2, embedding_profile="test-profile")
 
     class FakeTorch:
         class cuda:

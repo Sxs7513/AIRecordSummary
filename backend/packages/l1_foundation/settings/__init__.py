@@ -8,6 +8,7 @@ from urllib.parse import quote
 from pydantic import AliasChoices, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from l1_foundation.embedding_profiles import get_embedding_profile
 from l1_foundation.model_ref import OnlineModelRef
 
 
@@ -155,8 +156,7 @@ class Settings(BaseSettings):
         le=10,
         validation_alias="RAG_RECORDING_PROFILE_SCOPED_CHUNK_LIMIT",
     )
-    embedding_model: str = Field(default="Qwen/Qwen3-Embedding-4B", validation_alias="EMBEDDING_MODEL")
-    embedding_dimensions: int = Field(default=2560, gt=0, validation_alias="EMBEDDING_DIMENSIONS")
+    embedding_profile: str = Field(default="qwen3-4b", validation_alias="EMBEDDING_PROFILE")
     embedding_inference_batch_size: int = Field(default=8, gt=0, le=64, validation_alias="EMBEDDING_INFERENCE_BATCH_SIZE")
     embedding_model_cache_dir: Path = Field(default=Path("model-cache/embedding"), validation_alias="EMBEDDING_MODEL_CACHE_DIR")
     recording_summary_provider: LlmProviderName = Field(
@@ -196,6 +196,21 @@ class Settings(BaseSettings):
     rag_plan_local_input_tokens: int = Field(default=4_000, gt=0, validation_alias="RAG_PLAN_LOCAL_INPUT_TOKENS")
     rag_run_max_total_tokens: int = Field(default=50_000, gt=0, validation_alias="RAG_RUN_MAX_TOTAL_TOKENS")
     rag_evaluation_stale_run_seconds: float = Field(default=120.0, ge=30, validation_alias="RAG_EVALUATION_STALE_RUN_SECONDS")
+    rag_answer_judge_model: str = Field(
+        default="gemini-gemini-3.5-flash-lite",
+        min_length=1,
+        validation_alias="RAG_ANSWER_JUDGE_MODEL",
+    )
+    rag_answer_judge_prompt_version: str = Field(
+        default="answer_judge_v5",
+        min_length=1,
+        validation_alias="RAG_ANSWER_JUDGE_PROMPT_VERSION",
+    )
+    rag_answer_judge_max_output_tokens: int = Field(
+        default=4_096,
+        gt=0,
+        validation_alias="RAG_ANSWER_JUDGE_MAX_OUTPUT_TOKENS",
+    )
     rag_rerank_enabled: bool = Field(default=True, validation_alias="RAG_RERANK_ENABLED")
     rag_rerank_model: str = Field(default="Qwen/Qwen3-Reranker-0.6B", validation_alias="RAG_RERANK_MODEL")
     rag_rerank_model_cache_dir: Path = Field(default=Path("model-cache/rerank"), validation_alias="RAG_RERANK_MODEL_CACHE_DIR")
@@ -319,7 +334,9 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_hybrid_retrieval_settings(self) -> Self:
+        get_embedding_profile(self.embedding_profile)
         OnlineModelRef.parse(self.rag_online_default_model)
+        OnlineModelRef.parse(self.rag_answer_judge_model)
         OnlineModelRef.parse(self.rag_asr_adjudication_audit_model)
         OnlineModelRef.parse(self.rag_asr_adjudication_construct_model)
         OnlineModelRef.parse(self.rag_asr_adjudication_decision_model)
@@ -330,6 +347,14 @@ class Settings(BaseSettings):
         if self.rag_rerank_output_limit > self.rag_rerank_candidate_limit:
             raise ValueError("RAG rerank output limit cannot exceed its candidate limit")
         return self
+
+    @property
+    def embedding_model(self) -> str:
+        return get_embedding_profile(self.embedding_profile).model_name
+
+    @property
+    def embedding_dimensions(self) -> int:
+        return get_embedding_profile(self.embedding_profile).dimensions
 
     def _database_url_for(self, database: str) -> str:
         if self.database_url is not None and database == self.db_name:

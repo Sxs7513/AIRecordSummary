@@ -30,6 +30,7 @@ class FakeResult:
 class FakeConnection:
     def __init__(self, embedding_model_id: UUID) -> None:
         self.embedding_model_id = embedding_model_id
+        self.chunk_id = uuid4()
         self.executions: list[tuple[str, Mapping[str, object]]] = []
 
     def execute(self, statement: object, parameters: Mapping[str, object]) -> FakeResult:
@@ -37,6 +38,8 @@ class FakeConnection:
         self.executions.append((sql, parameters))
         if "insert into embedding_models" in sql:
             return FakeResult(scalar=self.embedding_model_id)
+        if "insert into recording_search_chunks" in sql:
+            return FakeResult(scalar=self.chunk_id)
         return FakeResult()
 
 
@@ -72,6 +75,7 @@ def test_embedding_projection_replaces_chunks_idempotently() -> None:
     service = RecordingProjectionService(engine)
     output = EmbeddingIndexingOutput(
         provider="sentence_transformers",
+        embedding_profile="qwen3-4b",
         model_name="Qwen/Qwen3-Embedding-4B",
         dimensions=3,
         chunks=[
@@ -96,11 +100,14 @@ def test_embedding_projection_replaces_chunks_idempotently() -> None:
     service.project(recording_id, "embedding_indexing", output)
     service.project(recording_id, "embedding_indexing", output)
 
-    deletes = [parameters for sql, parameters in connection.executions if "delete from recording_search_chunks" in sql]
+    deletes = [parameters for sql, parameters in connection.executions if "delete from recording_search_chunks where" in sql]
     inserts = [parameters for sql, parameters in connection.executions if "insert into recording_search_chunks" in sql]
-    assert deletes == [{"recording_id": recording_id}, {"recording_id": recording_id}]
+    vector_inserts = [parameters for sql, parameters in connection.executions if "insert into recording_search_chunk_embeddings" in sql]
+    assert deletes == [
+        {"recording_id": recording_id, "chunk_indexes": [0]},
+        {"recording_id": recording_id, "chunk_indexes": [0]},
+    ]
     assert len(inserts) == 2
-    assert inserts[0]["embedding_model_id"] == embedding_model_id
     assert inserts[0]["original_text"] == "嗯，原始  ASR。\n内容！"
     assert inserts[0]["normalized_original_text"] == "嗯 原始 asr 内容"
     assert inserts[0]["normalized_text"] == "主题 公司营收 标准术语 营收 收入 语义上下文 询问公司目前达到的营收规模 正文 speaker a 测试内容"
@@ -108,4 +115,7 @@ def test_embedding_projection_replaces_chunks_idempotently() -> None:
     assert metadata["topic"] == "公司营收"
     assert metadata["terms"] == ["营收", "收入"]
     assert metadata["search_context"] == "询问公司目前达到的营收规模"
-    assert inserts[0]["embedding"] == "[0.1,0.2,0.3]"
+    assert len(vector_inserts) == 2
+    assert vector_inserts[0]["embedding_model_id"] == embedding_model_id
+    assert vector_inserts[0]["model_key"] == "qwen3-4b"
+    assert vector_inserts[0]["embedding"] == "[0.1,0.2,0.3]"
