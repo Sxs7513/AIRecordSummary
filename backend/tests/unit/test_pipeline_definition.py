@@ -14,7 +14,7 @@ from l2_core.audio_processing.stages.noop import NoopStage
 def test_recording_processing_uses_diarization_segments_for_qwen_asr() -> None:
     nodes = {node.name: node for node in recording_processing.nodes}
 
-    assert recording_processing.version == "26"
+    assert recording_processing.version == "27"
     assert nodes["diarize_pyannote"].depends_on == ("normalize_audio",)
     assert nodes["diarize_pyannote"].stage_version == "2"
     assert nodes["preprocess_asr_audio"].depends_on == ("normalize_audio",)
@@ -36,10 +36,11 @@ def test_recording_processing_indexes_and_summarizes_in_parallel() -> None:
     nodes = {node.name: node for node in recording_processing.nodes}
 
     assert nodes["embedding_indexing"].depends_on == ("build_search_chunks",)
-    assert nodes["embedding_indexing"].stage_version == "8"
+    assert nodes["embedding_indexing"].stage_version == "9"
     assert nodes["generate_summary"].depends_on == ("build_utterances",)
     assert nodes["generate_summary"].stage_version == "2"
     assert nodes["summary_embedding_indexing"].depends_on == ("generate_summary",)
+    assert nodes["summary_embedding_indexing"].stage_version == "2"
     assert nodes["summary_embedding_indexing"].input_artifacts[0].artifact_type == "summary.recording"
     assert nodes["summary_embedding_indexing"].required is False
     assert nodes["build_search_chunks"].output_artifacts == ("search.chunks",)

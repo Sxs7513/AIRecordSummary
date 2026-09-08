@@ -24,11 +24,13 @@ class SummaryEmbeddingIndexer:
         worker_client: SyncWorkerClient,
         token_counter: EmbeddingTokenCounter,
         dimensions: int,
+        embedding_profile: str,
         max_tokens: int = 512,
     ) -> None:
         self._worker_client = worker_client
         self._token_counter = token_counter
         self._dimensions = dimensions
+        self._embedding_profile = embedding_profile
         self._max_tokens = max_tokens
 
     def encode(self, summary_text: str, recording_title: str = "") -> SummaryEmbeddingIndexingOutput:
@@ -39,19 +41,23 @@ class SummaryEmbeddingIndexer:
             max_tokens=self._max_tokens,
         )
         result = self._worker_client.execute(
-            embedding_encode_command([retrieval_text]),
+            embedding_encode_command([retrieval_text], self._embedding_profile),
             result_type=EmbeddingEncodeTaskResult,
         )
         if result.dimensions != self._dimensions:
             raise ValueError(f"Summary embedding dimensions do not match configured {self._dimensions}")
         if result.provider != "sentence_transformers":
             raise ValueError("Summary embedding worker returned an unexpected provider")
+        if result.embedding_profile != self._embedding_profile or result.distance_metric != "cosine":
+            raise ValueError("Summary embedding worker returned an unexpected profile")
         if len(result.vectors) != 1 or len(result.vectors[0]) != self._dimensions:
             raise ValueError("Summary embedding worker returned an invalid vector")
         return SummaryEmbeddingIndexingOutput(
             provider="sentence_transformers",
+            embedding_profile=self._embedding_profile,
             model_name=result.model_name,
             dimensions=result.dimensions,
+            distance_metric="cosine",
             retrieval_text=retrieval_text,
             content_hash=hashlib.sha256(retrieval_text.encode("utf-8")).hexdigest(),
             embedding=result.vectors[0],
@@ -60,7 +66,7 @@ class SummaryEmbeddingIndexer:
 
 class SummaryEmbeddingIndexingStage:
     name = "summary_embedding_indexing"
-    version = "1"
+    version = "2"
     retry_policy = RetryPolicy(initial_backoff_seconds=30)
     input_model = SummaryEmbeddingIndexingInput
 

@@ -40,105 +40,12 @@ def _arguments() -> argparse.Namespace:
 
 
 def _ensure_schema(engine: Engine) -> None:
-    with engine.begin() as connection:
-        connection.execute(
-            text(
-                """
-                do $$
-                begin
-                    if to_regclass('public.recording_retrieval_documents') is null
-                       and to_regclass('public.recording_summary_embeddings') is not null then
-                        alter table recording_summary_embeddings rename to recording_retrieval_documents;
-                    end if;
-                    if to_regclass('public.recording_summary_embeddings_recording_id_idx') is not null
-                       and to_regclass('public.recording_retrieval_documents_recording_id_idx') is null then
-                        alter index recording_summary_embeddings_recording_id_idx
-                            rename to recording_retrieval_documents_recording_id_idx;
-                    end if;
-                    if to_regclass('public.recording_summary_embeddings_hnsw_idx') is not null
-                       and to_regclass('public.recording_retrieval_documents_hnsw_idx') is null then
-                        alter index recording_summary_embeddings_hnsw_idx
-                            rename to recording_retrieval_documents_hnsw_idx;
-                    end if;
-                end
-                $$
-                """
-            )
-        )
-        connection.execute(
-            text(
-                """
-                create table if not exists recording_retrieval_documents (
-                    id uuid primary key default gen_random_uuid(),
-                    recording_id uuid not null references recordings(id) on delete cascade,
-                    embedding_model_id uuid not null references embedding_models(id) on delete restrict,
-                    document_index integer not null default 0 check (document_index >= 0),
-                    document_type text not null default 'profile' check (document_type in ('profile', 'overview', 'outline')),
-                    retrieval_text text not null,
-                    content_hash text not null,
-                    embedding halfvec(2560) not null,
-                    created_at timestamptz not null default now(),
-                    updated_at timestamptz not null default now(),
-                    unique (recording_id, embedding_model_id, document_index)
-                )
-                """
-            )
-        )
-        connection.execute(
-            text(
-                "alter table recording_retrieval_documents "
-                "drop constraint if exists recording_summary_embeddings_recording_id_fkey"
-            )
-        )
-        connection.execute(
-            text(
-                "alter table recording_retrieval_documents "
-                "drop constraint if exists recording_retrieval_documents_recording_id_fkey"
-            )
-        )
-        connection.execute(
-            text(
-                "alter table recording_retrieval_documents "
-                "add constraint recording_retrieval_documents_recording_id_fkey "
-                "foreign key (recording_id) references recordings(id) on delete cascade"
-            )
-        )
-        connection.execute(
-            text(
-                "alter table recording_retrieval_documents "
-                "drop constraint if exists recording_summary_embeddings_document_type_check"
-            )
-        )
-        connection.execute(
-            text(
-                "alter table recording_retrieval_documents "
-                "drop constraint if exists recording_retrieval_documents_document_type_check"
-            )
-        )
-        connection.execute(text("update recording_retrieval_documents set document_type = 'profile' where document_type <> 'profile'"))
-        connection.execute(
-            text(
-                "alter table recording_retrieval_documents "
-                "add constraint recording_retrieval_documents_document_type_check "
-                "check (document_type in ('profile', 'overview', 'outline'))"
-            )
-        )
-        connection.execute(
-            text(
-                """
-                create index if not exists recording_retrieval_documents_recording_id_idx
-                on recording_retrieval_documents (recording_id)
-                """
-            )
-        )
-        connection.execute(
-            text(
-                """
-                create index if not exists recording_retrieval_documents_hnsw_idx
-                on recording_retrieval_documents using hnsw (embedding halfvec_cosine_ops)
-                """
-            )
-        )
+    with engine.connect() as connection:
+        tables = connection.execute(
+            text("select to_regclass('public.recording_retrieval_documents'), to_regclass('public.recording_retrieval_document_embeddings')")
+        ).one()
+    if any(value is None for value in tables):
+        raise RuntimeError("Embedding tables are missing; run scripts/db/init-python-backend.sh first")
 
 
 def _load_documents(
@@ -154,6 +61,7 @@ def _load_documents(
     clauses = ["btrim(summaries.summary_text) <> ''"]
     values: dict[str, object] = {
         "provider": _PROVIDER,
+        "model_key": settings.embedding_profile,
         "model_name": settings.embedding_model,
         "dimensions": settings.embedding_dimensions,
     }
@@ -173,13 +81,15 @@ def _load_documents(
                     from recording_summaries summaries
                     join recordings on recordings.id = summaries.recording_id
                     left join (
-                        select embeddings.recording_id, embeddings.content_hash
-                        from recording_retrieval_documents embeddings
-                        join embedding_models models on models.id = embeddings.embedding_model_id
+                        select documents.recording_id, vectors.content_hash
+                        from recording_retrieval_documents documents
+                        join recording_retrieval_document_embeddings vectors on vectors.document_id = documents.id
+                        join embedding_models models on models.id = vectors.embedding_model_id
                         where models.provider = :provider
                           and models.model_name = :model_name
                           and models.dimensions = :dimensions
-                          and embeddings.document_index = 0
+                          and vectors.model_key = :model_key
+                          and documents.document_index = 0
                     ) existing on existing.recording_id = summaries.recording_id
                     where {" and ".join(clauses)}
                     order by summaries.updated_at, summaries.recording_id
@@ -220,8 +130,6 @@ def _persist_batch(engine: Engine, result: EmbeddingEncodeTaskResult, documents:
         raise ValueError(f"Embedding result count mismatch: expected {len(documents)}, got {len(result.vectors)}")
     if any(len(vector) != result.dimensions for vector in result.vectors):
         raise ValueError("Embedding vector dimensions do not match result metadata")
-    if result.dimensions != 2560:
-        raise ValueError(f"recording_retrieval_documents expects 2560 dimensions, got {result.dimensions}")
     with engine.begin() as connection:
         model_id = UUID(
             str(
@@ -229,40 +137,72 @@ def _persist_batch(engine: Engine, result: EmbeddingEncodeTaskResult, documents:
                     text(
                         """
                         insert into embedding_models (provider, model_name, dimensions, distance_metric, is_active)
-                        values (:provider, :model_name, :dimensions, 'cosine', true)
+                        values (:provider, :model_name, :dimensions, :distance_metric, true)
                         on conflict (provider, model_name, dimensions) do update set
                             distance_metric = excluded.distance_metric,
                             is_active = true
                         returning id
                         """
                     ),
-                    {"provider": result.provider, "model_name": result.model_name, "dimensions": result.dimensions},
+                    {
+                        "provider": result.provider,
+                        "model_name": result.model_name,
+                        "dimensions": result.dimensions,
+                        "distance_metric": result.distance_metric,
+                    },
                 ).scalar_one()
             )
         )
         for document, vector in zip(documents, result.vectors, strict=True):
-            connection.execute(
-                text(
-                    """
+            document_id = UUID(
+                str(
+                    connection.execute(
+                        text(
+                            """
                     insert into recording_retrieval_documents (
-                        recording_id, embedding_model_id, document_index, document_type,
-                        retrieval_text, content_hash, embedding
+                        recording_id, document_index, document_type, retrieval_text, content_hash
                     ) values (
-                        :recording_id, :embedding_model_id, 0, 'profile',
-                        :retrieval_text, :content_hash, cast(:embedding as halfvec)
+                        :recording_id, 0, 'profile', :retrieval_text, :content_hash
                     )
-                    on conflict (recording_id, embedding_model_id, document_index) do update set
+                    on conflict (recording_id, document_index) do update set
                         document_type = excluded.document_type,
                         retrieval_text = excluded.retrieval_text,
                         content_hash = excluded.content_hash,
-                        embedding = excluded.embedding,
                         updated_at = now()
+                    returning id
+                    """
+                        ),
+                        {
+                            "recording_id": document.recording_id,
+                            "retrieval_text": document.retrieval_text,
+                            "content_hash": document.content_hash,
+                        },
+                    ).scalar_one()
+                )
+            )
+            connection.execute(
+                text("delete from recording_retrieval_document_embeddings where document_id = :document_id and content_hash <> :content_hash"),
+                {"document_id": document_id, "content_hash": document.content_hash},
+            )
+            connection.execute(
+                text(
+                    """
+                    insert into recording_retrieval_document_embeddings (
+                        document_id, embedding_model_id, model_key, dimensions, content_hash, embedding
+                    ) values (
+                        :document_id, :embedding_model_id, :model_key, :dimensions, :content_hash,
+                        cast(:embedding as halfvec)
+                    )
+                    on conflict (document_id, embedding_model_id) do update set
+                        model_key = excluded.model_key, dimensions = excluded.dimensions,
+                        content_hash = excluded.content_hash, embedding = excluded.embedding, updated_at = now()
                     """
                 ),
                 {
-                    "recording_id": document.recording_id,
+                    "document_id": document_id,
                     "embedding_model_id": model_id,
-                    "retrieval_text": document.retrieval_text,
+                    "model_key": result.embedding_profile,
+                    "dimensions": result.dimensions,
                     "content_hash": document.content_hash,
                     "embedding": _vector_literal(vector),
                 },
@@ -322,7 +262,7 @@ def run(args: argparse.Namespace, settings: Settings) -> int:
         batches = _batches(documents, args.batch_size)
         for batch_index, batch in enumerate(batches, start=1):
             result = worker.execute(
-                embedding_encode_command([document.retrieval_text for document in batch]),
+                embedding_encode_command([document.retrieval_text for document in batch], settings.embedding_profile),
                 result_type=EmbeddingEncodeTaskResult,
             )
             _persist_batch(engine, result, batch)

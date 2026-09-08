@@ -16,8 +16,10 @@ def test_summary_embedding_indexer_builds_one_bounded_retrieval_document() -> No
             embedded_texts.extend(command.input.texts)
             return result_type(
                 provider="sentence_transformers",
+                embedding_profile="test-profile",
                 model_name="test/model",
                 dimensions=2,
+                distance_metric="cosine",
                 vectors=[[0.1, 0.2]],
             )
 
@@ -28,6 +30,7 @@ def test_summary_embedding_indexer_builds_one_bounded_retrieval_document() -> No
         cast(SyncWorkerClient, FakeWorkerClient()),
         cast(EmbeddingTokenCounter, count_characters),
         dimensions=2,
+        embedding_profile="test-profile",
         max_tokens=120,
     )
     output = indexer.encode(

@@ -17,18 +17,29 @@ from l1_foundation.model_ref import OnlineModelRef
 from l1_foundation.observability import InstrumentedModelClient
 from l1_foundation.settings import Settings
 from l1_foundation.worker import ComputeCommand, ExecutionScope, SyncWorkerClient, WorkerClient, execution_scope
-from l2_core.rag.contracts import Evidence, EvidenceGrade
+from l2_core.rag.contracts import Evidence, EvidenceGrade, EvidenceSource
 from l2_core.rag.graph import RagGraph
 from l2_core.rag.hooks import RagNodeCompleted, RagOperationCompleted
 from l2_core.rag.retrieval import RagRetriever
 from l2_core.rag_adjudication_evaluation.runner import RagAdjudicationEvaluationRunner
+from l2_core.rag_evaluation.answer_annotations import AnswerAnnotation, AnswerVerdict, answerability_matches
+from l2_core.rag_evaluation.answer_evaluator import AnswerEvaluationResult, AnswerEvaluator
+from l2_core.rag_evaluation.answer_metrics import answer_case_metrics
 from l2_core.rag_evaluation.contracts import EvidenceAnchor, RankedItem, RetrievalMetrics
+from l2_core.rag_evaluation.diagnosis import (
+    DIAGNOSTIC_VERSION,
+    OperationMatches,
+    build_evidence_journeys,
+    summarize_journeys,
+)
 from l2_core.rag_evaluation.evidence_matcher import match_ranked_item
 from l2_core.rag_evaluation.metrics import mean_metrics, percentile, retrieval_metrics
 
 logger = logging.getLogger("evaluation")
 MAX_SAVED_CANDIDATES = 50
 FINAL_METRICS_KEY = "__final__"
+RETRIEVAL_METRIC_VERSION = "2"
+ANSWER_METRIC_VERSION = "4"
 
 
 class EvaluationTraceHook:
@@ -69,6 +80,22 @@ class _AsyncSyncWorkerClient:
             command,
             result_type=result_type,
             on_progress=on_progress,
+        )
+
+    async def execute_streaming[InputT: BaseModel, ResultT: BaseModel](
+        self,
+        command: ComputeCommand[InputT],
+        *,
+        result_type: type[ResultT],
+        on_progress: Callable[[float, str | None], None] | None = None,
+        on_delta: Callable[[str], None] | None = None,
+    ) -> ResultT:
+        return await asyncio.to_thread(
+            self._client.execute_streaming,
+            command,
+            result_type=result_type,
+            on_progress=on_progress,
+            on_delta=on_delta,
         )
 
 
@@ -271,7 +298,8 @@ class RagEvaluationWorker:
         retriever = RagRetriever(self._engine, settings, self._worker_client)
         metrics_by_operation: dict[str, list[RetrievalMetrics]] = defaultdict(list)
         case_latencies: list[int] = []
-        grade_passes: list[float] = []
+        grade_answerability_results: list[float] = []
+        answer_metrics_by_name: dict[str, list[float]] = defaultdict(list)
         completed = failed = 0
 
         async with self._model_worker_client(settings) as model_worker:
@@ -286,6 +314,12 @@ class RagEvaluationWorker:
                 node_model_profile=settings.rag_node_model_profile,
                 query_term_expansion_enabled=settings.rag_query_term_expansion_enabled,
             )
+            answer_evaluator = AnswerEvaluator(
+                InstrumentedModelClient(cast(WorkerClient, model_worker)),
+                OnlineModelRef.parse(settings.rag_answer_judge_model),
+                context_size=settings.rag_context_size,
+                max_output_tokens=settings.rag_answer_judge_max_output_tokens,
+            )
             try:
                 for case in cases:
                     if self._cancel_requested(run_id):
@@ -296,24 +330,46 @@ class RagEvaluationWorker:
                     result_id = self._start_case(run_id, case_id, str(case["query"]))
                     try:
                         evidence = self._load_evidence(case_id)
+                        annotation = AnswerAnnotation.model_validate(case["answer_annotation"])
                         scope_ids = self._scope_recording_ids(cast(Mapping[str, object], case["scope"]), workspace_recording_ids)
                         hook = EvaluationTraceHook()
-                        state = await graph.run_retrieval(
+                        answer, sources, not_enough_evidence, message, confirmation = await graph.run(
                             query=str(case["query"]),
                             limit=settings.rag_fused_candidate_limit,
                             scope_recording_ids=scope_ids,
+                            on_phase=lambda _name, _label, _progress: None,
+                            on_delta=lambda _delta: None,
                             run_id=result_id,
                             hook=hook,
                         )
-                        state = await graph.grade_retrieval(state, hook=hook)
-                        grade = state.get("grade")
-                        if grade is None:
-                            raise RuntimeError("RAG evaluation completed without an evidence grade")
-                        grade_passed = grade.verdict != "abstain"
-                        operations = hook.operations or [self._empty_terminal_operation(hook, state.get("route_error"))]
+                        if confirmation is not None:
+                            raise RuntimeError("RAG answer evaluation must not enter adjudication confirmation")
+                        route_node = next((item for item in hook.nodes if item.node == "route"), None)
+                        route_error = str(route_node.metadata.get("reason") or "") if route_node is not None else ""
+                        grade_node = next((item for item in reversed(hook.nodes) if item.node == "grade_corrected"), None)
+                        if grade_node is None:
+                            grade_node = next((item for item in reversed(hook.nodes) if item.node == "grade"), None)
+                        if grade_node is None:
+                            grade_node = next((item for item in reversed(hook.nodes) if item.node == "grade_original"), None)
+                        raw_verdict = grade_node.metadata.get("verdict") if grade_node is not None else None
+                        actual_verdict = "abstain" if not_enough_evidence else _answer_verdict(raw_verdict or "direct_answer")
+                        grade = EvidenceGrade(
+                            verdict=actual_verdict,
+                            reason=str(grade_node.metadata.get("reason") or "") if grade_node is not None else (message or route_error),
+                        )
+                        grade_answerability_correct = answerability_matches(annotation.expected_verdict, actual_verdict)
+                        operations = hook.operations or [self._empty_terminal_operation(hook, route_error or None)]
                         final_metric: RetrievalMetrics | None = None
+                        diagnostic_operations: list[OperationMatches] = []
                         for sequence, operation in enumerate(operations):
                             items = _operation_items(operation)
+                            diagnostic_operations.append(
+                                OperationMatches(
+                                    operation=operation.operation,
+                                    status="failed" if operation.status == "failed" else "succeeded",
+                                    matches=[match_ranked_item(item, evidence) for item in items],
+                                )
+                            )
                             metric = self._save_ranked_step(
                                 result_id,
                                 sequence,
@@ -329,30 +385,130 @@ class RagEvaluationWorker:
                             final_metric = metric
                         if final_metric is not None:
                             metrics_by_operation[FINAL_METRICS_KEY].append(final_metric)
-                        grade_node = next((item for item in reversed(hook.nodes) if item.node == "grade"), None)
+                        evidence_journeys = build_evidence_journeys(evidence, diagnostic_operations)
+                        evidence_diagnosis = summarize_journeys(evidence_journeys)
+                        self._save_evidence_diagnosis(result_id, case_id, evidence_journeys)
                         self._save_grade_step(
                             result_id,
                             len(operations),
                             grade,
-                            grade_passed,
+                            grade_answerability_correct,
                             round(grade_node.elapsed_ms) if grade_node is not None else 0,
+                            expected_verdict=annotation.expected_verdict,
                         )
+
+                        answer_sequence = len(operations) + 1
+                        answer_node = next((item for item in reversed(hook.nodes) if item.node == "answer"), None)
+                        self._save_answer_step(
+                            result_id,
+                            answer_sequence,
+                            answer,
+                            sources,
+                            actual_verdict,
+                            round(answer_node.elapsed_ms) if answer_node is not None else 0,
+                        )
+                        if annotation.expected_verdict == "abstain" and actual_verdict == "abstain":
+                            answer_evaluation = AnswerEvaluationResult(
+                                answerability_correct=True,
+                                key_point_results=[],
+                                claim_results=[],
+                            )
+                            judge_latency = 0
+                            judge_skipped = True
+                        else:
+                            judge_started = perf_counter()
+                            try:
+                                answer_evaluation = await answer_evaluator.evaluate(
+                                    query=str(case["query"]),
+                                    annotation=annotation,
+                                    actual_verdict=actual_verdict,
+                                    generated_answer=answer,
+                                    cited_evidence=self._load_cited_evidence(sources),
+                                    gold_evidence=[
+                                        {
+                                            "id": str(item.id),
+                                            "recording_id": str(item.recording_id),
+                                            "quote": item.quote,
+                                            "start_ms": item.start_ms,
+                                            "end_ms": item.end_ms,
+                                        }
+                                        for item in evidence
+                                    ],
+                                )
+                            except Exception as judge_error:
+                                judge_latency = _elapsed_ms(judge_started)
+                                logger.exception(
+                                    "RAG 评测：Answer Judge 失败 run_id=%s case_id=%s",
+                                    run_id,
+                                    case_id,
+                                )
+                                self._save_answer_evaluation_failure_step(
+                                    result_id,
+                                    answer_sequence + 1,
+                                    judge_latency,
+                                    judge_model=settings.rag_answer_judge_model,
+                                    prompt_version=settings.rag_answer_judge_prompt_version,
+                                    error=judge_error,
+                                )
+                                answer_metrics_by_name["answer_evaluation_failure"].append(1.0)
+                                latency = _elapsed_ms(started)
+                                case_latencies.append(latency)
+                                self._finish_case(
+                                    result_id,
+                                    latency,
+                                    succeeded=True,
+                                    details={
+                                        "route_strategy": route_node.metadata.get("strategy_id") if route_node is not None else None,
+                                        "route_error": route_error or None,
+                                        "expected_verdict": annotation.expected_verdict,
+                                        "actual_verdict": actual_verdict,
+                                        "not_enough_evidence": not_enough_evidence,
+                                        "grade_answerability_correct": grade_answerability_correct,
+                                        "answer_evaluation_status": "failed",
+                                        "answer_evaluation_error": str(judge_error)[-2_000:],
+                                        "evidence_diagnosis": evidence_diagnosis,
+                                    },
+                                )
+                                grade_answerability_results.append(float(grade_answerability_correct))
+                                completed += 1
+                                self._update_progress(run_id, completed, failed)
+                                continue
+                            judge_latency = _elapsed_ms(judge_started)
+                            judge_skipped = False
+                        case_answer_metrics = answer_case_metrics(annotation, actual_verdict, answer_evaluation)
+                        self._save_answer_evaluation_step(
+                            result_id,
+                            answer_sequence + 1,
+                            answer_evaluation,
+                            case_answer_metrics,
+                            judge_latency,
+                            judge_model=settings.rag_answer_judge_model,
+                            prompt_version=settings.rag_answer_judge_prompt_version,
+                            judge_skipped=judge_skipped,
+                        )
+                        for metric_name, metric_value in case_answer_metrics.items():
+                            answer_metrics_by_name[metric_name].append(metric_value)
+                        answer_metrics_by_name["answer_evaluation_failure"].append(0.0)
 
                         latency = _elapsed_ms(started)
                         case_latencies.append(latency)
-                        route = state.get("route")
                         self._finish_case(
                             result_id,
                             latency,
                             succeeded=True,
                             details={
-                                "route_strategy": route.strategy_id if route is not None else None,
-                                "route_error": state.get("route_error"),
-                                "grade_verdict": grade.verdict,
-                                "grade_passed": grade_passed,
+                                "route_strategy": route_node.metadata.get("strategy_id") if route_node is not None else None,
+                                "route_error": route_error or None,
+                                "expected_verdict": annotation.expected_verdict,
+                                "actual_verdict": actual_verdict,
+                                "not_enough_evidence": not_enough_evidence,
+                                "grade_verdict": actual_verdict,
+                                "grade_answerability_correct": grade_answerability_correct,
+                                "answer_evaluation_status": "skipped" if judge_skipped else "succeeded",
+                                "evidence_diagnosis": evidence_diagnosis,
                             },
                         )
-                        grade_passes.append(float(grade_passed))
+                        grade_answerability_results.append(float(grade_answerability_correct))
                         completed += 1
                     except Exception as error:
                         logger.exception("RAG 评测：Case 失败 run_id=%s case_id=%s", run_id, case_id)
@@ -362,7 +518,13 @@ class RagEvaluationWorker:
             finally:
                 await asyncio.to_thread(retriever.release)
 
-        self._save_run_metrics(run_id, metrics_by_operation, case_latencies, grade_passes)
+        self._save_run_metrics(
+            run_id,
+            metrics_by_operation,
+            case_latencies,
+            grade_answerability_results,
+            answer_metrics_by_name,
+        )
         with self._engine.begin() as connection:
             status = "failed" if failed and not completed else "succeeded"
             connection.execute(
@@ -437,6 +599,20 @@ class RagEvaluationWorker:
                 ).scalar_one(),
             )
             for rank, (item, match) in enumerate(zip(items[:MAX_SAVED_CANDIDATES], matches, strict=False), start=1):
+                matched_evidences: list[dict[str, object]] = [
+                    {
+                        "evidence_id": covered.evidence_id,
+                        "relevance": covered.relevance,
+                        "match_kind": covered.kind,
+                    }
+                    for covered in match.all_matches()
+                ]
+                ranked_result_details: dict[str, object] = {
+                    "text": item.text,
+                    "start_ms": item.start_ms,
+                    "end_ms": item.end_ms,
+                    "matched_evidences": matched_evidences,
+                }
                 connection.execute(
                     text(
                         """
@@ -465,7 +641,7 @@ class RagEvaluationWorker:
                         "evidence_id": match.evidence_id,
                         "relevance": match.relevance,
                         "match_kind": match.kind,
-                        "details": _json({"text": item.text, "start_ms": item.start_ms, "end_ms": item.end_ms}),
+                        "details": _json(ranked_result_details),
                     },
                 )
             for name, value in metrics.as_dict().items():
@@ -477,7 +653,7 @@ class RagEvaluationWorker:
                             operation, metric_name, metric_version, value, sample_count
                         )
                         select results.evaluation_run_id, results.evaluation_case_id, :step_id,
-                               'step', :operation, :metric_name, '1', :value, 1
+                               'step', :operation, :metric_name, :metric_version, :value, 1
                         from rag_evaluation_case_results results where results.id = :case_result_id
                         """
                     ),
@@ -486,6 +662,7 @@ class RagEvaluationWorker:
                         "case_result_id": case_result_id,
                         "operation": operation,
                         "metric_name": name,
+                        "metric_version": RETRIEVAL_METRIC_VERSION,
                         "value": value,
                     },
                 )
@@ -496,8 +673,10 @@ class RagEvaluationWorker:
         run_id: UUID,
         metrics_by_operation: Mapping[str, Sequence[RetrievalMetrics]],
         case_latencies: Sequence[int],
-        grade_passes: Sequence[float],
+        grade_answerability_results: Sequence[float],
+        answer_metrics_by_name: Mapping[str, Sequence[float]],
     ) -> None:
+        grade_metric_details: dict[str, object] = {"expected": "answerable_vs_abstain"}
         with self._engine.begin() as connection:
             for operation, values in metrics_by_operation.items():
                 if operation == FINAL_METRICS_KEY:
@@ -509,13 +688,14 @@ class RagEvaluationWorker:
                             insert into rag_evaluation_metric_values (
                                 evaluation_run_id, scope, operation, metric_name,
                                 metric_version, value, sample_count
-                            ) values (:run_id, 'operation', :operation, :name, '1', :value, :sample_count)
+                            ) values (:run_id, 'operation', :operation, :name, :metric_version, :value, :sample_count)
                             """
                         ),
                         {
                             "run_id": run_id,
                             "operation": operation,
                             "name": name,
+                            "metric_version": RETRIEVAL_METRIC_VERSION,
                             "value": value,
                             "sample_count": len(values),
                         },
@@ -529,13 +709,14 @@ class RagEvaluationWorker:
                         insert into rag_evaluation_metric_values (
                             evaluation_run_id, scope, scope_key, operation, metric_name,
                             metric_version, value, sample_count
-                        ) values (:run_id, 'run', 'final', :operation, :name, '1', :value, :sample_count)
+                        ) values (:run_id, 'run', 'final', :operation, :name, :metric_version, :value, :sample_count)
                         """
                     ),
                     {
                         "run_id": run_id,
                         "operation": final_operation,
                         "name": name,
+                        "metric_version": RETRIEVAL_METRIC_VERSION,
                         "value": value,
                         "sample_count": len(final_values),
                     },
@@ -547,16 +728,16 @@ class RagEvaluationWorker:
                         evaluation_run_id, scope, scope_key, operation, metric_name,
                         metric_version, value, sample_count, details
                     ) values (
-                        :run_id, 'run', 'final', 'grade.evidence', 'grade_pass_rate',
+                        :run_id, 'run', 'final', 'grade.evidence', 'grade_answerability_accuracy',
                         '1', :value, :sample_count, cast(:details as jsonb)
                     )
                     """
                 ),
                 {
                     "run_id": run_id,
-                    "value": sum(grade_passes) / len(grade_passes) if grade_passes else 0.0,
-                    "sample_count": len(grade_passes),
-                    "details": _json({"expected": "non_abstain"}),
+                    "value": (sum(grade_answerability_results) / len(grade_answerability_results) if grade_answerability_results else 0.0),
+                    "sample_count": len(grade_answerability_results),
+                    "details": _json(grade_metric_details),
                 },
             )
             for name, value in {
@@ -574,16 +755,49 @@ class RagEvaluationWorker:
                     ),
                     {"run_id": run_id, "name": name, "value": value, "sample_count": len(case_latencies)},
                 )
+            for name, values in answer_metrics_by_name.items():
+                if not values:
+                    continue
+                connection.execute(
+                    text(
+                        """
+                        insert into rag_evaluation_metric_values (
+                            evaluation_run_id, scope, scope_key, operation, metric_name,
+                            metric_version, value, sample_count
+                        ) values (
+                            :run_id, 'run', 'final', 'evaluate.answer', :name,
+                            :metric_version, :value, :sample_count
+                        )
+                        """
+                    ),
+                    {
+                        "run_id": run_id,
+                        "name": name,
+                        "metric_version": ANSWER_METRIC_VERSION,
+                        "value": sum(values) / len(values),
+                        "sample_count": len(values),
+                    },
+                )
 
     def _save_grade_step(
         self,
         case_result_id: UUID,
         sequence: int,
         grade: EvidenceGrade,
-        passed: bool,
+        answerability_correct: bool,
         latency_ms: int,
+        *,
+        expected_verdict: AnswerVerdict,
     ) -> None:
         operation = "grade.evidence"
+        grade_step_details: dict[str, object] = {
+            "expected": expected_verdict,
+            "answerability_correct": answerability_correct,
+        }
+        grade_step_metric_details: dict[str, object] = {
+            "expected": expected_verdict,
+            "verdict": grade.verdict,
+        }
         with self._engine.begin() as connection:
             step_id = cast(
                 UUID,
@@ -606,7 +820,7 @@ class RagEvaluationWorker:
                         "sequence": sequence,
                         "latency_ms": latency_ms,
                         "output": _json({"verdict": grade.verdict, "reason": grade.reason}),
-                        "details": _json({"expected": "non_abstain", "passed": passed}),
+                        "details": _json(grade_step_details),
                     },
                 ).scalar_one(),
             )
@@ -618,7 +832,7 @@ class RagEvaluationWorker:
                         operation, metric_name, metric_version, value, sample_count, details
                     )
                     select results.evaluation_run_id, results.evaluation_case_id, :step_id,
-                           'step', :operation, 'grade_pass', '1', :value, 1, cast(:details as jsonb)
+                           'step', :operation, 'grade_answerability_correct', '1', :value, 1, cast(:details as jsonb)
                     from rag_evaluation_case_results results where results.id = :case_result_id
                     """
                 ),
@@ -626,10 +840,183 @@ class RagEvaluationWorker:
                     "step_id": step_id,
                     "case_result_id": case_result_id,
                     "operation": operation,
-                    "value": float(passed),
-                    "details": _json({"expected": "non_abstain", "verdict": grade.verdict}),
+                    "value": float(answerability_correct),
+                    "details": _json(grade_step_metric_details),
                 },
             )
+
+    def _save_answer_step(
+        self,
+        case_result_id: UUID,
+        sequence: int,
+        answer: str,
+        sources: Sequence[EvidenceSource],
+        actual_verdict: AnswerVerdict,
+        latency_ms: int,
+    ) -> None:
+        with self._engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    insert into rag_evaluation_step_results (
+                        case_result_id, operation, operation_version, sequence, attempt,
+                        output_kind, status, latency_ms, output, details
+                    ) values (
+                        :case_result_id, 'answer.generate', '1', :sequence, 0,
+                        'answer', 'succeeded', :latency_ms,
+                        cast(:output as jsonb), cast(:details as jsonb)
+                    )
+                    """
+                ),
+                {
+                    "case_result_id": case_result_id,
+                    "sequence": sequence,
+                    "latency_ms": latency_ms,
+                    "output": _json({"answer": answer, "sources": [dict(source) for source in sources]}),
+                    "details": _json({"actual_verdict": actual_verdict}),
+                },
+            )
+
+    def _save_answer_evaluation_step(
+        self,
+        case_result_id: UUID,
+        sequence: int,
+        evaluation: AnswerEvaluationResult,
+        metrics: Mapping[str, float],
+        latency_ms: int,
+        *,
+        judge_model: str,
+        prompt_version: str,
+        judge_skipped: bool,
+    ) -> None:
+        with self._engine.begin() as connection:
+            step_id = cast(
+                UUID,
+                connection.execute(
+                    text(
+                        """
+                        insert into rag_evaluation_step_results (
+                            case_result_id, operation, operation_version, sequence, attempt,
+                            output_kind, status, latency_ms, output, details
+                        ) values (
+                            :case_result_id, 'evaluate.answer', :operation_version, :sequence, 0,
+                            'answer_evaluation', 'succeeded', :latency_ms,
+                            cast(:output as jsonb), cast(:details as jsonb)
+                        ) returning id
+                        """
+                    ),
+                    {
+                        "case_result_id": case_result_id,
+                        "operation_version": prompt_version,
+                        "sequence": sequence,
+                        "latency_ms": latency_ms,
+                        "output": _json(evaluation.model_dump(mode="json")),
+                        "details": _json(
+                            {
+                                "judge_model": judge_model,
+                                "judge_skipped": judge_skipped,
+                            }
+                        ),
+                    },
+                ).scalar_one(),
+            )
+            for name, value in metrics.items():
+                connection.execute(
+                    text(
+                        """
+                        insert into rag_evaluation_metric_values (
+                            evaluation_run_id, evaluation_case_id, step_result_id, scope,
+                            operation, metric_name, metric_version, value, sample_count
+                        )
+                        select results.evaluation_run_id, results.evaluation_case_id, :step_id,
+                               'step', 'evaluate.answer', :metric_name, :metric_version, :value, 1
+                        from rag_evaluation_case_results results where results.id = :case_result_id
+                        """
+                    ),
+                    {
+                        "step_id": step_id,
+                        "case_result_id": case_result_id,
+                        "metric_name": name,
+                        "metric_version": ANSWER_METRIC_VERSION,
+                        "value": value,
+                    },
+                )
+
+    def _save_answer_evaluation_failure_step(
+        self,
+        case_result_id: UUID,
+        sequence: int,
+        latency_ms: int,
+        *,
+        judge_model: str,
+        prompt_version: str,
+        error: Exception,
+    ) -> None:
+        with self._engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    insert into rag_evaluation_step_results (
+                        case_result_id, operation, operation_version, sequence, attempt,
+                        output_kind, status, latency_ms, output, details, error_message
+                    ) values (
+                        :case_result_id, 'evaluate.answer', :operation_version, :sequence, 0,
+                        'answer_evaluation', 'failed', :latency_ms, '{}'::jsonb,
+                        cast(:details as jsonb), :error
+                    )
+                    """
+                ),
+                {
+                    "case_result_id": case_result_id,
+                    "operation_version": prompt_version,
+                    "sequence": sequence,
+                    "latency_ms": latency_ms,
+                    "details": _json({"judge_model": judge_model, "judge_skipped": False}),
+                    "error": str(error)[-2_000:],
+                },
+            )
+
+    def _save_evidence_diagnosis(
+        self,
+        case_result_id: UUID,
+        evaluation_case_id: UUID,
+        journeys: Sequence[Mapping[str, object]],
+    ) -> None:
+        with self._engine.begin() as connection:
+            for journey in journeys:
+                connection.execute(
+                    text(
+                        """
+                        insert into rag_evaluation_evidence_diagnostics (
+                            evaluation_run_id, case_result_id, evaluation_case_id, evidence_id,
+                            diagnostic_version, final_covered, last_visible_node,
+                            first_loss_node, stage_journey
+                        )
+                        select results.evaluation_run_id, :case_result_id, :evaluation_case_id,
+                               :evidence_id, :diagnostic_version, :final_covered,
+                               :last_visible_node, :first_loss_node, cast(:stage_journey as jsonb)
+                        from rag_evaluation_case_results results
+                        where results.id = :case_result_id
+                        on conflict (case_result_id, evidence_id, diagnostic_version)
+                        do update set
+                            final_covered = excluded.final_covered,
+                            last_visible_node = excluded.last_visible_node,
+                            first_loss_node = excluded.first_loss_node,
+                            stage_journey = excluded.stage_journey,
+                            created_at = now()
+                        """
+                    ),
+                    {
+                        "case_result_id": case_result_id,
+                        "evaluation_case_id": evaluation_case_id,
+                        "evidence_id": journey["evidence_id"],
+                        "diagnostic_version": DIAGNOSTIC_VERSION,
+                        "final_covered": bool(journey["final_covered"]),
+                        "last_visible_node": journey.get("last_visible_node"),
+                        "first_loss_node": journey.get("first_loss_node"),
+                        "stage_journey": _json(journey["stages"]),
+                    },
+                )
 
     def _load_evidence(self, case_id: UUID) -> list[EvidenceAnchor]:
         with self._engine.connect() as connection:
@@ -650,6 +1037,48 @@ class RagEvaluationWorker:
                 ).mappings()
             ]
 
+    def _load_cited_evidence(self, sources: Sequence[EvidenceSource]) -> list[dict[str, object]]:
+        if not sources:
+            return []
+        result: list[dict[str, object]] = []
+        with self._engine.connect() as connection:
+            for source in sources:
+                recording = source["recording"]
+                chunk = source["chunk"]
+                rows = connection.execute(
+                    text(
+                        """
+                        select coalesce(profiles.display_name, mappings.display_name, utterances.speaker_label) as speaker_label,
+                               utterances.text, utterances.start_ms, utterances.end_ms
+                        from utterance_segments utterances
+                        left join recording_speaker_mappings mappings
+                          on mappings.recording_id = utterances.recording_id
+                         and mappings.speaker_cluster_id = utterances.speaker_cluster_id
+                        left join speaker_profiles profiles on profiles.id = mappings.speaker_profile_id
+                        where utterances.recording_id = :recording_id
+                          and utterances.start_ms < :end_ms and utterances.end_ms > :start_ms
+                        order by utterances.utterance_index
+                        """
+                    ),
+                    {
+                        "recording_id": UUID(recording["id"]),
+                        "start_ms": chunk["startMs"],
+                        "end_ms": chunk["endMs"],
+                    },
+                ).mappings()
+                evidence_text = "\n".join(f"{row['speaker_label'] or 'Unknown Speaker'}: {row['text']}" for row in rows)
+                result.append(
+                    {
+                        "index": source["index"],
+                        "recording_id": recording["id"],
+                        "chunk_id": chunk["id"],
+                        "start_ms": chunk["startMs"],
+                        "end_ms": chunk["endMs"],
+                        "text": evidence_text,
+                    }
+                )
+        return result
+
     def _start_case(self, run_id: UUID, case_id: UUID, query: str) -> UUID:
         with self._engine.begin() as connection:
             existing_id = connection.execute(
@@ -663,6 +1092,10 @@ class RagEvaluationWorker:
                 {"run_id": run_id, "case_id": case_id},
             ).scalar_one_or_none()
             if existing_id is not None:
+                connection.execute(
+                    text("delete from rag_evaluation_evidence_diagnostics where case_result_id = :result_id"),
+                    {"result_id": existing_id},
+                )
                 connection.execute(
                     text("delete from rag_evaluation_step_results where case_result_id = :result_id"),
                     {"result_id": existing_id},
@@ -761,11 +1194,11 @@ class RagEvaluationWorker:
     def _settings_for_run(self, config: Mapping[str, object]) -> Settings:
         embedding = cast(Mapping[str, object], config.get("embedding") or {})
         rerank = cast(Mapping[str, object], config.get("rerank") or {})
+        answer_judge = cast(Mapping[str, object], config.get("answer_judge") or {})
         legacy_vector_weight = _float_setting(config, "vector_weight", self._settings.rag_original_vector_weight)
         return self._settings.model_copy(
             update={
-                "embedding_model": str(embedding.get("model", self._settings.embedding_model)),
-                "embedding_dimensions": _int_setting(embedding, "dimensions", self._settings.embedding_dimensions),
+                "embedding_profile": str(embedding.get("profile", self._settings.embedding_profile)),
                 "rag_hybrid_search_enabled": bool(config.get("hybrid_enabled", True)),
                 "rag_online_default_model": str(config.get("online_default_model", self._settings.rag_online_default_model)),
                 "rag_query_term_expansion_enabled": bool(config.get("query_term_expansion_enabled", self._settings.rag_query_term_expansion_enabled)),
@@ -790,6 +1223,13 @@ class RagEvaluationWorker:
                 "rag_rerank_candidate_limit": _int_setting(rerank, "candidate_limit", self._settings.rag_rerank_candidate_limit),
                 "rag_rerank_output_limit": _int_setting(rerank, "output_limit", self._settings.rag_rerank_output_limit),
                 "rag_rerank_max_total_tokens": _int_setting(rerank, "max_total_tokens", self._settings.rag_rerank_max_total_tokens),
+                "rag_answer_judge_model": str(answer_judge.get("model", self._settings.rag_answer_judge_model)),
+                "rag_answer_judge_prompt_version": str(answer_judge.get("prompt_version", self._settings.rag_answer_judge_prompt_version)),
+                "rag_answer_judge_max_output_tokens": _int_setting(
+                    answer_judge,
+                    "max_output_tokens",
+                    self._settings.rag_answer_judge_max_output_tokens,
+                ),
             }
         )
 
@@ -853,3 +1293,9 @@ def _int_setting(values: Mapping[str, object], key: str, default: int) -> int:
 def _float_setting(values: Mapping[str, object], key: str, default: float) -> float:
     value = values.get(key)
     return float(value) if isinstance(value, (int, float, str)) else default
+
+
+def _answer_verdict(value: object) -> AnswerVerdict:
+    if value in ("direct_answer", "qualified_answer", "abstain"):
+        return value
+    raise ValueError(f"Unsupported answer verdict: {value!r}")

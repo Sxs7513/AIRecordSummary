@@ -8,6 +8,7 @@ from uuid import UUID
 
 from sqlalchemy import Engine, text
 
+from l1_foundation.embedding_profiles import get_embedding_profile
 from l1_foundation.settings import Settings
 from l1_foundation.worker import SyncWorkerClient
 from l2_core.audio_processing.worker_tasks import EmbeddingEncodeTaskResult, embedding_encode_command
@@ -95,6 +96,7 @@ class RagRetriever:
         self._engine = engine
         self._settings = settings
         self._worker_client = worker_client
+        self._embedding_profile = get_embedding_profile(str(getattr(settings, "embedding_profile", "qwen3-4b")))
 
     @property
     def recording_profile_search_enabled(self) -> bool:
@@ -230,9 +232,20 @@ class RagRetriever:
     def generate_query_embeddings(self, topics: Sequence[str]) -> list[list[float]]:
         if not topics:
             return []
-        result = self._worker_client.execute(embedding_encode_command(topics), result_type=EmbeddingEncodeTaskResult)
+        result = self._worker_client.execute(
+            embedding_encode_command(topics, self._embedding_profile.key),
+            result_type=EmbeddingEncodeTaskResult,
+        )
         if len(result.vectors) != len(topics):
             raise RuntimeError("Embedding Worker returned an invalid query vector count")
+        if (
+            result.embedding_profile != self._embedding_profile.key
+            or result.provider != self._embedding_profile.provider
+            or result.model_name != self._embedding_profile.model_name
+            or result.dimensions != self._embedding_profile.dimensions
+            or result.distance_metric != self._embedding_profile.distance_metric
+        ):
+            raise RuntimeError("Embedding Worker returned a profile that does not match the Retriever")
         return result.vectors
 
     def retrieve_vector_candidates(
@@ -244,9 +257,6 @@ class RagRetriever:
         vector = "[" + ",".join(f"{item:.8g}" for item in embedding) + "]"
         values: dict[str, object] = {
             "embedding": vector,
-            "embedding_provider": "sentence_transformers",
-            "embedding_model": self._settings.embedding_model,
-            "embedding_dimensions": self._settings.embedding_dimensions,
             "limit": limit or self._settings.rag_vector_candidate_limit,
         }
         clauses = ["recordings.status = 'completed'"]
@@ -257,7 +267,16 @@ class RagRetriever:
                 "embedding_models.dimensions = :embedding_dimensions",
             )
         )
+        values.update(
+            {
+                "embedding_provider": self._embedding_profile.provider,
+                "embedding_model": self._embedding_profile.model_name,
+                "embedding_dimensions": self._embedding_profile.dimensions,
+            }
+        )
         self._append_chunk_filters(clauses, values, filters)
+        dimensions = self._embedding_profile.dimensions
+        model_key = self._embedding_profile.key
         with self._engine.connect() as connection:
             self._set_statement_timeout(connection)
             return [
@@ -271,12 +290,14 @@ class RagRetriever:
                            chunks.metadata,
                            recordings.title, recordings.file_name,
                            recordings.location, recordings.duration_seconds, recordings.created_at,
-                           1 - (chunks.embedding <=> cast(:embedding as halfvec)) as score
+                           1 - (vectors.embedding::halfvec({dimensions}) <=> cast(:embedding as halfvec({dimensions}))) as score
                     from recording_search_chunks chunks
                     join recordings on recordings.id = chunks.recording_id
-                    join embedding_models on embedding_models.id = chunks.embedding_model_id
+                    join recording_search_chunk_embeddings vectors on vectors.chunk_id = chunks.id
+                    join embedding_models on embedding_models.id = vectors.embedding_model_id
                     where {" and ".join(clauses)}
-                    order by chunks.embedding <=> cast(:embedding as halfvec)
+                      and vectors.model_key = '{model_key}'
+                    order by vectors.embedding::halfvec({dimensions}) <=> cast(:embedding as halfvec({dimensions}))
                     limit :limit
                     """
                         ),
@@ -297,9 +318,9 @@ class RagRetriever:
         vector = self._vector_literal(embedding)
         values: dict[str, object] = {
             "embedding": vector,
-            "embedding_provider": "sentence_transformers",
-            "embedding_model": self._settings.embedding_model,
-            "embedding_dimensions": self._settings.embedding_dimensions,
+            "embedding_provider": self._embedding_profile.provider,
+            "embedding_model": self._embedding_profile.model_name,
+            "embedding_dimensions": self._embedding_profile.dimensions,
             "min_score": self._settings.rag_recording_profile_min_score,
             "limit": self._settings.rag_recording_profile_candidate_limit,
         }
@@ -308,9 +329,11 @@ class RagRetriever:
             "embedding_models.provider = :embedding_provider",
             "embedding_models.model_name = :embedding_model",
             "embedding_models.dimensions = :embedding_dimensions",
-            "1 - (profile_documents.embedding <=> cast(:embedding as halfvec)) >= :min_score",
         ]
         self._append_recording_filters(clauses, values, filters)
+        dimensions = self._embedding_profile.dimensions
+        model_key = self._embedding_profile.key
+        clauses.append(f"1 - (vectors.embedding::halfvec({dimensions}) <=> cast(:embedding as halfvec({dimensions}))) >= :min_score")
         with self._engine.connect() as connection:
             self._set_statement_timeout(connection)
             rows = (
@@ -318,12 +341,14 @@ class RagRetriever:
                     text(
                         f"""
                         select profile_documents.recording_id,
-                               1 - (profile_documents.embedding <=> cast(:embedding as halfvec)) as score
+                               1 - (vectors.embedding::halfvec({dimensions}) <=> cast(:embedding as halfvec({dimensions}))) as score
                         from recording_retrieval_documents profile_documents
                         join recordings on recordings.id = profile_documents.recording_id
-                        join embedding_models on embedding_models.id = profile_documents.embedding_model_id
+                        join recording_retrieval_document_embeddings vectors on vectors.document_id = profile_documents.id
+                        join embedding_models on embedding_models.id = vectors.embedding_model_id
                         where {" and ".join(clauses)}
-                        order by profile_documents.embedding <=> cast(:embedding as halfvec)
+                          and vectors.model_key = '{model_key}'
+                        order by vectors.embedding::halfvec({dimensions}) <=> cast(:embedding as halfvec({dimensions}))
                         limit :limit
                         """
                     ),
@@ -345,39 +370,43 @@ class RagRetriever:
         profile_scores = {candidate["recording_id"]: candidate["score"] for candidate in candidates}
         values: dict[str, object] = {
             "embedding": vector,
-            "embedding_provider": "sentence_transformers",
-            "embedding_model": self._settings.embedding_model,
-            "embedding_dimensions": self._settings.embedding_dimensions,
+            "embedding_provider": self._embedding_profile.provider,
+            "embedding_model": self._embedding_profile.model_name,
+            "embedding_dimensions": self._embedding_profile.dimensions,
             "recording_ids": [str(recording_id) for recording_id in profile_scores],
             "per_recording_limit": self._settings.rag_recording_profile_scoped_chunk_limit,
         }
+        dimensions = self._embedding_profile.dimensions
+        model_key = self._embedding_profile.key
         with self._engine.connect() as connection:
             self._set_statement_timeout(connection)
             rows = (
                 connection.execute(
                     text(
-                        """
+                        f"""
                         with scoped_chunks as materialized (
                             select chunks.id as chunk_id, chunks.recording_id, chunks.text,
                                    chunks.start_ms, chunks.end_ms, chunks.speaker_labels,
                                    chunks.is_target_person, chunks.source_utterance_segment_ids,
-                                   chunks.metadata, chunks.embedding,
+                                   chunks.metadata, vectors.embedding,
                                    recordings.title, recordings.file_name, recordings.location,
                                    recordings.duration_seconds, recordings.created_at
                             from recording_search_chunks chunks
                             join recordings on recordings.id = chunks.recording_id
-                            join embedding_models on embedding_models.id = chunks.embedding_model_id
+                            join recording_search_chunk_embeddings vectors on vectors.chunk_id = chunks.id
+                            join embedding_models on embedding_models.id = vectors.embedding_model_id
                             where chunks.recording_id = any(cast(:recording_ids as uuid[]))
                               and recordings.status = 'completed'
                               and embedding_models.provider = :embedding_provider
                               and embedding_models.model_name = :embedding_model
                               and embedding_models.dimensions = :embedding_dimensions
+                              and vectors.model_key = '{model_key}'
                         ), ranked as (
                             select scoped_chunks.*,
-                                   1 - (embedding <=> cast(:embedding as halfvec)) as score,
+                                   1 - (embedding::halfvec({dimensions}) <=> cast(:embedding as halfvec({dimensions}))) as score,
                                    row_number() over (
                                        partition by recording_id
-                                       order by embedding <=> cast(:embedding as halfvec), chunk_id
+                                       order by embedding::halfvec({dimensions}) <=> cast(:embedding as halfvec({dimensions})), chunk_id
                                    ) as recording_rank
                             from scoped_chunks
                         )
@@ -453,6 +482,73 @@ class RagRetriever:
                 )
             ]
 
+    def retrieve_lexical_variant_candidates(
+        self,
+        topics: Sequence[str],
+        filters: ResolvedFilters,
+        limit: int | None = None,
+    ) -> list[list[RetrievalCandidateRow]]:
+        """Retrieve several aliases for one keyword in a single database call."""
+
+        queries = list(dict.fromkeys(query for topic in topics if (query := normalize_search_text(topic))))
+        if not queries:
+            return []
+        values: dict[str, object] = {
+            "queries": queries,
+            "limit": limit or self._settings.rag_lexical_candidate_limit,
+        }
+        clauses = ["recordings.status = 'completed'"]
+        self._append_chunk_filters(clauses, values, filters)
+        searchable_text = "coalesce(nullif(chunks.normalized_original_text, ''), chunks.normalized_text)"
+        with self._engine.connect() as connection:
+            self._set_statement_timeout(connection)
+            rows = (
+                connection.execute(
+                    text(
+                        f"""
+                        with query_variants as (
+                            select query, ordinality - 1 as variant_index
+                            from unnest(cast(:queries as text[])) with ordinality as variants(query, ordinality)
+                        )
+                        select candidates.*, query_variants.variant_index
+                        from query_variants
+                        cross join lateral (
+                            select chunks.id as chunk_id, chunks.recording_id, chunks.text,
+                                   chunks.start_ms, chunks.end_ms, chunks.speaker_labels,
+                                   chunks.is_target_person, chunks.source_utterance_segment_ids,
+                                   chunks.metadata,
+                                   recordings.title, recordings.file_name,
+                                   recordings.location, recordings.duration_seconds, recordings.created_at,
+                                   (position(query_variants.query in {searchable_text}) > 0) as exact_match,
+                                   case
+                                     when position(query_variants.query in {searchable_text}) > 0 then 1.0
+                                     else word_similarity(query_variants.query, {searchable_text})
+                                   end as score,
+                                   query_variants.query <<-> {searchable_text} as lexical_distance
+                            from recording_search_chunks chunks
+                            join recordings on recordings.id = chunks.recording_id
+                            where {" and ".join(clauses)}
+                              and (position(query_variants.query in {searchable_text}) > 0
+                                   or word_similarity(query_variants.query, {searchable_text}) > 0)
+                            order by exact_match desc, lexical_distance
+                            limit :limit
+                        ) candidates
+                        order by query_variants.variant_index, candidates.exact_match desc, candidates.lexical_distance
+                        """
+                    ),
+                    values,
+                )
+                .mappings()
+                .all()
+            )
+        grouped: list[list[RetrievalCandidateRow]] = [[] for _query in queries]
+        for row in rows:
+            payload = dict(row)
+            variant_index = int(cast(int, payload.pop("variant_index")))
+            payload.pop("lexical_distance", None)
+            grouped[variant_index].append(_retrieval_candidate_row(payload))
+        return grouped
+
     def fuse_candidates(
         self,
         vector_rows: list[RetrievalCandidateRow],
@@ -472,11 +568,7 @@ class RagRetriever:
         candidates: dict[UUID, RankedCandidate] = {}
         expanded_list_count = max(1, len(vector_lists) - 1)
         for list_index, rows in enumerate(vector_lists):
-            list_weight = (
-                self._settings.rag_original_vector_weight
-                if list_index == 0
-                else self._settings.rag_expanded_vector_weight / expanded_list_count
-            )
+            list_weight = self._settings.rag_original_vector_weight if list_index == 0 else self._settings.rag_expanded_vector_weight / expanded_list_count
             for rank, row in enumerate(rows, start=1):
                 chunk_id = row["chunk_id"]
                 candidate = candidates.setdefault(chunk_id, RankedCandidate(row=row))
@@ -562,9 +654,7 @@ class RagRetriever:
                 (
                     item
                     for item in merged
-                    if item["recording_id"] == row["recording_id"]
-                    and item["start_ms"] <= row["end_ms"]
-                    and row["start_ms"] <= item["end_ms"]
+                    if item["recording_id"] == row["recording_id"] and item["start_ms"] <= row["end_ms"] and row["start_ms"] <= item["end_ms"]
                 ),
                 None,
             )
@@ -751,10 +841,7 @@ class RagRetriever:
         for raw_row in raw_utterance_rows:
             row = _scope_utterance_row(raw_row)
             utterances_by_recording[row["recording_id"]].append(row)
-        return [
-            self._scope_evidence(index, recording, utterances_by_recording[recording["id"]])
-            for index, recording in enumerate(recordings, start=1)
-        ]
+        return [self._scope_evidence(index, recording, utterances_by_recording[recording["id"]]) for index, recording in enumerate(recordings, start=1)]
 
     def retrieve_metadata(
         self,
@@ -850,9 +937,7 @@ class RagRetriever:
                 end_ms=end_ms,
                 speaker_labels=speaker_labels,
                 is_target_person=any(bool(item["is_target_person"]) for item in utterances),
-                matched_speaker_profiles=list(
-                    dict.fromkeys(item["speaker_profile_id"] for item in utterances if item["speaker_profile_id"] is not None)
-                ),
+                matched_speaker_profiles=list(dict.fromkeys(item["speaker_profile_id"] for item in utterances if item["speaker_profile_id"] is not None)),
             ),
             score=1.0,
             match_type="scope",

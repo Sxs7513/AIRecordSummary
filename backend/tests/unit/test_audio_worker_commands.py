@@ -21,7 +21,7 @@ def test_non_streaming_audio_commands_do_not_wait_for_sse_subscriber() -> None:
                 )
             ]
         ),
-        embedding_encode_command(["测试文本"]),
+        embedding_encode_command(["测试文本"], "qwen3-4b"),
     )
 
     assert all(command.wait_for_subscriber is False for command in commands)

@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.exc import IntegrityError
 
 from evaluation_dependencies import CurrentUserDependency, RagEvaluationServiceDependency
+from l2_core.rag_evaluation.answer_annotations import AnswerAnnotation
 from l2_core.rag_evaluation.service import (
     RagEvaluationConflictError,
     RagEvaluationNotFoundError,
@@ -40,6 +41,10 @@ class CreateCaseRequest(BaseModel):
 class AddEvidenceRequest(BaseModel):
     chunk_id: UUID
     relevance: int = Field(default=3, ge=1, le=3)
+
+
+class UpdateAnswerAnnotationRequest(BaseModel):
+    annotation: AnswerAnnotation
 
 
 class RevisionRequest(BaseModel):
@@ -143,6 +148,31 @@ def delete_evidence(
 ) -> None:
     try:
         service.delete_evidence(user, evidence_id)
+    except Exception as error:
+        _raise_api_error(error)
+
+
+@router.post("/cases/{case_id}/answer-annotation:suggest")
+def suggest_answer_annotation(
+    case_id: UUID,
+    service: RagEvaluationServiceDependency,
+    user: CurrentUserDependency,
+) -> dict[str, Any]:
+    try:
+        return service.suggest_answer_annotation(user, case_id)
+    except Exception as error:
+        _raise_api_error(error)
+
+
+@router.put("/cases/{case_id}/answer-annotation")
+def update_answer_annotation(
+    case_id: UUID,
+    payload: UpdateAnswerAnnotationRequest,
+    service: RagEvaluationServiceDependency,
+    user: CurrentUserDependency,
+) -> dict[str, Any]:
+    try:
+        return service.update_answer_annotation(user, case_id, payload.annotation)
     except Exception as error:
         _raise_api_error(error)
 
@@ -275,5 +305,5 @@ def _raise_api_error(error: Exception) -> Never:
     if isinstance(error, (RagEvaluationConflictError, IntegrityError)):
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
     if isinstance(error, ValueError):
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(error)) from error
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(error)) from error
     raise error

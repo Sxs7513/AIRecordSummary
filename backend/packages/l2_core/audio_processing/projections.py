@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 from collections.abc import Sequence
@@ -200,10 +201,6 @@ class RecordingProjectionService:
                     "summary_text": output.summary_text,
                 },
             )
-            connection.execute(
-                text("delete from recording_retrieval_documents where recording_id = :recording_id"),
-                {"recording_id": recording_id},
-            )
 
     def _project_summary_embedding(self, recording_id: RecordingId, output: SummaryEmbeddingIndexingOutput) -> None:
         if len(output.embedding) != output.dimensions:
@@ -215,40 +212,74 @@ class RecordingProjectionService:
                     text(
                         """
                         insert into embedding_models (provider, model_name, dimensions, distance_metric, is_active)
-                        values (:provider, :model_name, :dimensions, 'cosine', true)
+                        values (:provider, :model_name, :dimensions, :distance_metric, true)
                         on conflict (provider, model_name, dimensions) do update set
                             distance_metric = excluded.distance_metric,
                             is_active = true
                         returning id
                         """
                     ),
-                    {"provider": output.provider, "model_name": output.model_name, "dimensions": output.dimensions},
+                    {
+                        "provider": output.provider,
+                        "model_name": output.model_name,
+                        "dimensions": output.dimensions,
+                        "distance_metric": output.distance_metric,
+                    },
                 ).scalar_one(),
+            )
+            document_id = cast(
+                UUID,
+                connection.execute(
+                    text(
+                        """
+                    insert into recording_retrieval_documents (
+                        recording_id, document_index, document_type, retrieval_text, content_hash
+                    ) values (
+                        :recording_id, :document_index, :document_type, :retrieval_text, :content_hash
+                    )
+                    on conflict (recording_id, document_index) do update set
+                        document_type = excluded.document_type,
+                        retrieval_text = excluded.retrieval_text,
+                        content_hash = excluded.content_hash,
+                        updated_at = now()
+                    returning id
+                    """
+                    ),
+                    {
+                        "recording_id": recording_id,
+                        "document_index": output.document_index,
+                        "document_type": output.document_type,
+                        "retrieval_text": output.retrieval_text,
+                        "content_hash": output.content_hash,
+                    },
+                ).scalar_one(),
+            )
+            connection.execute(
+                text("delete from recording_retrieval_document_embeddings where document_id = :document_id and content_hash <> :content_hash"),
+                {"document_id": document_id, "content_hash": output.content_hash},
             )
             connection.execute(
                 text(
                     """
-                    insert into recording_retrieval_documents (
-                        recording_id, embedding_model_id, document_index, document_type,
-                        retrieval_text, content_hash, embedding
+                    insert into recording_retrieval_document_embeddings (
+                        document_id, embedding_model_id, model_key, dimensions, content_hash, embedding
                     ) values (
-                        :recording_id, :embedding_model_id, :document_index, :document_type,
-                        :retrieval_text, :content_hash, cast(:embedding as halfvec)
+                        :document_id, :embedding_model_id, :model_key, :dimensions, :content_hash,
+                        cast(:embedding as halfvec)
                     )
-                    on conflict (recording_id, embedding_model_id, document_index) do update set
-                        document_type = excluded.document_type,
-                        retrieval_text = excluded.retrieval_text,
+                    on conflict (document_id, embedding_model_id) do update set
+                        model_key = excluded.model_key,
+                        dimensions = excluded.dimensions,
                         content_hash = excluded.content_hash,
                         embedding = excluded.embedding,
                         updated_at = now()
                     """
                 ),
                 {
-                    "recording_id": recording_id,
+                    "document_id": document_id,
                     "embedding_model_id": embedding_model_id,
-                    "document_index": output.document_index,
-                    "document_type": output.document_type,
-                    "retrieval_text": output.retrieval_text,
+                    "model_key": output.embedding_profile,
+                    "dimensions": output.dimensions,
                     "content_hash": output.content_hash,
                     "embedding": self._vector_literal(output.embedding),
                 },
@@ -267,7 +298,7 @@ class RecordingProjectionService:
                         insert into embedding_models (
                             provider, model_name, dimensions, distance_metric, is_active
                         ) values (
-                            :provider, :model_name, :dimensions, 'cosine', true
+                            :provider, :model_name, :dimensions, :distance_metric, true
                         )
                         on conflict (provider, model_name, dimensions) do update set
                             distance_metric = excluded.distance_metric,
@@ -279,12 +310,13 @@ class RecordingProjectionService:
                         "provider": output.provider,
                         "model_name": output.model_name,
                         "dimensions": output.dimensions,
+                        "distance_metric": output.distance_metric,
                     },
                 ).scalar_one(),
             )
             connection.execute(
-                text("delete from recording_search_chunks where recording_id = :recording_id"),
-                {"recording_id": recording_id},
+                text("delete from recording_search_chunks where recording_id = :recording_id and not (chunk_index = any(cast(:chunk_indexes as integer[])))"),
+                {"recording_id": recording_id, "chunk_indexes": [chunk.chunk_index for chunk in output.chunks]},
             )
             for chunk in output.chunks:
                 utterance_ids = self._utterance_segment_ids(connection, recording_id, chunk.source_utterance_indexes)
@@ -293,48 +325,94 @@ class RecordingProjectionService:
                     recording_id,
                     chunk.source_diarization_segment_ids,
                 )
+                retrieval_text = chunk.retrieval_text()
+                content_hash = hashlib.sha256(retrieval_text.encode("utf-8")).hexdigest()
+                chunk_id = cast(
+                    UUID,
+                    connection.execute(
+                        text(
+                            """
+                        insert into recording_search_chunks (
+                            recording_id, chunk_index, text, original_text, normalized_text, normalized_original_text,
+                            start_ms, end_ms, speaker_labels, speaker_cluster_ids,
+                            source_utterance_segment_ids, source_transcription_segment_ids,
+                            is_target_person, matched_speaker_profile_ids, metadata
+                        ) values (
+                            :recording_id, :chunk_index, :text, :original_text, :normalized_text, :normalized_original_text,
+                            :start_ms, :end_ms, :speaker_labels, :speaker_cluster_ids,
+                            :source_utterance_segment_ids, :source_transcription_segment_ids,
+                            false, cast(:matched_speaker_profile_ids as uuid[]), cast(:metadata as jsonb)
+                        )
+                        on conflict (recording_id, chunk_index) do update set
+                            text = excluded.text,
+                            original_text = excluded.original_text,
+                            normalized_text = excluded.normalized_text,
+                            normalized_original_text = excluded.normalized_original_text,
+                            start_ms = excluded.start_ms,
+                            end_ms = excluded.end_ms,
+                            speaker_labels = excluded.speaker_labels,
+                            speaker_cluster_ids = excluded.speaker_cluster_ids,
+                            source_utterance_segment_ids = excluded.source_utterance_segment_ids,
+                            source_transcription_segment_ids = excluded.source_transcription_segment_ids,
+                            metadata = excluded.metadata,
+                            updated_at = now()
+                        returning id
+                        """
+                        ),
+                        {
+                            "recording_id": recording_id,
+                            "chunk_index": chunk.chunk_index,
+                            "text": chunk.text,
+                            "original_text": chunk.original_text,
+                            "normalized_text": normalize_search_text(retrieval_text),
+                            "normalized_original_text": normalize_search_text(chunk.original_text),
+                            "start_ms": chunk.start_ms,
+                            "end_ms": chunk.end_ms,
+                            "speaker_labels": chunk.speaker_labels,
+                            "speaker_cluster_ids": chunk.speaker_cluster_ids,
+                            "source_utterance_segment_ids": utterance_ids,
+                            "source_transcription_segment_ids": transcription_ids,
+                            "matched_speaker_profile_ids": [],
+                            "metadata": json.dumps(
+                                {
+                                    "topic": chunk.topic,
+                                    "terms": chunk.terms,
+                                    "search_context": chunk.search_context,
+                                    "topic_section_index": chunk.topic_section_index,
+                                    "build_method": chunk.build_method,
+                                },
+                                ensure_ascii=False,
+                            ),
+                        },
+                    ).scalar_one(),
+                )
+                connection.execute(
+                    text("delete from recording_search_chunk_embeddings where chunk_id = :chunk_id and content_hash <> :content_hash"),
+                    {"chunk_id": chunk_id, "content_hash": content_hash},
+                )
                 connection.execute(
                     text(
                         """
-                        insert into recording_search_chunks (
-                            recording_id, embedding_model_id, chunk_index, text, original_text, normalized_text, normalized_original_text,
-                            start_ms, end_ms, speaker_labels, speaker_cluster_ids,
-                            source_utterance_segment_ids, source_transcription_segment_ids,
-                            is_target_person, matched_speaker_profile_ids, metadata, embedding
+                        insert into recording_search_chunk_embeddings (
+                            chunk_id, embedding_model_id, model_key, dimensions, content_hash, embedding
                         ) values (
-                            :recording_id, :embedding_model_id, :chunk_index, :text, :original_text, :normalized_text, :normalized_original_text,
-                            :start_ms, :end_ms, :speaker_labels, :speaker_cluster_ids,
-                            :source_utterance_segment_ids, :source_transcription_segment_ids,
-                            false, cast(:matched_speaker_profile_ids as uuid[]), cast(:metadata as jsonb),
+                            :chunk_id, :embedding_model_id, :model_key, :dimensions, :content_hash,
                             cast(:embedding as halfvec)
                         )
+                        on conflict (chunk_id, embedding_model_id) do update set
+                            model_key = excluded.model_key,
+                            dimensions = excluded.dimensions,
+                            content_hash = excluded.content_hash,
+                            embedding = excluded.embedding,
+                            updated_at = now()
                         """
                     ),
                     {
-                        "recording_id": recording_id,
+                        "chunk_id": chunk_id,
                         "embedding_model_id": embedding_model_id,
-                        "chunk_index": chunk.chunk_index,
-                        "text": chunk.text,
-                        "original_text": chunk.original_text,
-                        "normalized_text": normalize_search_text(chunk.retrieval_text()),
-                        "normalized_original_text": normalize_search_text(chunk.original_text),
-                        "start_ms": chunk.start_ms,
-                        "end_ms": chunk.end_ms,
-                        "speaker_labels": chunk.speaker_labels,
-                        "speaker_cluster_ids": chunk.speaker_cluster_ids,
-                        "source_utterance_segment_ids": utterance_ids,
-                        "source_transcription_segment_ids": transcription_ids,
-                        "matched_speaker_profile_ids": [],
-                        "metadata": json.dumps(
-                            {
-                                "topic": chunk.topic,
-                                "terms": chunk.terms,
-                                "search_context": chunk.search_context,
-                                "topic_section_index": chunk.topic_section_index,
-                                "build_method": chunk.build_method,
-                            },
-                            ensure_ascii=False,
-                        ),
+                        "model_key": output.embedding_profile,
+                        "dimensions": output.dimensions,
+                        "content_hash": content_hash,
                         "embedding": self._vector_literal(chunk.embedding),
                     },
                 )

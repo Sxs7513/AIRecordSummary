@@ -2,15 +2,24 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
+from collections import defaultdict
 from collections.abc import Mapping
 from typing import Any, cast
 from uuid import UUID
 
 from sqlalchemy import Connection, Engine, text
 
+from l1_foundation.llm import LlmProvider, create_language_model_from_settings
+from l1_foundation.model_ref import OnlineModelRef
 from l1_foundation.settings import Settings
 from l2_core.auth.contracts import CurrentUser
 from l2_core.rag.normalization import normalize_search_text
+from l2_core.rag_evaluation.answer_annotations import AnswerAnnotation
+from l2_core.rag_evaluation.answer_evaluator import AnswerAnnotationGenerator
+from l2_core.rag_evaluation.diagnosis import summarize_journeys
+
+logger = logging.getLogger("evaluation")
 
 
 class RagEvaluationNotFoundError(LookupError):
@@ -60,23 +69,27 @@ class RagEvaluationService:
         if not clean_name:
             raise ValueError("Dataset name is required")
         with self._engine.begin() as connection:
-            row = connection.execute(
-                text(
-                    """
+            row = (
+                connection.execute(
+                    text(
+                        """
                     insert into evaluation_datasets (
                         workspace_id, name, description, task_type, created_by_user_id
                     ) values (
                         :workspace_id, :name, :description, 'rag_retrieval', :user_id
                     ) returning *
                     """
-                ),
-                {
-                    "workspace_id": user.current_workspace_id,
-                    "name": clean_name,
-                    "description": description.strip() if description and description.strip() else None,
-                    "user_id": user.id,
-                },
-            ).mappings().one()
+                    ),
+                    {
+                        "workspace_id": user.current_workspace_id,
+                        "name": clean_name,
+                        "description": description.strip() if description and description.strip() else None,
+                        "user_id": user.id,
+                    },
+                )
+                .mappings()
+                .one()
+            )
             return dict(row)
 
     def get_dataset(self, user: CurrentUser, dataset_id: UUID) -> dict[str, Any]:
@@ -152,9 +165,10 @@ class RagEvaluationService:
         with self._engine.begin() as connection:
             self._require_dataset(connection, user, dataset_id)
             self._require_recordings(connection, user, recording_ids or [])
-            row = connection.execute(
-                text(
-                    """
+            row = (
+                connection.execute(
+                    text(
+                        """
                     insert into rag_evaluation_case_drafts (
                         dataset_id, query, scope, tags, group_key, created_by_user_id
                     ) values (
@@ -162,16 +176,19 @@ class RagEvaluationService:
                         :group_key, :user_id
                     ) returning *
                     """
-                ),
-                {
-                    "dataset_id": dataset_id,
-                    "query": clean_query,
-                    "scope": _json(scope),
-                    "tags": clean_tags,
-                    "group_key": stable_group,
-                    "user_id": user.id,
-                },
-            ).mappings().one()
+                    ),
+                    {
+                        "dataset_id": dataset_id,
+                        "query": clean_query,
+                        "scope": _json(scope),
+                        "tags": clean_tags,
+                        "group_key": stable_group,
+                        "user_id": user.id,
+                    },
+                )
+                .mappings()
+                .one()
+            )
             connection.execute(
                 text("update evaluation_datasets set updated_at = now() where id = :dataset_id"),
                 {"dataset_id": dataset_id},
@@ -200,17 +217,21 @@ class RagEvaluationService:
         """Exclude a draft from future versions without breaking frozen history."""
         with self._engine.begin() as connection:
             draft = self._require_case_draft(connection, user, case_id, for_update=True)
-            row = connection.execute(
-                text(
-                    """
+            row = (
+                connection.execute(
+                    text(
+                        """
                     update rag_evaluation_case_drafts
                     set archived_by_user_id = :user_id, archived_at = now(), updated_at = now()
                     where id = :case_id and archived_at is null
                     returning *
                     """
-                ),
-                {"case_id": case_id, "user_id": user.id},
-            ).mappings().one_or_none()
+                    ),
+                    {"case_id": case_id, "user_id": user.id},
+                )
+                .mappings()
+                .one_or_none()
+            )
             if row is None:
                 return dict(draft)
             connection.execute(
@@ -224,24 +245,29 @@ class RagEvaluationService:
             raise ValueError("Evidence relevance must be between 1 and 3")
         with self._engine.begin() as connection:
             draft = self._require_case_draft(connection, user, case_id, for_update=True)
-            chunk = connection.execute(
-                text(
-                    """
+            chunk = (
+                connection.execute(
+                    text(
+                        """
                     select chunks.*, recordings.title as recording_title,
                            recordings.file_name as recording_file_name
                     from recording_search_chunks chunks
                     join recordings on recordings.id = chunks.recording_id
                     where chunks.id = :chunk_id and recordings.workspace_id = :workspace_id
                     """
-                ),
-                {"chunk_id": chunk_id, "workspace_id": user.current_workspace_id},
-            ).mappings().one_or_none()
+                    ),
+                    {"chunk_id": chunk_id, "workspace_id": user.current_workspace_id},
+                )
+                .mappings()
+                .one_or_none()
+            )
             if chunk is None:
                 raise RagEvaluationNotFoundError("Search chunk not found")
             checksum = _content_checksum(str(chunk["text"]), int(chunk["start_ms"]), int(chunk["end_ms"]))
-            row = connection.execute(
-                text(
-                    """
+            row = (
+                connection.execute(
+                    text(
+                        """
                     insert into rag_evaluation_evidence_drafts (
                         case_draft_id, source_recording_id, source_chunk_id, quote,
                         start_ms, end_ms, relevance, content_checksum, metadata
@@ -253,19 +279,22 @@ class RagEvaluationService:
                     do update set relevance = excluded.relevance
                     returning *
                     """
-                ),
-                {
-                    "case_id": case_id,
-                    "recording_id": chunk["recording_id"],
-                    "chunk_id": chunk_id,
-                    "quote": chunk["text"],
-                    "start_ms": chunk["start_ms"],
-                    "end_ms": chunk["end_ms"],
-                    "relevance": relevance,
-                    "checksum": checksum,
-                    "metadata": _json(chunk["metadata"] if isinstance(chunk["metadata"], Mapping) else {}),
-                },
-            ).mappings().one()
+                    ),
+                    {
+                        "case_id": case_id,
+                        "recording_id": chunk["recording_id"],
+                        "chunk_id": chunk_id,
+                        "quote": chunk["text"],
+                        "start_ms": chunk["start_ms"],
+                        "end_ms": chunk["end_ms"],
+                        "relevance": relevance,
+                        "checksum": checksum,
+                        "metadata": _json(chunk["metadata"] if isinstance(chunk["metadata"], Mapping) else {}),
+                    },
+                )
+                .mappings()
+                .one()
+            )
             self._return_case_to_draft(connection, case_id)
             connection.execute(
                 text("update evaluation_datasets set updated_at = now() where id = :dataset_id"),
@@ -279,9 +308,10 @@ class RagEvaluationService:
 
     def delete_evidence(self, user: CurrentUser, evidence_id: UUID) -> None:
         with self._engine.begin() as connection:
-            row = connection.execute(
-                text(
-                    """
+            row = (
+                connection.execute(
+                    text(
+                        """
                     select evidence.id, evidence.case_draft_id, drafts.dataset_id
                     from rag_evaluation_evidence_drafts evidence
                     join rag_evaluation_case_drafts drafts on drafts.id = evidence.case_draft_id
@@ -289,27 +319,125 @@ class RagEvaluationService:
                     where evidence.id = :evidence_id and datasets.workspace_id = :workspace_id
                     for update
                     """
-                ),
-                {"evidence_id": evidence_id, "workspace_id": user.current_workspace_id},
-            ).mappings().one_or_none()
+                    ),
+                    {"evidence_id": evidence_id, "workspace_id": user.current_workspace_id},
+                )
+                .mappings()
+                .one_or_none()
+            )
             if row is None:
                 raise RagEvaluationNotFoundError("Evidence not found")
             connection.execute(text("delete from rag_evaluation_evidence_drafts where id = :id"), {"id": evidence_id})
+
+    def suggest_answer_annotation(self, user: CurrentUser, case_id: UUID) -> dict[str, Any]:
+        with self._engine.connect() as connection:
+            draft = self._require_case_draft(connection, user, case_id)
+            evidence = self._draft_evidence(connection, case_id)
+        evidence_log = [
+            {
+                "evidence_id": str(item["id"]),
+                "recording_id": str(item["source_recording_id"]),
+                "chunk_id": str(item["source_chunk_id"]) if item["source_chunk_id"] is not None else None,
+                "start_ms": int(item["start_ms"]),
+                "end_ms": int(item["end_ms"]),
+                "relevance": int(item["relevance"]),
+            }
+            for item in evidence
+        ]
+        logger.info(
+            "RAG 答案标注：开始自动生成 case_id=%s query=%s evidence_count=%s evidences=%s",
+            case_id,
+            draft["query"],
+            len(evidence_log),
+            _json(evidence_log),
+        )
+        if not evidence:
+            annotation = AnswerAnnotation(
+                expected_verdict="abstain",
+                reference_answer=None,
+                key_points=[],
+            )
+            logger.info(
+                "RAG 答案标注：无 Gold Evidence，生成拒答标注 case_id=%s annotation=%s",
+                case_id,
+                annotation.model_dump_json(),
+            )
+            return annotation.model_dump(mode="json")
+        model_ref = OnlineModelRef.parse(self._settings.rag_answer_judge_model)
+        model = create_language_model_from_settings(
+            self._settings,
+            LlmProvider(model_ref.provider),
+            local_context_size=self._settings.rag_context_size,
+        )
+        try:
+            annotation = AnswerAnnotationGenerator(
+                model,
+                model_ref,
+                context_size=self._settings.rag_context_size,
+                max_output_tokens=self._settings.rag_answer_judge_max_output_tokens,
+            ).generate(
+                query=str(draft["query"]),
+                evidence=[{"id": str(item["id"]), "quote": str(item["quote"]), "relevance": int(item["relevance"])} for item in evidence],
+            )
+            self._validate_answer_annotation(annotation, evidence)
+        except Exception:
+            logger.exception(
+                "RAG 答案标注：自动生成失败 case_id=%s evidence_count=%s",
+                case_id,
+                len(evidence_log),
+            )
+            raise
+        finally:
+            model.release()
+        logger.info(
+            "RAG 答案标注：自动生成完成 case_id=%s annotation=%s",
+            case_id,
+            annotation.model_dump_json(),
+        )
+        return annotation.model_dump(mode="json")
+
+    def update_answer_annotation(
+        self,
+        user: CurrentUser,
+        case_id: UUID,
+        annotation: AnswerAnnotation,
+    ) -> dict[str, Any]:
+        with self._engine.begin() as connection:
+            draft = self._require_case_draft(connection, user, case_id, for_update=True)
+            evidence = self._draft_evidence(connection, case_id)
+            self._validate_answer_annotation(annotation, evidence)
+            row = (
+                connection.execute(
+                    text(
+                        """
+                        update rag_evaluation_case_drafts
+                        set answer_annotation = cast(:annotation as jsonb), status = 'draft',
+                            reviewed_by_user_id = null, reviewed_at = null,
+                            approved_by_user_id = null, approved_at = null,
+                            revision = revision + 1, updated_at = now()
+                        where id = :case_id
+                        returning *
+                        """
+                    ),
+                    {"case_id": case_id, "annotation": _json(annotation.model_dump(mode="json"))},
+                )
+                .mappings()
+                .one()
+            )
+            connection.execute(
+                text("update evaluation_datasets set updated_at = now() where id = :dataset_id"),
+                {"dataset_id": draft["dataset_id"]},
+            )
+            return {**dict(row), "evidence": evidence}
 
     def transition_case(self, user: CurrentUser, case_id: UUID, revision: int, action: str) -> dict[str, Any]:
         with self._engine.begin() as connection:
             draft = self._require_case_draft(connection, user, case_id, for_update=True)
             if int(draft["revision"]) != revision:
                 raise RagEvaluationConflictError("问题已被其他操作修改，请刷新后重试")
-            evidence_count = cast(
-                int,
-                connection.execute(
-                    text("select count(*) from rag_evaluation_evidence_drafts where case_draft_id = :case_id"),
-                    {"case_id": case_id},
-                ).scalar_one(),
-            )
-            if evidence_count == 0:
-                raise RagEvaluationConflictError("至少标注一个正确 Chunk 后才能审核")
+            evidence = self._draft_evidence(connection, case_id)
+            annotation = self._annotation_from_row(draft)
+            self._validate_answer_annotation(annotation, evidence)
             if action == "review" and draft["status"] == "draft":
                 statement = """
                     update rag_evaluation_case_drafts
@@ -326,9 +454,7 @@ class RagEvaluationService:
                 """
             else:
                 raise RagEvaluationConflictError(f"Cannot {action} case in {draft['status']} status")
-            return dict(
-                connection.execute(text(statement), {"case_id": case_id, "user_id": user.id}).mappings().one()
-            )
+            return dict(connection.execute(text(statement), {"case_id": case_id, "user_id": user.id}).mappings().one())
 
     def search_chunks(
         self,
@@ -428,9 +554,10 @@ class RagEvaluationService:
                     {"dataset_id": dataset_id},
                 ).scalar_one(),
             )
-            version = connection.execute(
-                text(
-                    """
+            version = (
+                connection.execute(
+                    text(
+                        """
                     insert into evaluation_dataset_versions (
                         dataset_id, version_number, status, normalization_name,
                         normalization_version, definition_snapshot, split_strategy,
@@ -441,23 +568,27 @@ class RagEvaluationService:
                         :case_count, :user_id
                     ) returning *
                     """
-                ),
-                {
-                    "dataset_id": dataset_id,
-                    "version_number": version_number,
-                    "definition": _json(
-                        {
-                            "task_type": "rag_retrieval",
-                            "query_normalization": "search_text_v1",
-                            "evidence_matcher": "recording_time_overlap_or_quote_v1",
-                            "relevance_scale": [0, 1, 2, 3],
-                        }
                     ),
-                    "split_strategy": _json({"name": "all_test_v1"}),
-                    "case_count": len(cases),
-                    "user_id": user.id,
-                },
-            ).mappings().one()
+                    {
+                        "dataset_id": dataset_id,
+                        "version_number": version_number,
+                        "definition": _json(
+                            {
+                                "task_type": "rag_retrieval",
+                                "query_normalization": "search_text_v1",
+                                "evidence_matcher": "recording_time_overlap_or_quote_v1",
+                                "answer_ground_truth": "reference_answer_and_key_points_v1",
+                                "relevance_scale": [0, 1, 2, 3],
+                            }
+                        ),
+                        "split_strategy": _json({"name": "all_test_v1"}),
+                        "case_count": len(cases),
+                        "user_id": user.id,
+                    },
+                )
+                .mappings()
+                .one()
+            )
             for item in cases:
                 frozen_case_id = cast(
                     UUID,
@@ -466,10 +597,11 @@ class RagEvaluationService:
                             """
                             insert into rag_evaluation_cases (
                                 dataset_version_id, source_draft_id, query, query_normalized,
-                                scope, tags, split, group_key
+                                scope, tags, split, group_key, answer_annotation
                             ) values (
                                 :version_id, :draft_id, :query, :query_normalized,
-                                cast(:scope as jsonb), cast(:tags as text[]), 'test', :group_key
+                                cast(:scope as jsonb), cast(:tags as text[]), 'test', :group_key,
+                                cast(:answer_annotation as jsonb)
                             ) returning id
                             """
                         ),
@@ -481,44 +613,59 @@ class RagEvaluationService:
                             "scope": _json(item["scope"]),
                             "tags": item["tags"],
                             "group_key": item["group_key"],
+                            "answer_annotation": _json(item["answer_annotation"]),
                         },
                     ).scalar_one(),
                 )
+                evidence_id_mapping: dict[UUID, UUID] = {}
                 for evidence in cast(list[dict[str, Any]], item["evidence"]):
-                    connection.execute(
-                        text(
-                            """
+                    frozen_evidence_id = cast(
+                        UUID,
+                        connection.execute(
+                            text(
+                                """
                             insert into rag_evaluation_evidence (
                                 evaluation_case_id, source_recording_id, source_chunk_id,
                                 quote, start_ms, end_ms, relevance, content_checksum, metadata
                             ) values (
                                 :case_id, :recording_id, :chunk_id, :quote, :start_ms,
                                 :end_ms, :relevance, :checksum, cast(:metadata as jsonb)
-                            )
+                            ) returning id
                             """
-                        ),
-                        {
-                            "case_id": frozen_case_id,
-                            "recording_id": evidence["source_recording_id"],
-                            "chunk_id": evidence["source_chunk_id"],
-                            "quote": evidence["quote"],
-                            "start_ms": evidence["start_ms"],
-                            "end_ms": evidence["end_ms"],
-                            "relevance": evidence["relevance"],
-                            "checksum": evidence["content_checksum"],
-                            "metadata": _json(evidence["metadata"]),
-                        },
+                            ),
+                            {
+                                "case_id": frozen_case_id,
+                                "recording_id": evidence["source_recording_id"],
+                                "chunk_id": evidence["source_chunk_id"],
+                                "quote": evidence["quote"],
+                                "start_ms": evidence["start_ms"],
+                                "end_ms": evidence["end_ms"],
+                                "relevance": evidence["relevance"],
+                                "checksum": evidence["content_checksum"],
+                                "metadata": _json(evidence["metadata"]),
+                            },
+                        ).scalar_one(),
                     )
-            frozen = connection.execute(
-                text(
-                    """
+                    evidence_id_mapping[UUID(str(evidence["id"]))] = frozen_evidence_id
+                frozen_annotation = AnswerAnnotation.model_validate(item["answer_annotation"]).remap_evidence_ids(evidence_id_mapping)
+                connection.execute(
+                    text("update rag_evaluation_cases set answer_annotation = cast(:annotation as jsonb) where id = :case_id"),
+                    {"case_id": frozen_case_id, "annotation": _json(frozen_annotation.model_dump(mode="json"))},
+                )
+            frozen = (
+                connection.execute(
+                    text(
+                        """
                     update evaluation_dataset_versions
                     set status = 'frozen', checksum = :checksum, frozen_at = now()
                     where id = :version_id returning *
                     """
-                ),
-                {"version_id": version["id"], "checksum": checksum},
-            ).mappings().one()
+                    ),
+                    {"version_id": version["id"], "checksum": checksum},
+                )
+                .mappings()
+                .one()
+            )
             return dict(frozen)
 
     def create_run(
@@ -533,25 +680,33 @@ class RagEvaluationService:
         if not clean_key:
             raise ValueError("Idempotency key is required")
         with self._engine.begin() as connection:
-            version = connection.execute(
-                text(
-                    """
+            version = (
+                connection.execute(
+                    text(
+                        """
                     select versions.*, datasets.workspace_id, datasets.task_type
                     from evaluation_dataset_versions versions
                     join evaluation_datasets datasets on datasets.id = versions.dataset_id
                     where versions.id = :version_id and datasets.workspace_id = :workspace_id
                     """
-                ),
-                {"version_id": dataset_version_id, "workspace_id": user.current_workspace_id},
-            ).mappings().one_or_none()
+                    ),
+                    {"version_id": dataset_version_id, "workspace_id": user.current_workspace_id},
+                )
+                .mappings()
+                .one_or_none()
+            )
             if version is None:
                 raise RagEvaluationNotFoundError("Dataset version not found")
             if version["status"] != "frozen" or version["task_type"] != "rag_retrieval":
                 raise RagEvaluationConflictError("Only frozen RAG retrieval versions can be evaluated")
-            existing = connection.execute(
-                text("select * from evaluation_runs where workspace_id = :workspace_id and idempotency_key = :key"),
-                {"workspace_id": user.current_workspace_id, "key": clean_key},
-            ).mappings().one_or_none()
+            existing = (
+                connection.execute(
+                    text("select * from evaluation_runs where workspace_id = :workspace_id and idempotency_key = :key"),
+                    {"workspace_id": user.current_workspace_id, "key": clean_key},
+                )
+                .mappings()
+                .one_or_none()
+            )
             if existing is not None:
                 return dict(existing)
             snapshot_id = self._ensure_corpus_snapshot(connection, user)
@@ -563,9 +718,25 @@ class RagEvaluationService:
                     {"version_id": dataset_version_id},
                 ).scalar_one(),
             )
-            run = connection.execute(
-                text(
-                    """
+            incomplete_answer_count = cast(
+                int,
+                connection.execute(
+                    text(
+                        """
+                        select count(*) from rag_evaluation_cases
+                        where dataset_version_id = :version_id and split = 'test'
+                          and answer_annotation is null
+                        """
+                    ),
+                    {"version_id": dataset_version_id},
+                ).scalar_one(),
+            )
+            if incomplete_answer_count:
+                raise RagEvaluationConflictError("该冻结版本缺少答案标注，请从草稿重新冻结一个版本")
+            run = (
+                connection.execute(
+                    text(
+                        """
                     insert into evaluation_runs (
                         workspace_id, dataset_version_id, evaluator_type, split, status,
                         idempotency_key, config_snapshot, total_case_count, created_by_user_id
@@ -574,16 +745,19 @@ class RagEvaluationService:
                         :key, cast(:config as jsonb), :case_count, :user_id
                     ) returning *
                     """
-                ),
-                {
-                    "workspace_id": user.current_workspace_id,
-                    "version_id": dataset_version_id,
-                    "key": clean_key,
-                    "config": _json({**config, "evaluator_version": "1", "metric_version": "1"}),
-                    "case_count": case_count,
-                    "user_id": user.id,
-                },
-            ).mappings().one()
+                    ),
+                    {
+                        "workspace_id": user.current_workspace_id,
+                        "version_id": dataset_version_id,
+                        "key": clean_key,
+                        "config": _json({**config, "evaluator_version": "2", "metric_version": "2"}),
+                        "case_count": case_count,
+                        "user_id": user.id,
+                    },
+                )
+                .mappings()
+                .one()
+            )
             connection.execute(
                 text(
                     """
@@ -623,9 +797,10 @@ class RagEvaluationService:
 
     def get_run(self, user: CurrentUser, run_id: UUID) -> dict[str, Any]:
         with self._engine.connect() as connection:
-            run = connection.execute(
-                text(
-                    """
+            run = (
+                connection.execute(
+                    text(
+                        """
                     select runs.*, datasets.name as dataset_name, versions.version_number,
                            pipelines.name as pipeline_name, pipelines.config_hash,
                            pipelines.config_snapshot as pipeline_config
@@ -637,9 +812,12 @@ class RagEvaluationService:
                     where runs.id = :run_id and runs.workspace_id = :workspace_id
                       and runs.evaluator_type = 'rag_retrieval'
                     """
-                ),
-                {"run_id": run_id, "workspace_id": user.current_workspace_id},
-            ).mappings().one_or_none()
+                    ),
+                    {"run_id": run_id, "workspace_id": user.current_workspace_id},
+                )
+                .mappings()
+                .one_or_none()
+            )
             if run is None:
                 raise RagEvaluationNotFoundError("Evaluation run not found")
             metrics = [
@@ -660,7 +838,7 @@ class RagEvaluationService:
                 for row in connection.execute(
                     text(
                         """
-                        select results.*, cases.query, cases.tags
+                        select results.*, cases.query, cases.tags, cases.answer_annotation
                         from rag_evaluation_case_results results
                         join rag_evaluation_cases cases on cases.id = results.evaluation_case_id
                         where results.evaluation_run_id = :run_id
@@ -670,7 +848,46 @@ class RagEvaluationService:
                     {"run_id": run_id},
                 ).mappings()
             ]
+            journey_rows = [
+                dict(row)
+                for row in connection.execute(
+                    text(
+                        """
+                        select diagnostics.*, evidence.quote, evidence.start_ms, evidence.end_ms,
+                               evidence.relevance, evidence.source_recording_id,
+                               evidence.source_chunk_id, recordings.title as recording_title
+                        from rag_evaluation_evidence_diagnostics diagnostics
+                        join rag_evaluation_evidence evidence on evidence.id = diagnostics.evidence_id
+                        left join recordings on recordings.id = evidence.source_recording_id
+                        where diagnostics.evaluation_run_id = :run_id
+                        order by diagnostics.case_result_id, evidence.relevance desc, evidence.id
+                        """
+                    ),
+                    {"run_id": run_id},
+                ).mappings()
+            ]
+            journeys_by_case: dict[object, list[dict[str, Any]]] = defaultdict(list)
+            all_journeys: list[dict[str, Any]] = []
+            for row in journey_rows:
+                journey = {
+                    "diagnostic_version": row["diagnostic_version"],
+                    "evidence_id": str(row["evidence_id"]),
+                    "recording_id": str(row["source_recording_id"]),
+                    "recording_title": row["recording_title"],
+                    "source_chunk_id": str(row["source_chunk_id"]) if row["source_chunk_id"] else None,
+                    "quote": row["quote"],
+                    "start_ms": row["start_ms"],
+                    "end_ms": row["end_ms"],
+                    "relevance": row["relevance"],
+                    "final_covered": row["final_covered"],
+                    "last_visible_node": row["last_visible_node"],
+                    "first_loss_node": row["first_loss_node"],
+                    "stages": row["stage_journey"],
+                }
+                journeys_by_case[row["case_result_id"]].append(journey)
+                all_journeys.append(journey)
             for case in cases:
+                case["evidence_journeys"] = journeys_by_case.get(case["id"], [])
                 steps = [
                     dict(row)
                     for row in connection.execute(
@@ -703,13 +920,19 @@ class RagEvaluationService:
                         ).mappings()
                     ]
                 case["steps"] = steps
-            return {"run": dict(run), "metrics": metrics, "cases": cases}
+            return {
+                "run": dict(run),
+                "metrics": metrics,
+                "cases": cases,
+                "evidence_diagnosis": summarize_journeys(all_journeys),
+            }
 
     def cancel_run(self, user: CurrentUser, run_id: UUID) -> dict[str, Any]:
         with self._engine.begin() as connection:
-            row = connection.execute(
-                text(
-                    """
+            row = (
+                connection.execute(
+                    text(
+                        """
                     update evaluation_runs
                     set cancel_requested = true, updated_at = now()
                     where id = :run_id and workspace_id = :workspace_id
@@ -717,9 +940,12 @@ class RagEvaluationService:
                       and status in ('queued', 'running')
                     returning *
                     """
-                ),
-                {"run_id": run_id, "workspace_id": user.current_workspace_id},
-            ).mappings().one_or_none()
+                    ),
+                    {"run_id": run_id, "workspace_id": user.current_workspace_id},
+                )
+                .mappings()
+                .one_or_none()
+            )
             if row is None:
                 raise RagEvaluationConflictError("Run cannot be cancelled")
             return dict(row)
@@ -750,9 +976,11 @@ class RagEvaluationService:
                     select chunks.*, models.id as current_embedding_model_id
                     from recording_search_chunks chunks
                     join recordings on recordings.id = chunks.recording_id
-                    join embedding_models models on models.id = chunks.embedding_model_id
+                    join recording_search_chunk_embeddings vectors on vectors.chunk_id = chunks.id
+                    join embedding_models models on models.id = vectors.embedding_model_id
                     where recordings.workspace_id = :workspace_id
                       and recordings.status = 'completed'
+                      and vectors.model_key = :model_key
                       and models.provider = 'sentence_transformers'
                       and models.model_name = :model_name
                       and models.dimensions = :dimensions
@@ -761,6 +989,7 @@ class RagEvaluationService:
                 ),
                 {
                     "workspace_id": user.current_workspace_id,
+                    "model_key": self._settings.embedding_profile,
                     "model_name": self._settings.embedding_model,
                     "dimensions": self._settings.embedding_dimensions,
                 },
@@ -769,8 +998,7 @@ class RagEvaluationService:
         if not rows:
             raise RagEvaluationConflictError("当前 Workspace 没有可评测的 SearchChunk 索引")
         checksum_payload = [
-            [str(row["id"]), str(row["recording_id"]), row["chunk_index"], _content_checksum(str(row["text"]), row["start_ms"], row["end_ms"])]
-            for row in rows
+            [str(row["id"]), str(row["recording_id"]), row["chunk_index"], _content_checksum(str(row["text"]), row["start_ms"], row["end_ms"])] for row in rows
         ]
         checksum = _stable_checksum(checksum_payload)
         existing = connection.execute(
@@ -803,7 +1031,13 @@ class RagEvaluationService:
                     "workspace_id": user.current_workspace_id,
                     "name": f"自动快照 {checksum[:8]}",
                     "embedding_model_id": rows[0]["current_embedding_model_id"],
-                    "config": _json({"embedding_model": self._settings.embedding_model, "dimensions": self._settings.embedding_dimensions}),
+                    "config": _json(
+                        {
+                            "embedding_profile": self._settings.embedding_profile,
+                            "embedding_model": self._settings.embedding_model,
+                            "dimensions": self._settings.embedding_dimensions,
+                        }
+                    ),
                     "recording_count": len({row["recording_id"] for row in rows}),
                     "chunk_count": len(rows),
                     "user_id": user.id,
@@ -847,12 +1081,19 @@ class RagEvaluationService:
         config = {
             "retrieval_contract_version": "1",
             "embedding": {
+                "profile": self._settings.embedding_profile,
                 "provider": "sentence_transformers",
                 "model": self._settings.embedding_model,
                 "dimensions": self._settings.embedding_dimensions,
+                "distance_metric": "cosine",
             },
             "hybrid_enabled": self._settings.rag_hybrid_search_enabled,
             "online_default_model": self._settings.rag_online_default_model,
+            "answer_judge": {
+                "model": self._settings.rag_answer_judge_model,
+                "prompt_version": self._settings.rag_answer_judge_prompt_version,
+                "max_output_tokens": self._settings.rag_answer_judge_max_output_tokens,
+            },
             "query_term_expansion_enabled": self._settings.rag_query_term_expansion_enabled,
             "vector_top_k": self._settings.rag_vector_candidate_limit,
             "lexical_top_k": self._settings.rag_lexical_candidate_limit,
@@ -921,9 +1162,36 @@ class RagEvaluationService:
                     {"case_id": case["id"]},
                 ).mappings()
             ]
-            if not case["evidence"]:
-                raise RagEvaluationConflictError(f"问题 {case['query']} 没有正确 Chunk")
+            annotation = self._annotation_from_row(case)
+            self._validate_answer_annotation(annotation, cast(list[dict[str, Any]], case["evidence"]))
         return cases
+
+    @staticmethod
+    def _draft_evidence(connection: Connection, case_id: UUID) -> list[dict[str, Any]]:
+        return [
+            dict(row)
+            for row in connection.execute(
+                text("select * from rag_evaluation_evidence_drafts where case_draft_id = :case_id order by id"),
+                {"case_id": case_id},
+            ).mappings()
+        ]
+
+    @staticmethod
+    def _annotation_from_row(row: Mapping[str, object]) -> AnswerAnnotation:
+        raw = row.get("answer_annotation")
+        if raw is None:
+            raise RagEvaluationConflictError("请先保存答案标注")
+        try:
+            return AnswerAnnotation.model_validate(raw)
+        except ValueError as error:
+            raise RagEvaluationConflictError(f"答案标注无效：{error}") from error
+
+    @staticmethod
+    def _validate_answer_annotation(annotation: AnswerAnnotation, evidence: list[dict[str, Any]]) -> None:
+        try:
+            annotation.validate_case_evidence({UUID(str(item["id"])) for item in evidence})
+        except ValueError as error:
+            raise RagEvaluationConflictError(str(error)) from error
 
     @staticmethod
     def _return_case_to_draft(connection: Connection, case_id: UUID) -> None:
@@ -963,13 +1231,14 @@ class RagEvaluationService:
         for_update: bool = False,
     ) -> dict[str, Any]:
         suffix = " for update" if for_update else ""
-        row = connection.execute(
-            text(
-                "select * from evaluation_datasets where id = :dataset_id and workspace_id = :workspace_id "
-                "and task_type = 'rag_retrieval'" + suffix
-            ),
-            {"dataset_id": dataset_id, "workspace_id": user.current_workspace_id},
-        ).mappings().one_or_none()
+        row = (
+            connection.execute(
+                text("select * from evaluation_datasets where id = :dataset_id and workspace_id = :workspace_id and task_type = 'rag_retrieval'" + suffix),
+                {"dataset_id": dataset_id, "workspace_id": user.current_workspace_id},
+            )
+            .mappings()
+            .one_or_none()
+        )
         if row is None:
             raise RagEvaluationNotFoundError("RAG evaluation dataset not found")
         return dict(row)
@@ -983,17 +1252,22 @@ class RagEvaluationService:
         for_update: bool = False,
     ) -> dict[str, Any]:
         suffix = " for update" if for_update else ""
-        row = connection.execute(
-            text(
-                """
+        row = (
+            connection.execute(
+                text(
+                    """
                 select drafts.* from rag_evaluation_case_drafts drafts
                 join evaluation_datasets datasets on datasets.id = drafts.dataset_id
                 where drafts.id = :case_id and datasets.workspace_id = :workspace_id
                   and datasets.task_type = 'rag_retrieval'
-                """ + suffix
-            ),
-            {"case_id": case_id, "workspace_id": user.current_workspace_id},
-        ).mappings().one_or_none()
+                """
+                    + suffix
+                ),
+                {"case_id": case_id, "workspace_id": user.current_workspace_id},
+            )
+            .mappings()
+            .one_or_none()
+        )
         if row is None:
             raise RagEvaluationNotFoundError("RAG evaluation case not found")
         return dict(row)

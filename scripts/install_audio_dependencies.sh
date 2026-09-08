@@ -154,7 +154,8 @@ load_env_file() {
   TRANSCRIPT_ALIGNMENT_ENABLED="${TRANSCRIPT_ALIGNMENT_ENABLED:-true}"
   TRANSCRIPT_ALIGNMENT_MODEL="${TRANSCRIPT_ALIGNMENT_MODEL:-Qwen/Qwen3-ForcedAligner-0.6B}"
   EMBEDDING_ENABLED="${EMBEDDING_ENABLED:-true}"
-  EMBEDDING_MODEL="${EMBEDDING_MODEL:-Qwen/Qwen3-Embedding-4B}"
+  EMBEDDING_PROFILE="${EMBEDDING_PROFILE:-qwen3-4b}"
+  EMBEDDING_PRELOAD_PROFILES="${EMBEDDING_PRELOAD_PROFILES:-qwen3-0.6b}"
   EMBEDDING_MODEL_CACHE_DIR="${EMBEDDING_MODEL_CACHE_DIR:-model-cache/embedding}"
   RAG_ANSWER_ENABLED="${RAG_ANSWER_ENABLED:-true}"
   RAG_LOCAL_MODEL_REPO="${RAG_LOCAL_MODEL_REPO:-Qwen/Qwen3-4B-GGUF}"
@@ -715,6 +716,20 @@ ensure_huggingface_snapshot() {
   "${VENV_PYTHON}" -u "${ROOT_DIR}/scripts/ensure_hf_snapshot.py" "${model_name}" "${cache_dir}"
 }
 
+embedding_model_for_profile() {
+  case "$1" in
+    qwen3-4b)
+      printf '%s\n' "Qwen/Qwen3-Embedding-4B"
+      ;;
+    qwen3-0.6b)
+      printf '%s\n' "Qwen/Qwen3-Embedding-0.6B"
+      ;;
+    *)
+      fail "Unknown embedding preload profile: $1"
+      ;;
+  esac
+}
+
 ensure_qwen_asr() {
   local python_version
   python_version="$("${VENV_PYTHON}" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
@@ -833,7 +848,36 @@ ensure_embedding_runtime() {
   fi
 
   local embedding_cache_dir="${ROOT_DIR}/${EMBEDDING_MODEL_CACHE_DIR}"
-  ensure_huggingface_snapshot "${EMBEDDING_MODEL}" "${embedding_cache_dir}" "embedding"
+  local active_embedding_model
+  active_embedding_model="$(embedding_model_for_profile "${EMBEDDING_PROFILE}")"
+  local -a embedding_models=("${active_embedding_model}")
+  local -a preload_profiles=()
+  local profile
+  local preload_model
+  local existing_model
+  local already_added
+  IFS=',' read -r -a preload_profiles <<< "${EMBEDDING_PRELOAD_PROFILES}"
+  for profile in "${preload_profiles[@]}"; do
+    profile="${profile#"${profile%%[![:space:]]*}"}"
+    profile="${profile%"${profile##*[![:space:]]}"}"
+    if [[ -z "${profile}" ]]; then
+      continue
+    fi
+    preload_model="$(embedding_model_for_profile "${profile}")"
+    already_added="false"
+    for existing_model in "${embedding_models[@]}"; do
+      if [[ "${existing_model}" == "${preload_model}" ]]; then
+        already_added="true"
+        break
+      fi
+    done
+    if [[ "${already_added}" == "false" ]]; then
+      embedding_models+=("${preload_model}")
+    fi
+  done
+  for preload_model in "${embedding_models[@]}"; do
+    ensure_huggingface_snapshot "${preload_model}" "${embedding_cache_dir}" "embedding"
+  done
   if [[ "${RAG_RERANK_ENABLED:-true}" == "true" ]]; then
     local rerank_cache_dir="${ROOT_DIR}/${RAG_RERANK_MODEL_CACHE_DIR}"
     ensure_huggingface_snapshot "${RAG_RERANK_MODEL}" "${rerank_cache_dir}" "RAG reranker"

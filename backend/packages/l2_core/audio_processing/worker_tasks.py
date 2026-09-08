@@ -85,14 +85,17 @@ class EmbeddingEncodeTaskInput(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     texts: list[str] = Field(min_length=1)
+    embedding_profile: str = Field(min_length=1)
 
 
 class EmbeddingEncodeTaskResult(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     provider: str
+    embedding_profile: str
     model_name: str
     dimensions: int = Field(gt=0)
+    distance_metric: str
     vectors: list[list[float]]
 
 
@@ -130,11 +133,11 @@ def alignment_inference_batch_command(
     )
 
 
-def embedding_encode_command(texts: Sequence[str]) -> ComputeCommand[EmbeddingEncodeTaskInput]:
+def embedding_encode_command(texts: Sequence[str], embedding_profile: str) -> ComputeCommand[EmbeddingEncodeTaskInput]:
     return ComputeCommand(
         task_id=uuid4(),
         operation="embedding.encode",
-        operation_version="1",
+        operation_version="2",
         resource_queue=ResourceQueue.GPU_NORMAL,
-        input=EmbeddingEncodeTaskInput(texts=list(texts)),
+        input=EmbeddingEncodeTaskInput(texts=list(texts), embedding_profile=embedding_profile),
     )
