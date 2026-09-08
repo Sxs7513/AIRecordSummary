@@ -324,7 +324,7 @@ def test_partial_failure_retry_reopens_the_same_processing_run() -> None:
                 "processing_id": str(processing_id),
                 "subject_id": str(recording_id),
                 "pipeline_name": "recording_processing",
-                "pipeline_version": "26",
+                "pipeline_version": "27",
                 "status": "partial_failed",
                 "stages": {"generate_summary": {"status": "failed"}},
             },

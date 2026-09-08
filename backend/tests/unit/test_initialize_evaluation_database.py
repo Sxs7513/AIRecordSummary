@@ -55,6 +55,8 @@ def test_evaluation_schema_is_additive_and_separate_from_base_schema() -> None:
     assert "rag_evaluation_evidence_source_recording_id_fkey" in schema
     assert "rag_corpus_snapshot_chunks_recording_id_fkey" in schema
     assert "rag_evaluation_ranked_results_recording_id_fkey" in schema
+    assert "create table if not exists rag_evaluation_evidence_diagnostics" in schema
+    assert "rag_evaluation_evidence_diagnostics_run_loss_idx" in schema
     assert "app.evaluation_maintenance" in schema
     assert "source_draft_correction_id uuid" not in schema
     assert "references rag_adjudication_evaluation_correction_drafts" not in schema

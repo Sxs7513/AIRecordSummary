@@ -6,11 +6,12 @@ from l1_foundation.pipeline.definitions.graph import ArtifactBinding, PipelineDe
 CPU_RETRY = RetryPolicy(initial_backoff_seconds=10)
 GPU_RETRY = RetryPolicy(initial_backoff_seconds=30)
 
+
 def build_recording_processing() -> PipelineDefinition:
     """Assemble the recording business pipeline with Qwen ASR."""
     return PipelineDefinition(
         name="recording_processing",
-        version="26",
+        version="27",
         nodes=(
             PipelineNode(
                 "normalize_audio",
@@ -93,7 +94,7 @@ def build_recording_processing() -> PipelineDefinition:
             PipelineNode(
                 "embedding_indexing",
                 "embedding_indexing",
-                "8",
+                "9",
                 GPU_RETRY,
                 depends_on=("build_search_chunks",),
                 required=False,
@@ -112,7 +113,7 @@ def build_recording_processing() -> PipelineDefinition:
             PipelineNode(
                 "summary_embedding_indexing",
                 "summary_embedding_indexing",
-                "1",
+                "2",
                 GPU_RETRY,
                 depends_on=("generate_summary",),
                 required=False,

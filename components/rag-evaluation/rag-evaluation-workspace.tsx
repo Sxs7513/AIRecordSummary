@@ -5,6 +5,8 @@ import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 
 import { ragEvaluationRequest } from "@/app/sdk/rag-evaluation/client";
 import type {
+  AnswerAnnotation,
+  AnswerVerdict,
   RagEvalCase,
   RagEvalDataset,
   RagEvalDatasetDetail,
@@ -28,7 +30,10 @@ const operationLabels: Record<string, string> = {
   "retrieve.expand": "Expand",
   "retrieve.rerank": "Rerank",
   "retrieve.empty": "Empty Retrieval",
-  "route.unresolved": "Route Unresolved"
+  "route.unresolved": "Route Unresolved",
+  "grade.evidence": "Evidence Grade",
+  "answer.generate": "Generated Answer",
+  "evaluate.answer": "Answer Judge"
 };
 
 const retrievalOperationOrder: Record<string, number> = {
@@ -42,12 +47,28 @@ const retrievalOperationOrder: Record<string, number> = {
   "retrieve.rerank": 5
 };
 
+const diagnosisNodeLabels: Record<string, string> = {
+  base_retrieval: "基础召回",
+  rrf: "RRF",
+  expand: "Expand",
+  rerank: "Rerank",
+  unknown: "未知"
+};
+
+const diagnosisStageOrder = ["base_retrieval", "rrf", "expand", "rerank"];
+
 function compareRetrievalOperations(left: string, right: string) {
   const fallbackRank = Object.keys(retrievalOperationOrder).length;
   return (retrievalOperationOrder[left] ?? fallbackRank) - (retrievalOperationOrder[right] ?? fallbackRank);
 }
 
 const CHUNK_PAGE_SIZE = 50;
+
+const emptyAnswerAnnotation: AnswerAnnotation = {
+  expected_verdict: "direct_answer",
+  reference_answer: "",
+  key_points: []
+};
 
 export function RagEvaluationWorkspace() {
   const [datasets, setDatasets] = useState<RagEvalDataset[]>([]);
@@ -64,8 +85,13 @@ export function RagEvaluationWorkspace() {
   const [runDetail, setRunDetail] = useState<RagEvalRunDetail | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [answerDraft, setAnswerDraft] = useState<AnswerAnnotation>(emptyAnswerAnnotation);
 
   const selectedCase = detail?.cases.find((item) => item.id === selectedCaseId) ?? null;
+
+  useEffect(() => {
+    setAnswerDraft(selectedCase?.answer_annotation ?? emptyAnswerAnnotation);
+  }, [selectedCase]);
 
   const loadDatasets = useCallback(async () => {
     const result = await ragEvaluationRequest<RagEvalDataset[]>("/datasets");
@@ -194,6 +220,54 @@ export function RagEvaluationWorkspace() {
       await ragEvaluationRequest(`/evidence/${evidenceId}`, { method: "DELETE" });
       await loadDetail();
     });
+  }
+
+  async function suggestAnswerAnnotation() {
+    if (!selectedCase) return;
+    await perform(async () => {
+      const suggestion = await ragEvaluationRequest<AnswerAnnotation>(
+        `/cases/${selectedCase.id}/answer-annotation:suggest`,
+        { method: "POST" }
+      );
+      setAnswerDraft(suggestion);
+    });
+  }
+
+  async function saveAnswerAnnotation() {
+    if (!selectedCase) return;
+    await perform(async () => {
+      await ragEvaluationRequest(`/cases/${selectedCase.id}/answer-annotation`, {
+        method: "PUT",
+        body: JSON.stringify({ annotation: answerDraft })
+      });
+      await loadDetail();
+    });
+  }
+
+  function addKeyPoint() {
+    setAnswerDraft((current) => ({
+      ...current,
+      key_points: [
+        ...current.key_points,
+        { id: `kp-${current.key_points.length + 1}`, text: "", evidence_ids: [] }
+      ]
+    }));
+  }
+
+  function updateKeyPoint(index: number, update: Partial<AnswerAnnotation["key_points"][number]>) {
+    setAnswerDraft((current) => ({
+      ...current,
+      key_points: current.key_points.map((item, itemIndex) => itemIndex === index ? { ...item, ...update } : item)
+    }));
+  }
+
+  function selectVerdict(verdict: AnswerVerdict) {
+    setAnswerDraft((current) => ({
+      ...current,
+      expected_verdict: verdict,
+      reference_answer: verdict === "abstain" ? null : current.reference_answer ?? "",
+      key_points: verdict === "abstain" ? [] : current.key_points
+    }));
   }
 
   async function transition(item: RagEvalCase, action: "review" | "approve") {
@@ -334,7 +408,7 @@ export function RagEvaluationWorkspace() {
                           <small>{item.evidence.length} 条正确证据</small>
                         </button>
                         <div className="actions">
-                          {!item.archived_at && item.status === "draft" && <button className="button secondary" disabled={busy || !item.evidence.length} onClick={() => transition(item, "review")}>提交审核</button>}
+                          {!item.archived_at && item.status === "draft" && <button className="button secondary" disabled={busy || !canReview(item)} onClick={() => transition(item, "review")}>提交审核</button>}
                           {!item.archived_at && item.status === "reviewed" && <button className="button secondary" disabled={busy} onClick={() => transition(item, "approve")}>批准</button>}
                           {!item.archived_at && <button className="button secondary" disabled={busy} onClick={() => archiveCase(item)}>归档</button>}
                           {!item.archived_at && <button className="button danger" disabled={busy} onClick={() => deleteCase(item)}>删除</button>}
@@ -420,6 +494,91 @@ export function RagEvaluationWorkspace() {
               </section>
 
               <section className="panel">
+                <div className="rag-eval-section-title">
+                  <div>
+                    <h2>答案标注</h2>
+                    <p className="subtle">模型只生成草稿；人工确认并保存后，问题会回到 draft。</p>
+                  </div>
+                  <button className="button secondary" disabled={busy || !selectedCase} onClick={() => void suggestAnswerAnnotation()}>
+                    根据 Gold Evidence 生成草稿
+                  </button>
+                </div>
+                {!selectedCase ? <p className="subtle">选择一个问题后编辑答案标注。</p> : (
+                  <div className="grid">
+                    <label>预期 Verdict
+                      <select
+                        value={answerDraft.expected_verdict}
+                        onChange={(event) => selectVerdict(event.target.value as AnswerVerdict)}
+                      >
+                        <option value="direct_answer">Direct Answer</option>
+                        <option value="qualified_answer">Qualified Answer</option>
+                        <option value="abstain">Abstain</option>
+                      </select>
+                    </label>
+                    {answerDraft.expected_verdict !== "abstain" ? (
+                      <label>参考答案
+                        <textarea
+                          rows={4}
+                          value={answerDraft.reference_answer ?? ""}
+                          onChange={(event) => setAnswerDraft((current) => ({ ...current, reference_answer: event.target.value }))}
+                        />
+                      </label>
+                    ) : (
+                      <p className="subtle">无答案 Case 不需要参考答案或 Key Point；可以保留相关但不足以回答的 Gold Evidence，用于评测正确拒答。</p>
+                    )}
+                    {answerDraft.expected_verdict !== "abstain" ? (
+                      <div className="grid">
+                        <div className="rag-eval-section-title">
+                          <h3>Key Points</h3>
+                          <button className="button secondary" disabled={busy} onClick={addKeyPoint}>添加 Key Point</button>
+                        </div>
+                        {answerDraft.key_points.map((keyPoint, index) => (
+                          <article className="rag-eval-evidence" key={`${keyPoint.id}-${index}`}>
+                            <label>ID
+                              <input value={keyPoint.id} onChange={(event) => updateKeyPoint(index, { id: event.target.value })} />
+                            </label>
+                            <label>关键事实
+                              <textarea rows={2} value={keyPoint.text} onChange={(event) => updateKeyPoint(index, { text: event.target.value })} />
+                            </label>
+                            <fieldset>
+                              <legend>支持证据</legend>
+                              {selectedCase.evidence.map((evidence) => (
+                                <label key={evidence.id}>
+                                  <input
+                                    type="checkbox"
+                                    checked={keyPoint.evidence_ids.includes(evidence.id)}
+                                    onChange={(event) => updateKeyPoint(index, {
+                                      evidence_ids: event.target.checked
+                                        ? [...keyPoint.evidence_ids, evidence.id]
+                                        : keyPoint.evidence_ids.filter((id) => id !== evidence.id)
+                                    })}
+                                  />
+                                  {evidence.recording_title} · {formatTime(evidence.start_ms)}–{formatTime(evidence.end_ms)}
+                                </label>
+                              ))}
+                            </fieldset>
+                            <button
+                              className="button danger"
+                              disabled={busy}
+                              onClick={() => setAnswerDraft((current) => ({
+                                ...current,
+                                key_points: current.key_points.filter((_, itemIndex) => itemIndex !== index)
+                              }))}
+                            >
+                              删除 Key Point
+                            </button>
+                          </article>
+                        ))}
+                      </div>
+                    ) : null}
+                    <div className="actions">
+                      <button className="button" disabled={busy} onClick={() => void saveAnswerAnnotation()}>保存答案标注</button>
+                    </div>
+                  </div>
+                )}
+              </section>
+
+              <section className="panel">
                 <h2>冻结版本</h2>
                 <div className="rag-eval-version-list">
                   {detail.versions.map((version) => (
@@ -460,12 +619,27 @@ function ChunkCandidate({ chunk, busy, onAdd }: { chunk: SearchChunk; busy: bool
 }
 
 function RunWorkspace({ runs, detail, busy, onOpen, onDelete }: { runs: RagEvalRun[]; detail: RagEvalRunDetail | null; busy: boolean; onOpen: (id: string) => void; onDelete: (run: RagEvalRun) => Promise<void> }) {
+  const [lossNodeFilter, setLossNodeFilter] = useState("");
   const finalMetrics = useMemo(() => detail?.metrics.filter((item) => item.scope === "run") ?? [], [detail]);
   const operations = useMemo(() => {
     const rows = detail?.metrics.filter((item) => item.scope === "operation") ?? [];
     return Array.from(new Set(rows.map((item) => item.operation).filter((item): item is string => Boolean(item))))
       .sort(compareRetrievalOperations);
   }, [detail]);
+  const stepMetricsById = useMemo(() => {
+    const grouped = new Map<string, RagEvalMetric[]>();
+    for (const item of detail?.metrics ?? []) {
+      if (item.scope !== "step" || !item.step_result_id) continue;
+      const stepMetrics = grouped.get(item.step_result_id) ?? [];
+      stepMetrics.push(item);
+      grouped.set(item.step_result_id, stepMetrics);
+    }
+    return grouped;
+  }, [detail]);
+  const visibleCases = useMemo(() => {
+    if (!detail || !lossNodeFilter) return detail?.cases ?? [];
+    return detail.cases.filter((item) => item.evidence_journeys.some((journey) => (journey.first_loss_node || "unknown") === lossNodeFilter));
+  }, [detail, lossNodeFilter]);
   return (
     <section className="panel grid">
       <h2>评测 Run</h2>
@@ -491,6 +665,41 @@ function RunWorkspace({ runs, detail, busy, onOpen, onDelete }: { runs: RagEvalR
             <MetricCard label="MRR" metric={metric(finalMetrics, "reciprocal_rank")} />
             <MetricCard label="nDCG@10" metric={metric(finalMetrics, "ndcg_at_10")} />
           </div>
+          <div className="stats rag-eval-stats">
+            <MetricCard label="Answer Score" metric={metric(finalMetrics, "answer_score")} suffix=" / 100" />
+            <MetricCard label="答案正确率" metric={metric(finalMetrics, "answer_correctness")} percent />
+            <MetricCard label="Key Point 覆盖率" metric={metric(finalMetrics, "key_point_coverage")} percent />
+            <MetricCard label="引用支持率" metric={metric(finalMetrics, "citation_support_rate")} percent />
+            <MetricCard label="可回答性准确率" metric={metric(finalMetrics, "answerability_accuracy")} percent />
+            <MetricCard label="错误作答率" metric={metric(finalMetrics, "unsafe_answer")} percent />
+            <MetricCard label="Judge 失败率" metric={metric(finalMetrics, "answer_evaluation_failure")} percent />
+          </div>
+          {detail.evidence_diagnosis.gold_count > 0 ? (
+            <div className="rag-eval-diagnosis-overview">
+              <div className="rag-eval-diagnosis-heading">
+                <div>
+                  <h3>Gold 节点丢失</h3>
+                  <p className="subtle">已覆盖 {detail.evidence_diagnosis.covered_gold_count}/{detail.evidence_diagnosis.gold_count} 条 Gold</p>
+                </div>
+                <label>
+                  筛选丢失节点
+                  <select value={lossNodeFilter} onChange={(event) => setLossNodeFilter(event.target.value)}>
+                    <option value="">全部 Case</option>
+                    {Object.keys(detail.evidence_diagnosis.first_loss_node_counts).map((node) => (
+                      <option key={node} value={node}>{diagnosisNodeLabels[node] || node}</option>
+                    ))}
+                  </select>
+                </label>
+              </div>
+              <div className="rag-eval-loss-nodes">
+                {Object.entries(detail.evidence_diagnosis.first_loss_node_counts).map(([node, count]) => (
+                  <button className={`badge ${lossNodeFilter === node ? "active" : ""}`} key={node} onClick={() => setLossNodeFilter(lossNodeFilter === node ? "" : node)}>
+                    {diagnosisNodeLabels[node] || node} · {count}
+                  </button>
+                ))}
+              </div>
+            </div>
+          ) : null}
           <div className="table-wrap">
             <table>
               <thead><tr><th>阶段</th><th>Hit@5</th><th>Recall@10</th><th>MRR</th><th>nDCG@10</th></tr></thead>
@@ -506,33 +715,172 @@ function RunWorkspace({ runs, detail, busy, onOpen, onDelete }: { runs: RagEvalR
             </table>
           </div>
           <div className="rag-eval-result-cases">
-            {detail.cases.map((item) => (
-              <details className="rag-eval-result-case" key={item.id}>
-                <summary><span>{item.query}</span><span className={`badge ${item.status}`}>{item.status}</span><span>{item.latency_ms ?? 0} ms</span></summary>
-                {item.error_message && <p className="error">{item.error_message}</p>}
-                {[...item.steps].sort((left, right) => compareRetrievalOperations(left.operation, right.operation)).map((step) => (
-                  <div className="rag-eval-step" key={step.id}>
-                    <h3>
-                      {operationLabels[step.operation] || step.operation}
-                      {typeof step.details.query === "string" ? <small> · {step.details.query}</small> : null}{" "}
-                      <small>{step.latency_ms ?? 0} ms · {step.output.candidate_count ?? 0} candidates</small>
-                    </h3>
-                    <ol>{step.ranked_results.slice(0, 10).map((ranked) => (
-                      <li className={ranked.matched_relevance > 0 ? "matched" : ""} key={ranked.rank}>
-                        <span>#{ranked.rank}</span>
-                        <div><strong>{ranked.recording_title}</strong><p>{ranked.details?.text || ranked.text || ""}</p></div>
-                        <span>{ranked.matched_relevance > 0 ? `命中 R${ranked.matched_relevance}` : "未命中"}</span>
-                      </li>
-                    ))}</ol>
-                  </div>
-                ))}
-              </details>
-            ))}
+            {visibleCases.map((item) => {
+              const caseMetrics = finalCaseRetrievalMetrics(stepMetricsById, item);
+              const answerMetrics = metricsForAnswerStep(stepMetricsById, item);
+              const coveredGold = item.evidence_journeys.filter((journey) => journey.final_covered).length;
+              const lossSummary = countLossNodes(item.evidence_journeys);
+              return (
+                <details className="rag-eval-result-case" key={item.id}>
+                  <summary>
+                    <span>{item.query}</span>
+                    <span
+                      className="rag-eval-case-metrics"
+                      title={caseMetrics.operation ? `最终检索阶段：${operationLabels[caseMetrics.operation] || caseMetrics.operation}` : undefined}
+                    >
+                      <span className={`badge ${caseMetrics.hitAt5 === null ? "" : caseMetrics.hitAt5 > 0 ? "succeeded" : "failed"}`}>
+                        Hit@5 {caseMetrics.hitAt5 === null ? "—" : caseMetrics.hitAt5 > 0 ? "命中" : "未命中"}
+                      </span>
+                      <span className="badge">Recall@10 {formatMetric(caseMetrics.recallAt10, true)}</span>
+                      <span className="badge">
+                        Answer Score {formatScore(answerMetrics.answerScore)}
+                      </span>
+                      {typeof item.details.expected_verdict === "string" ? <span className="badge">Expected {item.details.expected_verdict}</span> : null}
+                      {typeof item.details.actual_verdict === "string" ? <span className="badge">Actual {item.details.actual_verdict}</span> : null}
+                      {item.evidence_journeys.length > 0 ? <span className="badge">Gold {coveredGold}/{item.evidence_journeys.length}</span> : null}
+                      {Object.entries(lossSummary).map(([node, count]) => (
+                        <span className="badge failed" key={node}>{diagnosisNodeLabels[node] || node} ×{count}</span>
+                      ))}
+                    </span>
+                    <span className={`badge ${item.status}`}>{item.status}</span>
+                    <span>{item.latency_ms ?? 0} ms</span>
+                  </summary>
+                  {item.error_message && <p className="error">{item.error_message}</p>}
+                  {item.answer_annotation?.reference_answer ? (
+                    <div className="rag-eval-step">
+                      <h3>Reference Answer</h3>
+                      <p>{item.answer_annotation.reference_answer}</p>
+                    </div>
+                  ) : null}
+                  {item.evidence_journeys.length > 0 ? (
+                    <div className="rag-eval-gold-journeys">
+                      <h3>Gold Evidence 节点轨迹</h3>
+                      {item.evidence_journeys.map((journey) => (
+                        <article className="rag-eval-gold-journey" key={journey.evidence_id}>
+                          <div className="rag-eval-gold-heading">
+                            <div><strong>R{journey.relevance} · {journey.recording_title || "未知录音"}</strong><p>{journey.quote}</p></div>
+                            <span className={`badge ${journey.final_covered ? "succeeded" : "failed"}`}>
+                              {journey.final_covered ? "最终覆盖" : `丢失于 ${diagnosisNodeLabels[journey.first_loss_node || "unknown"] || journey.first_loss_node}`}
+                            </span>
+                          </div>
+                          <div className="rag-eval-gold-stages">
+                            {diagnosisStageOrder.map((node) => {
+                              const stage = journey.stages[node];
+                              if (!stage) return null;
+                              return (
+                                <div className={`rag-eval-gold-stage ${stage.status}`} key={node} title={stage.operation || undefined}>
+                                  <span>{diagnosisNodeLabels[node] || node}</span>
+                                  <strong>{stageStatusLabel(stage.status, stage.best_rank)}</strong>
+                                  {stage.match_kind ? <small>{stage.match_kind}</small> : null}
+                                </div>
+                              );
+                            })}
+                          </div>
+                        </article>
+                      ))}
+                    </div>
+                  ) : null}
+                  {[...item.steps].sort((left, right) => left.sequence - right.sequence).map((step) => (
+                    <div className="rag-eval-step" key={step.id}>
+                      <h3>
+                        {operationLabels[step.operation] || step.operation}
+                        {typeof step.details.query === "string" ? <small> · {step.details.query}</small> : null}{" "}
+                        <small>
+                          {step.latency_ms ?? 0} ms
+                          {typeof step.output.candidate_count === "number" ? ` · ${step.output.candidate_count} candidates` : ""}
+                        </small>
+                      </h3>
+                      {step.error_message ? <p className="error">{step.error_message}</p> : null}
+                      {step.output.answer ? <p>{step.output.answer}</p> : null}
+                      {step.output.sources?.length ? (
+                        <ul className="rag-eval-answer-sources">
+                          {step.output.sources.map((source) => (
+                            <li key={`${source.index}-${source.chunk.id}`}>
+                              [{source.index}] {source.recording.title || source.recording.fileName} · {formatTime(source.chunk.startMs)}–{formatTime(source.chunk.endMs)}
+                            </li>
+                          ))}
+                        </ul>
+                      ) : null}
+                      {step.output.verdict ? <p className="subtle">Verdict: {step.output.verdict} · {step.output.reason || "无说明"}</p> : null}
+                      {typeof step.output.answerability_correct === "boolean" || typeof step.output.verdict_correct === "boolean" ? (
+                        <div className="grid">
+                          {typeof step.output.answerability_correct === "boolean" ? (
+                            <p className="subtle">可回答性判断 {step.output.answerability_correct ? "正确" : "错误"}</p>
+                          ) : (
+                            <p className="subtle">Verdict {step.output.verdict_correct ? "正确" : "错误"}</p>
+                          )}
+                          {step.output.key_point_results?.map((result) => (
+                            <p key={result.key_point_id}>
+                              <strong>{result.key_point_id}</strong> · 覆盖 {result.covered ? "是" : "否"} · 正确 {result.correct ? "是" : "否"} · {result.reason}
+                            </p>
+                          ))}
+                          {step.output.claim_results?.map((result, index) => (
+                            <p key={`${result.claim}-${index}`}>
+                              <strong>Claim</strong> · {result.claim} · 事实 {claimFactualStatusLabel(result.factual_status)} · 引用 {claimCitationStatusLabel(result.citation_status)}
+                              {result.citation_indexes.length ? ` [${result.citation_indexes.join(", ")}]` : ""} · {result.reason}
+                            </p>
+                          ))}
+                          {!step.output.claim_results && step.output.citation_results?.map((result, index) => (
+                            <p key={`${result.claim}-${index}`}>
+                              <strong>Claim</strong> · {result.claim} · 引用 {result.citation_indexes.join(", ") || "无"} · {result.supported ? "支持" : "不支持"} · {result.reason}
+                            </p>
+                          ))}
+                          {!step.output.claim_results && step.output.unsupported_claims?.length ? <p className="error">无支持 Claim：{step.output.unsupported_claims.join("；")}</p> : null}
+                          {!step.output.claim_results && step.output.contradictions?.length ? <p className="error">冲突：{step.output.contradictions.join("；")}</p> : null}
+                        </div>
+                      ) : null}
+                      <RankedResultList results={step.ranked_results} />
+                    </div>
+                  ))}
+                </details>
+              );
+            })}
           </div>
         </>
       )}
     </section>
   );
+}
+
+function RankedResultList({ results }: { results: RagEvalRunDetail["cases"][number]["steps"][number]["ranked_results"] }) {
+  const visible = results.slice(0, 10);
+  const collapsed = results.slice(10, 50);
+  return (
+    <>
+      <ol>{visible.map((ranked) => <RankedResultRow key={ranked.rank} ranked={ranked} />)}</ol>
+      {collapsed.length > 0 ? (
+        <details className="rag-eval-ranked-overflow">
+          <summary>展开剩余 {collapsed.length} 条（最多展示 50 条）</summary>
+          <ol>{collapsed.map((ranked) => <RankedResultRow key={ranked.rank} ranked={ranked} />)}</ol>
+        </details>
+      ) : null}
+    </>
+  );
+}
+
+function RankedResultRow({ ranked }: { ranked: RagEvalRunDetail["cases"][number]["steps"][number]["ranked_results"][number] }) {
+  return (
+    <li className={ranked.matched_relevance > 0 ? "matched" : ""}>
+      <span>#{ranked.rank}</span>
+      <div><strong>{ranked.recording_title}</strong><p>{ranked.details?.text || ranked.text || ""}</p></div>
+      <span>{ranked.matched_relevance > 0 ? `命中 R${ranked.matched_relevance}` : "未命中"}</span>
+    </li>
+  );
+}
+
+function countLossNodes(journeys: RagEvalRunDetail["cases"][number]["evidence_journeys"]): Record<string, number> {
+  const counts: Record<string, number> = {};
+  for (const journey of journeys) {
+    if (journey.final_covered) continue;
+    const node = journey.first_loss_node || "unknown";
+    counts[node] = (counts[node] || 0) + 1;
+  }
+  return counts;
+}
+
+function stageStatusLabel(status: "hit" | "miss" | "skipped" | "unknown", rank: number | null): string {
+  if (status === "hit") return rank === null ? "命中" : `#${rank}`;
+  return { miss: "未命中", skipped: "未启用", unknown: "未知" }[status];
 }
 
 function MetricCard({ label, metric: value, percent = false, suffix = "" }: { label: string; metric: number | null; percent?: boolean; suffix?: string }) {
@@ -549,6 +897,36 @@ function metricForOperation(items: RagEvalMetric[], operation: string, name: str
   return item ? Number(item.value) : null;
 }
 
+function finalCaseRetrievalMetrics(metricsByStep: Map<string, RagEvalMetric[]>, result: RagEvalRunDetail["cases"][number]) {
+  const finalStep = [...result.steps]
+    .sort((left, right) => right.sequence - left.sequence)
+    .find((step) => metricsByStep.get(step.id)?.some((item) => item.metric_name === "hit_at_5"));
+  const finalMetrics = finalStep ? metricsByStep.get(finalStep.id) ?? [] : [];
+  return {
+    hitAt5: metric(finalMetrics, "hit_at_5"),
+    recallAt10: metric(finalMetrics, "recall_at_10"),
+    operation: finalStep?.operation ?? null
+  };
+}
+
+function metricsForAnswerStep(metricsByStep: Map<string, RagEvalMetric[]>, result: RagEvalRunDetail["cases"][number]) {
+  const answerStep = result.steps.find((step) => step.operation === "evaluate.answer");
+  const answerMetrics = answerStep ? metricsByStep.get(answerStep.id) ?? [] : [];
+  return { answerScore: metric(answerMetrics, "answer_score") };
+}
+
+function formatScore(value: number | null): string {
+  return value === null || Number.isNaN(value) ? "—" : value.toFixed(1);
+}
+
+function claimFactualStatusLabel(status: "supported" | "unsupported" | "contradicted"): string {
+  return { supported: "有支持", unsupported: "无支持", contradicted: "冲突" }[status];
+}
+
+function claimCitationStatusLabel(status: "supported" | "missing" | "misaligned"): string {
+  return { supported: "支持", missing: "缺失", misaligned: "错位" }[status];
+}
+
 function formatMetric(value: number | null, percent = false): string {
   if (value === null || Number.isNaN(value)) return "—";
   return percent ? `${(value * 100).toFixed(1)}%` : value.toFixed(3);
@@ -561,6 +939,16 @@ function formatTime(milliseconds: number): string {
 
 function statusLabel(status: RagEvalCase["status"]): string {
   return { draft: "草稿", reviewed: "已审核", approved: "已批准" }[status];
+}
+
+function canReview(item: RagEvalCase): boolean {
+  const annotation = item.answer_annotation;
+  if (!annotation) return false;
+  if (annotation.expected_verdict === "abstain") return true;
+  return item.evidence.length > 0
+    && Boolean(annotation.reference_answer?.trim())
+    && annotation.key_points.length > 0
+    && annotation.key_points.every((keyPoint) => keyPoint.text.trim() && keyPoint.evidence_ids.length > 0);
 }
 
 function message(error: unknown): string {

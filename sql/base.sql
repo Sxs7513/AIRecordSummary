@@ -674,15 +674,12 @@ create table if not exists embedding_models (
 create table if not exists recording_retrieval_documents (
     id uuid primary key default gen_random_uuid(),
     recording_id uuid not null references recordings(id) on delete cascade,
-    embedding_model_id uuid not null references embedding_models(id) on delete restrict,
     document_index integer not null default 0 check (document_index >= 0),
     document_type text not null default 'profile' check (document_type in ('profile', 'overview', 'outline')),
     retrieval_text text not null,
     content_hash text not null,
-    embedding halfvec(2560) not null,
     created_at timestamptz not null default now(),
-    updated_at timestamptz not null default now(),
-    unique (recording_id, embedding_model_id, document_index)
+    updated_at timestamptz not null default now()
 );
 
 comment on table recording_retrieval_documents is
@@ -690,13 +687,10 @@ comment on table recording_retrieval_documents is
 
 create index if not exists recording_retrieval_documents_recording_id_idx
     on recording_retrieval_documents (recording_id);
-create index if not exists recording_retrieval_documents_hnsw_idx
-    on recording_retrieval_documents using hnsw (embedding halfvec_cosine_ops);
 
 create table if not exists recording_search_chunks (
     id uuid primary key default gen_random_uuid(),
     recording_id uuid not null references recordings(id) on delete cascade,
-    embedding_model_id uuid not null references embedding_models(id) on delete restrict,
     chunk_index integer not null check (chunk_index >= 0),
     text text not null,
     original_text text not null default '',
@@ -711,10 +705,8 @@ create table if not exists recording_search_chunks (
     is_target_person boolean not null default false,
     matched_speaker_profile_ids uuid[] not null default '{}',
     metadata jsonb not null default '{}'::jsonb,
-    embedding halfvec(2560) not null,
     created_at timestamptz not null default now(),
-    updated_at timestamptz not null default now(),
-    unique (recording_id, embedding_model_id, chunk_index)
+    updated_at timestamptz not null default now()
 );
 
 alter table recording_search_chunks
@@ -735,8 +727,150 @@ create index if not exists recording_search_chunks_original_text_trgm_idx
     on recording_search_chunks using gin (normalized_original_text gin_trgm_ops);
 create index if not exists recording_search_chunks_original_text_trgm_gist_idx
     on recording_search_chunks using gist (normalized_original_text gist_trgm_ops(siglen=64));
-create index if not exists recording_search_chunks_embedding_hnsw_idx
-    on recording_search_chunks using hnsw (embedding halfvec_cosine_ops);
+
+create table if not exists recording_search_chunk_embeddings (
+    chunk_id uuid not null references recording_search_chunks(id) on delete cascade,
+    embedding_model_id uuid not null references embedding_models(id) on delete restrict,
+    model_key text not null,
+    dimensions integer not null check (dimensions > 0),
+    content_hash text not null,
+    embedding halfvec not null,
+    created_at timestamptz not null default now(),
+    updated_at timestamptz not null default now(),
+    primary key (chunk_id, embedding_model_id),
+    check (
+        (model_key = 'qwen3-4b' and dimensions = 2560)
+        or (model_key = 'qwen3-0.6b' and dimensions = 1024)
+    ),
+    check (vector_dims(embedding) = dimensions)
+);
+
+create table if not exists recording_retrieval_document_embeddings (
+    document_id uuid not null references recording_retrieval_documents(id) on delete cascade,
+    embedding_model_id uuid not null references embedding_models(id) on delete restrict,
+    model_key text not null,
+    dimensions integer not null check (dimensions > 0),
+    content_hash text not null,
+    embedding halfvec not null,
+    created_at timestamptz not null default now(),
+    updated_at timestamptz not null default now(),
+    primary key (document_id, embedding_model_id),
+    check (
+        (model_key = 'qwen3-4b' and dimensions = 2560)
+        or (model_key = 'qwen3-0.6b' and dimensions = 1024)
+    ),
+    check (vector_dims(embedding) = dimensions)
+);
+
+-- Migrate vectors from the former model-bound parent tables before removing
+-- their fixed-width halfvec(2560) columns. Dynamic SQL keeps this block safe
+-- for fresh databases where those legacy columns never existed.
+do $$
+begin
+    if exists (
+        select 1 from information_schema.columns
+        where table_schema = 'public' and table_name = 'recording_search_chunks' and column_name = 'embedding'
+    ) then
+        execute $migration$
+            insert into recording_search_chunk_embeddings (
+                chunk_id, embedding_model_id, model_key, dimensions, content_hash, embedding
+            )
+            select chunks.id, chunks.embedding_model_id,
+                   case models.model_name
+                     when 'Qwen/Qwen3-Embedding-4B' then 'qwen3-4b'
+                     when 'Qwen/Qwen3-Embedding-0.6B' then 'qwen3-0.6b'
+                   end,
+                   models.dimensions,
+                   encode(
+                       digest(
+                           case
+                             when nullif(btrim(chunks.metadata ->> 'topic'), '') is null
+                              and terms.value is null
+                              and nullif(btrim(chunks.metadata ->> 'search_context'), '') is null
+                             then chunks.text
+                             else concat_ws(
+                                 E'\n',
+                                 case when nullif(btrim(chunks.metadata ->> 'topic'), '') is not null
+                                      then '主题：' || btrim(chunks.metadata ->> 'topic') end,
+                                 case when terms.value is not null then '标准术语：' || terms.value end,
+                                 case when nullif(btrim(chunks.metadata ->> 'search_context'), '') is not null
+                                      then '语义上下文：' || btrim(chunks.metadata ->> 'search_context') end,
+                                 '正文：' || btrim(chunks.text)
+                             )
+                           end,
+                           'sha256'
+                       ),
+                       'hex'
+                   ),
+                   chunks.embedding
+            from recording_search_chunks chunks
+            join embedding_models models on models.id = chunks.embedding_model_id
+            left join lateral (
+                select string_agg(values.term, '、' order by values.first_ordinality) as value
+                from (
+                    select btrim(term.value) as term, min(term.ordinality) as first_ordinality
+                    from jsonb_array_elements_text(coalesce(chunks.metadata -> 'terms', '[]'::jsonb))
+                         with ordinality as term(value, ordinality)
+                    where btrim(term.value) <> ''
+                    group by btrim(term.value)
+                ) values
+            ) terms on true
+            where (models.model_name, models.dimensions) in (
+                ('Qwen/Qwen3-Embedding-4B', 2560),
+                ('Qwen/Qwen3-Embedding-0.6B', 1024)
+            )
+            on conflict (chunk_id, embedding_model_id) do nothing
+        $migration$;
+    end if;
+    if exists (
+        select 1 from information_schema.columns
+        where table_schema = 'public' and table_name = 'recording_retrieval_documents' and column_name = 'embedding'
+    ) then
+        execute $migration$
+            insert into recording_retrieval_document_embeddings (
+                document_id, embedding_model_id, model_key, dimensions, content_hash, embedding
+            )
+            select documents.id, documents.embedding_model_id,
+                   case models.model_name
+                     when 'Qwen/Qwen3-Embedding-4B' then 'qwen3-4b'
+                     when 'Qwen/Qwen3-Embedding-0.6B' then 'qwen3-0.6b'
+                   end,
+                   models.dimensions, documents.content_hash, documents.embedding
+            from recording_retrieval_documents documents
+            join embedding_models models on models.id = documents.embedding_model_id
+            where (models.model_name, models.dimensions) in (
+                ('Qwen/Qwen3-Embedding-4B', 2560),
+                ('Qwen/Qwen3-Embedding-0.6B', 1024)
+            )
+            on conflict (document_id, embedding_model_id) do nothing
+        $migration$;
+    end if;
+end $$;
+
+-- Keep the legacy parent embedding columns, constraints, and indexes during the
+-- expand/backfill phase. They can be removed in a separate cutover migration
+-- after child-table reads and writes have been verified in production.
+
+create unique index if not exists recording_search_chunks_recording_chunk_uidx
+    on recording_search_chunks (recording_id, chunk_index);
+create unique index if not exists recording_retrieval_documents_recording_document_uidx
+    on recording_retrieval_documents (recording_id, document_index);
+create index if not exists recording_search_chunk_embeddings_model_idx
+    on recording_search_chunk_embeddings (embedding_model_id, chunk_id);
+create index if not exists recording_retrieval_document_embeddings_model_idx
+    on recording_retrieval_document_embeddings (embedding_model_id, document_id);
+create index if not exists recording_chunk_embeddings_qwen3_4b_hnsw_idx
+    on recording_search_chunk_embeddings using hnsw ((embedding::halfvec(2560)) halfvec_cosine_ops)
+    where model_key = 'qwen3-4b';
+create index if not exists recording_chunk_embeddings_qwen3_0_6b_hnsw_idx
+    on recording_search_chunk_embeddings using hnsw ((embedding::halfvec(1024)) halfvec_cosine_ops)
+    where model_key = 'qwen3-0.6b';
+create index if not exists recording_document_embeddings_qwen3_4b_hnsw_idx
+    on recording_retrieval_document_embeddings using hnsw ((embedding::halfvec(2560)) halfvec_cosine_ops)
+    where model_key = 'qwen3-4b';
+create index if not exists recording_document_embeddings_qwen3_0_6b_hnsw_idx
+    on recording_retrieval_document_embeddings using hnsw ((embedding::halfvec(1024)) halfvec_cosine_ops)
+    where model_key = 'qwen3-0.6b';
 
 -- Generation terminal query projection
 -- 活跃状态和流式事件位于 Redis；该表由 Generation Worker 的终态事务写入。

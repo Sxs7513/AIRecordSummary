@@ -109,6 +109,9 @@ def test_recording_profile_retrieval_uses_recording_level_embeddings() -> None:
     assert rows == [{"recording_id": recording_id, "score": 0.61}]
     sql, parameters = connection.executions[0]
     assert "from recording_retrieval_documents profile_documents" in sql
+    assert "join recording_retrieval_document_embeddings vectors" in sql
+    assert "vectors.model_key = 'qwen3-4b'" in sql
+    assert "halfvec(2560)" in sql
     assert "recordings.created_at >= :created_from" in sql
     assert parameters["created_from"] == created_from
     assert parameters["min_score"] == 0.3
@@ -338,9 +341,7 @@ def test_recording_scope_uses_exact_file_name_filter() -> None:
     recording_id = uuid4()
     connection = FakeConnection([[recording_id]])
 
-    result = _retriever(connection).resolve_recording_scope(
-        ResolvedFilters(file_names=["test3.m4a"]), limit=None, rank=None
-    )
+    result = _retriever(connection).resolve_recording_scope(ResolvedFilters(file_names=["test3.m4a"]), limit=None, rank=None)
 
     assert result == [recording_id]
     sql, values = connection.executions[0]
@@ -394,6 +395,41 @@ def test_lexical_candidates_apply_resolved_scope_and_chunk_filters() -> None:
     assert values["query"] == "api 版本"
     assert values["recording_ids"] == [str(recording_id)]
     assert values["speaker_profile_ids"] == [str(profile_id)]
+
+
+def test_lexical_variants_are_retrieved_in_one_database_call() -> None:
+    chunk_id = uuid4()
+    recording_id = uuid4()
+    connection = FakeConnection(
+        [
+            [
+                {
+                    "chunk_id": chunk_id,
+                    "recording_id": recording_id,
+                    "score": 1.0,
+                    "exact_match": True,
+                    "variant_index": 2,
+                    "lexical_distance": 0.0,
+                }
+            ]
+        ]
+    )
+    filters = ResolvedFilters(recording_scope_resolved=True)
+
+    result = _retriever(connection).retrieve_lexical_variant_candidates(["1017", "一零一七", "幺零幺七"], filters)
+
+    assert result == [
+        [],
+        [],
+        [{"chunk_id": chunk_id, "recording_id": recording_id, "score": 1.0, "exact_match": True}],
+    ]
+    assert len(connection.executions) == 1
+    sql, values = connection.executions[0]
+    assert "unnest(cast(:queries as text[])) with ordinality" in sql
+    assert "cross join lateral" in sql
+    assert "query_variants.variant_index" in sql
+    assert "chunks.normalized_original_text" in sql
+    assert values["queries"] == ["1017", "一零一七", "幺零幺七"]
 
 
 def test_rrf_fusion_deduplicates_and_marks_match_types() -> None:

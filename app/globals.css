@@ -816,14 +816,39 @@ th {
 .rag-eval-run.active { background: var(--accent-soft); border-color: #93b4ff; }
 .rag-eval-stats { display: grid; gap: 12px; grid-template-columns: repeat(4, minmax(120px, 1fr)); }
 .rag-eval-result-case { border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
-.rag-eval-result-case summary { align-items: center; cursor: pointer; display: grid; gap: 10px; grid-template-columns: minmax(0, 1fr) auto auto; padding: 12px; }
+.rag-eval-result-case summary { align-items: center; cursor: pointer; display: grid; gap: 10px; grid-template-columns: minmax(0, 1fr) auto auto auto; padding: 12px; }
+.rag-eval-case-metrics { display: flex; flex-wrap: wrap; gap: 6px; }
+.rag-eval-diagnosis-overview { background: #f8fafc; border: 1px solid var(--line); border-radius: 8px; display: grid; gap: 10px; padding: 12px; }
+.rag-eval-diagnosis-heading { align-items: end; display: flex; gap: 16px; justify-content: space-between; }
+.rag-eval-diagnosis-heading h3, .rag-eval-diagnosis-heading p { margin: 0; }
+.rag-eval-diagnosis-heading label { color: var(--muted); display: grid; font-size: 12px; gap: 4px; }
+.rag-eval-loss-nodes { display: flex; flex-wrap: wrap; gap: 7px; }
+.rag-eval-loss-nodes button { border: 1px solid transparent; cursor: pointer; }
+.rag-eval-loss-nodes button.active { border-color: #2563eb; box-shadow: 0 0 0 1px #2563eb; }
+.rag-eval-gold-journeys { border-top: 1px solid var(--line); display: grid; gap: 9px; padding: 12px; }
+.rag-eval-gold-journeys > h3 { font-size: 15px; margin: 0; }
+.rag-eval-gold-journey { background: #f8fafc; border: 1px solid var(--line); border-radius: 7px; display: grid; gap: 10px; padding: 10px; }
+.rag-eval-gold-heading { align-items: start; display: flex; gap: 12px; justify-content: space-between; }
+.rag-eval-gold-heading p { color: var(--muted); line-height: 1.45; margin: 4px 0 0; }
+.rag-eval-gold-stages { display: grid; gap: 7px; grid-template-columns: repeat(4, minmax(90px, 1fr)); }
+.rag-eval-gold-stage { border: 1px solid var(--line); border-radius: 6px; display: grid; gap: 2px; padding: 7px 8px; }
+.rag-eval-gold-stage > span, .rag-eval-gold-stage > small { color: var(--muted); font-size: 11px; }
+.rag-eval-gold-stage.hit { background: #e7f8f0; border-color: #a7e1c5; }
+.rag-eval-gold-stage.miss { background: #fff1f2; border-color: #fecdd3; }
+.rag-eval-gold-stage.unknown { background: #fffbeb; border-color: #fde68a; }
+.rag-eval-gold-stage.skipped { opacity: .65; }
 .rag-eval-step { border-top: 1px solid var(--line); padding: 12px; }
 .rag-eval-step h3 { font-size: 15px; margin: 0 0 8px; }
 .rag-eval-step h3 small { color: var(--muted); font-weight: 400; }
 .rag-eval-step ol { display: grid; gap: 5px; list-style: none; margin: 0; padding: 0; }
-.rag-eval-step li { align-items: start; background: #f8fafc; border-radius: 6px; display: grid; gap: 8px; grid-template-columns: 34px minmax(0, 1fr) auto; padding: 8px; }
-.rag-eval-step li.matched { background: #e7f8f0; box-shadow: inset 3px 0 var(--ok); }
-.rag-eval-step li p { color: var(--muted); display: -webkit-box; line-height: 1.45; margin: 3px 0 0; overflow: hidden; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
+.rag-eval-step ol > li { align-items: start; background: #f8fafc; border-radius: 6px; display: grid; gap: 8px; grid-template-columns: 34px minmax(0, 1fr) auto; padding: 8px; }
+.rag-eval-step ol > li.matched { background: #e7f8f0; box-shadow: inset 3px 0 var(--ok); }
+.rag-eval-step ol > li p { color: var(--muted); display: -webkit-box; line-height: 1.45; margin: 3px 0 0; overflow: hidden; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
+.rag-eval-answer-sources { display: grid; gap: 6px; list-style: none; margin: 8px 0 0; padding: 0; }
+.rag-eval-answer-sources > li { background: #f8fafc; border: 1px solid var(--line); border-radius: 6px; color: var(--muted); line-height: 1.45; overflow-wrap: anywhere; padding: 8px 10px; }
+.rag-eval-ranked-overflow { margin-top: 8px; }
+.rag-eval-ranked-overflow > summary { color: #2563eb; cursor: pointer; font-size: 13px; padding: 5px 2px; user-select: none; }
+.rag-eval-ranked-overflow > ol { margin-top: 6px; }
 .rag-adj-grid { align-items: start; display: grid; gap: 16px; grid-template-columns: minmax(300px, .75fr) minmax(420px, 1.25fr); }
 .rag-adj-evidence-list, .rag-adj-reference-list, .rag-adj-gold-list, .rag-adj-result-gold { display: grid; gap: 10px; }
 .rag-adj-target { border: 1px solid #93b4ff; border-radius: 10px; display: grid; gap: 12px; padding: 13px; }

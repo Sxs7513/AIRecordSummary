@@ -35,9 +35,7 @@ def test_qwen_asr_defaults() -> None:
     assert settings.pyannote_short_segment_absorb_max_gap_ms == 2_000
     assert settings.asr_lab_training_model == "Qwen/Qwen3-ASR-1.7B-hf"
     assert settings.asr_lab_training_module == "qwen_asr_lora"
-    assert settings.resolved_asr_lab_training_python_bin == (
-        REPOSITORY_ROOT / "backend/packages/l2_core/trainers/qwen-asr-lora/.venv/bin/python"
-    ).absolute()
+    assert settings.resolved_asr_lab_training_python_bin == (REPOSITORY_ROOT / "backend/packages/l2_core/trainers/qwen-asr-lora/.venv/bin/python").absolute()
     assert ".venv" in settings.resolved_asr_lab_training_python_bin.parts
     assert settings.compute_worker_host == "127.0.0.1"
     assert settings.compute_worker_port == 8010
@@ -89,6 +87,9 @@ def test_summary_defaults_to_large_context_without_rolling() -> None:
     assert settings.topic_detection_provider == "gemini"
     assert settings.recording_summary_provider == "gemini"
     assert settings.rag_online_default_model == "gemini-gemini-3.5-flash-lite"
+    assert settings.rag_answer_judge_model == "gemini-gemini-3.5-flash-lite"
+    assert settings.rag_answer_judge_prompt_version == "answer_judge_v5"
+    assert settings.rag_answer_judge_max_output_tokens == 4_096
     assert settings.rag_asr_adjudication_search_provider == "gemini"
     assert settings.rag_asr_adjudication_audit_prompt_variant == "relation_rules"
     assert settings.rag_asr_adjudication_audit_model == "gemini-gemini-3.5-flash-lite"
@@ -180,6 +181,9 @@ def test_rag_online_models_require_provider_qualified_online_references() -> Non
     with pytest.raises(ValidationError, match="provider must be one of"):
         Settings(_env_file=None, **settings_payload(RAG_ASR_ADJUDICATION_DECISION_MODEL="local-qwen3-4b"))
 
+    with pytest.raises(ValidationError, match="provider must be one of"):
+        Settings(_env_file=None, **settings_payload(RAG_ANSWER_JUDGE_MODEL="local-qwen3-4b"))
+
 
 def test_hybrid_retrieval_defaults_are_enabled_and_bounded() -> None:
     settings = Settings(_env_file=None, **settings_payload())
@@ -200,6 +204,19 @@ def test_hybrid_retrieval_defaults_are_enabled_and_bounded() -> None:
     assert settings.rag_rerank_model == "Qwen/Qwen3-Reranker-0.6B"
     assert settings.rag_rerank_max_total_tokens == 16_000
     assert settings.rag_rerank_output_limit == 8
+
+
+def test_embedding_profile_selects_model_and_dimensions() -> None:
+    settings = Settings(_env_file=None, **settings_payload(EMBEDDING_PROFILE="qwen3-0.6b"))
+
+    assert settings.embedding_profile == "qwen3-0.6b"
+    assert settings.embedding_model == "Qwen/Qwen3-Embedding-0.6B"
+    assert settings.embedding_dimensions == 1024
+
+
+def test_embedding_model_metadata_is_not_independently_configurable() -> None:
+    assert "embedding_model" not in Settings.model_fields
+    assert "embedding_dimensions" not in Settings.model_fields
 
 
 def test_rag_route_model_profile_can_switch_between_7b_and_4b() -> None:

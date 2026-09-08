@@ -34,7 +34,7 @@ class EmbeddingIndexingStage:
     # Embeddings still use only
     # retrieval_text; invalidation is required because this artifact is also
     # the payload used to project chunk metadata into PostgreSQL.
-    version = "8"
+    version = "9"
     retry_policy = RetryPolicy(initial_backoff_seconds=30)
     input_model = EmbeddingIndexingInput
 
@@ -44,6 +44,7 @@ class EmbeddingIndexingStage:
         model_name: str,
         model_cache_dir: Path,
         dimensions: int,
+        embedding_profile: str,
         device: str = "auto",
         worker_client: WorkerClient | None = None,
     ) -> None:
@@ -51,6 +52,7 @@ class EmbeddingIndexingStage:
         self._model_name = model_name
         self._model_cache_dir = model_cache_dir
         self._dimensions = dimensions
+        self._embedding_profile = embedding_profile
         self._device = device
         self._model: EmbeddingModel | None = None
         self._worker_client = worker_client
@@ -73,19 +75,29 @@ class EmbeddingIndexingStage:
             raise RuntimeError("EmbeddingIndexingStage requires WorkerClient")
         if chunks:
             result = await self._worker_client.execute(
-                embedding_encode_command([chunk.retrieval_text() for chunk in chunks]),
+                embedding_encode_command([chunk.retrieval_text() for chunk in chunks], self._embedding_profile),
                 result_type=EmbeddingEncodeTaskResult,
                 on_progress=lambda progress, message: context.report_progress(round(progress * 100), message or "Embedding 编码"),
             )
             embeddings = result.vectors
+            if (
+                result.embedding_profile != self._embedding_profile
+                or result.model_name != self._model_name
+                or result.dimensions != self._dimensions
+                or result.provider != "sentence_transformers"
+                or result.distance_metric != "cosine"
+            ):
+                raise ValueError("Embedding Worker profile does not match the indexing stage")
         else:
             embeddings = []
         if any(len(vector) != self._dimensions for vector in embeddings):
             raise ValueError(f"Embedding dimension does not match configured {self._dimensions}")
         output = EmbeddingIndexingOutput(
             provider="sentence_transformers",
+            embedding_profile=self._embedding_profile,
             model_name=self._model_name,
             dimensions=self._dimensions,
+            distance_metric="cosine",
             chunks=[EmbeddedSearchChunk(**chunk.model_dump(), embedding=vector) for chunk, vector in zip(chunks, embeddings, strict=True)],
         )
         return StageResult(output=output, artifacts=(ArtifactPayload(artifact_type="search.embedding_index", data=output.model_dump(mode="json")),))

@@ -195,8 +195,10 @@ class EmbeddedSearchChunk(SearchChunk):
 
 class EmbeddingIndexingOutput(BaseModel):
     provider: Literal["sentence_transformers"]
+    embedding_profile: str
     model_name: str
     dimensions: int = Field(gt=0)
+    distance_metric: Literal["cosine"] = "cosine"
     chunks: list[EmbeddedSearchChunk]
 
 
@@ -216,8 +218,10 @@ class SummaryEmbeddingIndexingInput(BaseModel):
 
 class SummaryEmbeddingIndexingOutput(BaseModel):
     provider: Literal["sentence_transformers"]
+    embedding_profile: str
     model_name: str
     dimensions: int = Field(gt=0)
+    distance_metric: Literal["cosine"] = "cosine"
     document_index: int = Field(default=0, ge=0)
     document_type: Literal["profile"] = "profile"
     retrieval_text: str

@@ -197,10 +197,22 @@ class ChunkEvidencePipeline:
         async def lexical_search(variant_query: str) -> list[RetrievalCandidateRow]:
             operation_started = started_at()
             query_variants = expand_spoken_digit_variants(variant_query)
-            raw_results = await asyncio.gather(
-                *(asyncio.to_thread(self._retriever.retrieve_lexical_candidates, query_variant, filters) for query_variant in query_variants),
-                return_exceptions=True,
-            )
+            batch_retrieve = getattr(self._retriever, "retrieve_lexical_variant_candidates", None)
+            raw_results: list[list[RetrievalCandidateRow] | BaseException] = []
+            if callable(batch_retrieve):
+                try:
+                    batch_results = cast(
+                        list[list[RetrievalCandidateRow]],
+                        await asyncio.to_thread(batch_retrieve, query_variants, filters),
+                    )
+                    raw_results.extend(batch_results)
+                except Exception as error:
+                    raw_results.append(error)
+            else:
+                raw_results = await asyncio.gather(
+                    *(asyncio.to_thread(self._retriever.retrieve_lexical_candidates, query_variant, filters) for query_variant in query_variants),
+                    return_exceptions=True,
+                )
             errors = [result for result in raw_results if isinstance(result, BaseException)]
             successful_results = [(index, result) for index, result in enumerate(raw_results) if isinstance(result, list)]
             if not successful_results:

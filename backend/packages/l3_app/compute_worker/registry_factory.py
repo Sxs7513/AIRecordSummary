@@ -117,7 +117,7 @@ def build_compute_operation_registry(settings: Settings, file_store: FileStore |
     registry.register(
         ComputeOperationSpec(
             "embedding.encode",
-            "1",
+            "2",
             ResourceQueue.GPU_NORMAL,
             EmbeddingEncodeTaskInput,
             EmbeddingEncodeTaskResult,

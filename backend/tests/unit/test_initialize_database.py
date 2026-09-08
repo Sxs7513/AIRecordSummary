@@ -21,6 +21,11 @@ def test_base_schema_declares_only_the_final_tables_and_indexes() -> None:
     assert "alter table conversations alter column owner_user_id drop not null" in schema
     assert "client_creation_id uuid" in schema
     assert "conversations_owner_client_creation_idx" in schema
+    assert "create table if not exists recording_search_chunk_embeddings" in schema
+    assert "create table if not exists recording_retrieval_document_embeddings" in schema
+    assert "embedding halfvec not null" in schema
+    assert "recording_chunk_embeddings_qwen3_4b_hnsw_idx" in schema
+    assert "recording_chunk_embeddings_qwen3_0_6b_hnsw_idx" in schema
     recordings = schema.split("create table if not exists recordings (", 1)[1].split(");", 1)[0]
     assert "owner_user_id uuid not null references users(id) on delete restrict" in recordings
     assert "content_md5 text not null" in recordings

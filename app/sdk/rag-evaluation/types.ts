@@ -21,6 +21,20 @@ export type RagEvalEvidence = {
   recording_file_name: string;
 };
 
+export type AnswerVerdict = "direct_answer" | "qualified_answer" | "abstain";
+
+export type AnswerKeyPoint = {
+  id: string;
+  text: string;
+  evidence_ids: string[];
+};
+
+export type AnswerAnnotation = {
+  expected_verdict: AnswerVerdict;
+  reference_answer: string | null;
+  key_points: AnswerKeyPoint[];
+};
+
 export type RagEvalCase = {
   id: string;
   dataset_id: string;
@@ -31,6 +45,7 @@ export type RagEvalCase = {
   archived_at: string | null;
   revision: number;
   evidence: RagEvalEvidence[];
+  answer_annotation: AnswerAnnotation | null;
 };
 
 export type RagEvalDatasetVersion = {
@@ -92,6 +107,8 @@ export type RagEvalRun = {
 
 export type RagEvalMetric = {
   id: string;
+  evaluation_case_id: string | null;
+  step_result_id: string | null;
   scope: "run" | "tag" | "case" | "operation" | "step";
   scope_key: string | null;
   operation: string | null;
@@ -120,9 +137,70 @@ export type StepResult = {
   sequence: number;
   status: string;
   latency_ms: number | null;
-  output: { candidate_count?: number };
+  error_message: string | null;
+  output: {
+    candidate_count?: number;
+    answer?: string;
+    verdict?: AnswerVerdict;
+    reason?: string;
+    sources?: Array<{
+      index: number;
+      recording: { id: string; title?: string; fileName: string };
+      chunk: { id: string; startMs: number; endMs: number };
+    }>;
+    answerability_correct?: boolean;
+    verdict_correct?: boolean; // Legacy answer_judge_v1/v2 output.
+    key_point_results?: Array<{ key_point_id: string; covered: boolean; correct: boolean; reason: string }>;
+    claim_results?: Array<{
+      claim: string;
+      factual_status: "supported" | "unsupported" | "contradicted";
+      citation_status: "supported" | "missing" | "misaligned";
+      citation_indexes: number[];
+      reason: string;
+    }>;
+    // Legacy answer_judge_v1/v2 output retained for historical run rendering.
+    citation_results?: Array<{ claim: string; citation_indexes: number[]; supported: boolean; reason: string }>;
+    unsupported_claims?: string[];
+    contradictions?: string[];
+  };
   details: Record<string, unknown>;
   ranked_results: RankedResult[];
+};
+
+export type GoldStageStatus = "hit" | "miss" | "skipped" | "unknown";
+
+export type GoldStageObservation = {
+  status: GoldStageStatus;
+  best_rank: number | null;
+  match_kind?: string | null;
+  operation?: string | null;
+  channels?: Record<string, GoldStageObservation>;
+};
+
+export type EvidenceJourney = {
+  diagnostic_version: string;
+  evidence_id: string;
+  recording_id: string;
+  recording_title: string | null;
+  source_chunk_id: string | null;
+  quote: string;
+  start_ms: number;
+  end_ms: number;
+  relevance: number;
+  final_covered: boolean;
+  last_visible_node: string | null;
+  first_loss_node: string | null;
+  stages: Record<string, GoldStageObservation>;
+};
+
+export type EvidenceDiagnosisSummary = {
+  diagnostic_version: string;
+  gold_count: number;
+  covered_gold_count: number;
+  uncovered_gold_count: number;
+  unknown_gold_count: number;
+  coverage_status: "full_coverage" | "partial_coverage" | "no_hit" | "not_applicable";
+  first_loss_node_counts: Record<string, number>;
 };
 
 export type CaseResult = {
@@ -130,9 +208,12 @@ export type CaseResult = {
   evaluation_case_id: string;
   query: string;
   tags: string[];
+  answer_annotation: AnswerAnnotation | null;
   status: string;
   latency_ms: number | null;
   error_message: string | null;
+  details: Record<string, unknown>;
+  evidence_journeys: EvidenceJourney[];
   steps: StepResult[];
 };
 
@@ -140,4 +221,5 @@ export type RagEvalRunDetail = {
   run: RagEvalRun & { pipeline_config: Record<string, unknown> };
   metrics: RagEvalMetric[];
   cases: CaseResult[];
+  evidence_diagnosis: EvidenceDiagnosisSummary;
 };

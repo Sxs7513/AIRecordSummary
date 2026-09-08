@@ -565,7 +565,7 @@ strategy_version
 - `scope_summary` 的范围正确性、截断率和延迟；
 - 路由到错误策略的混淆矩阵。
 
-一期直接在 `rag_retrieval` 的生产检索链路结束后执行真实 Grade 节点，并假设所有评测问题都应当可回答：`direct_answer` 和 `qualified_answer` 记为通过，`abstain` 记为不通过。每个 case 持久化 `grade.evidence` step、实际 verdict 与 `grade_pass`，run 级聚合 `grade_pass_rate`。Case 的执行状态仍表示评测程序是否成功运行，Grade 不通过通过指标表达，不把 case 标记为执行失败。
+一期直接在 `rag_retrieval` 的生产检索链路结束后执行真实 Grade 节点，并按“可回答 / 应拒答”二分类评估：`direct_answer` 和 `qualified_answer` 都属于可回答，`abstain` 属于应拒答。每个 case 持久化 `grade.evidence` step、实际 verdict 与 `grade_answerability_correct`，run 级聚合 `grade_answerability_accuracy`。Case 的执行状态仍表示评测程序是否成功运行，可回答性判断错误通过指标表达，不把 case 标记为执行失败。
 
 该假设适合一期快速暴露错误拒答，但不能衡量无依据放行。后续引入明确的 `expected_verdict` 标注后，再计算完整的 verdict accuracy、错误拒答率和无依据放行率；检索指标和 Grade 指标继续分开保存，以区分“没有召回证据”和“召回后错误拒答”。
 

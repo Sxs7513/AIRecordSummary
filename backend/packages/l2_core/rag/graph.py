@@ -97,7 +97,7 @@ class AggregateAnswerStream(Protocol):
 
 logger = logging.getLogger("rag")
 
-MAX_ADJUDICATION_CASES = 3
+MAX_ADJUDICATION_CASES = 2
 MAX_ADJUDICATION_ITERATIONS = 4
 MAX_ADJUDICATION_SEARCHES = 10
 INSUFFICIENT_EVIDENCE_ANSWER = "没有在录音中找到足够依据。"

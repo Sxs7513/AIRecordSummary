@@ -403,7 +403,7 @@ def test_extracted_terms_are_each_sent_to_lexical_retrieval() -> None:
 def test_numeric_keyword_variants_share_one_lexical_rrf_lane() -> None:
     recording_id = uuid4()
     chunk_id = uuid4()
-    searched_queries: list[str] = []
+    query_batches: list[list[str]] = []
     fused_lexical_lists: list[list[dict[str, object]]] = []
 
     class NumericHybridRetriever:
@@ -415,11 +415,16 @@ def test_numeric_keyword_variants_share_one_lexical_rrf_lane() -> None:
         def retrieve_vector_candidates(self, _embedding: list[float], _filters: ResolvedFilters) -> list[dict[str, object]]:
             return []
 
-        def retrieve_lexical_candidates(self, query: str, _filters: ResolvedFilters) -> list[dict[str, object]]:
-            searched_queries.append(query)
-            if query == "幺零幺七":
-                return [{"chunk_id": chunk_id, "recording_id": recording_id, "score": 1.0, "exact_match": True}]
-            return []
+        def retrieve_lexical_variant_candidates(
+            self, queries: list[str], _filters: ResolvedFilters
+        ) -> list[list[dict[str, object]]]:
+            query_batches.append(queries)
+            return [
+                [{"chunk_id": chunk_id, "recording_id": recording_id, "score": 1.0, "exact_match": True}]
+                if query == "幺零幺七"
+                else []
+                for query in queries
+            ]
 
         def fuse_candidate_lists(
             self,
@@ -442,7 +447,7 @@ def test_numeric_keyword_variants_share_one_lexical_rrf_lane() -> None:
         )
     )
 
-    assert set(searched_queries) == {"1017", "一零一七", "幺零幺七", "幺零一七", "一零幺七"}
+    assert query_batches == [["1017", "一零一七", "幺零幺七", "幺零一七", "一零幺七"]]
     assert len(fused_lexical_lists) == 1
     assert [row["chunk_id"] for row in fused_lexical_lists[0]] == [chunk_id]
     assert candidates[0]["protected_lexical_terms"] == ["1017"]

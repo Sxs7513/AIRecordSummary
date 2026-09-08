@@ -987,6 +987,18 @@ create table if not exists rag_evaluation_case_drafts (
     )
 );
 
+alter table rag_evaluation_case_drafts
+    add column if not exists answer_annotation jsonb;
+
+alter table rag_evaluation_case_drafts
+    drop constraint if exists rag_evaluation_case_drafts_answer_annotation_check;
+alter table rag_evaluation_case_drafts
+    add constraint rag_evaluation_case_drafts_answer_annotation_check
+    check (answer_annotation is null or jsonb_typeof(answer_annotation) = 'object');
+
+comment on column rag_evaluation_case_drafts.answer_annotation is
+    '人工确认的答案评测标注；模型建议仅生成草稿，保存后问题退回 draft。';
+
 comment on table rag_evaluation_case_drafts is
     'RAG 检索评测的可编辑问题工作区；修改问题或证据后必须回到 draft。';
 
@@ -1070,6 +1082,18 @@ create table if not exists rag_evaluation_cases (
     check (jsonb_typeof(scope) = 'object'),
     check (jsonb_typeof(metadata) = 'object')
 );
+
+alter table rag_evaluation_cases
+    add column if not exists answer_annotation jsonb;
+
+alter table rag_evaluation_cases
+    drop constraint if exists rag_evaluation_cases_answer_annotation_check;
+alter table rag_evaluation_cases
+    add constraint rag_evaluation_cases_answer_annotation_check
+    check (answer_annotation is null or jsonb_typeof(answer_annotation) = 'object');
+
+comment on column rag_evaluation_cases.answer_annotation is
+    '随 Dataset Version 冻结的答案 Ground Truth，Evidence ID 已映射为 Frozen Evidence ID。';
 
 create index if not exists rag_evaluation_cases_version_split_idx
     on rag_evaluation_cases (dataset_version_id, split, id);
@@ -1263,6 +1287,31 @@ create index if not exists rag_evaluation_ranked_results_evidence_idx
 
 alter table rag_evaluation_ranked_results
     drop constraint if exists rag_evaluation_ranked_results_recording_id_fkey;
+
+create table if not exists rag_evaluation_evidence_diagnostics (
+    id uuid primary key default gen_random_uuid(),
+    evaluation_run_id uuid not null references evaluation_runs(id) on delete cascade,
+    case_result_id uuid not null references rag_evaluation_case_results(id) on delete cascade,
+    evaluation_case_id uuid not null references rag_evaluation_cases(id) on delete restrict,
+    evidence_id uuid not null references rag_evaluation_evidence(id) on delete restrict,
+    diagnostic_version text not null,
+    final_covered boolean not null,
+    last_visible_node text,
+    first_loss_node text,
+    stage_journey jsonb not null default '{}'::jsonb,
+    created_at timestamptz not null default now(),
+    check (length(btrim(diagnostic_version)) > 0),
+    check (jsonb_typeof(stage_journey) = 'object'),
+    unique (case_result_id, evidence_id, diagnostic_version)
+);
+
+comment on table rag_evaluation_evidence_diagnostics is
+    'RAG 检索评测的 Gold Evidence 级节点命中轨迹与首次持续丢失节点。';
+
+create index if not exists rag_evaluation_evidence_diagnostics_run_loss_idx
+    on rag_evaluation_evidence_diagnostics (evaluation_run_id, first_loss_node);
+create index if not exists rag_evaluation_evidence_diagnostics_case_idx
+    on rag_evaluation_evidence_diagnostics (case_result_id, evidence_id);
 
 create table if not exists rag_evaluation_metric_values (
     id uuid primary key default gen_random_uuid(),

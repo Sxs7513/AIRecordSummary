@@ -3,13 +3,14 @@ from __future__ import annotations
 import math
 from collections.abc import Sequence
 
+from l2_core.rag_evaluation.answer_annotations import answerability_matches
 from l2_core.rag_evaluation.contracts import EvidenceMatch, GradeAssessmentPair, GradeMetrics, RetrievalMetrics
 
 
 def retrieval_metrics(matches: Sequence[EvidenceMatch], evidence_relevances: Sequence[int]) -> RetrievalMetrics:
     """Calculate rank metrics from one ordered result list and frozen evidence judgments."""
 
-    matches = _deduplicate_matches(matches)
+    deduplicated_matches = _deduplicate_matches(matches)
     relevant_total = max(1, len(evidence_relevances))
     return RetrievalMetrics(
         hit_at_1=_hit(matches, 1),
@@ -19,7 +20,7 @@ def retrieval_metrics(matches: Sequence[EvidenceMatch], evidence_relevances: Seq
         recall_at_10=_recall(matches, relevant_total, 10),
         recall_at_20=_recall(matches, relevant_total, 20),
         reciprocal_rank=_reciprocal_rank(matches),
-        ndcg_at_10=_ndcg(matches, evidence_relevances, 10),
+        ndcg_at_10=_ndcg(deduplicated_matches, evidence_relevances, 10),
     )
 
 
@@ -46,8 +47,8 @@ def grade_metrics(pairs: Sequence[GradeAssessmentPair]) -> GradeMetrics:
     expected_answers = [pair for pair in pairs if pair[0].verdict != "abstain"]
     expected_abstentions = [pair for pair in pairs if pair[0].verdict == "abstain"]
     return GradeMetrics(
-        verdict_accuracy=_ratio(
-            sum(expected.verdict == predicted.verdict for expected, predicted in pairs),
+        answerability_accuracy=_ratio(
+            sum(answerability_matches(expected.verdict, predicted.verdict) for expected, predicted in pairs),
             len(pairs),
         ),
         answer_false_negative_rate=_ratio(
@@ -70,7 +71,7 @@ def _hit(matches: Sequence[EvidenceMatch], limit: int) -> float:
 
 
 def _recall(matches: Sequence[EvidenceMatch], total: int, limit: int) -> float:
-    evidence_ids = {item.evidence_id for item in matches[:limit] if item.evidence_id is not None}
+    evidence_ids = {covered.evidence_id for item in matches[:limit] for covered in item.all_matches() if covered.evidence_id is not None}
     return min(1.0, len(evidence_ids) / total)
 
 
@@ -98,8 +99,7 @@ def _deduplicate_matches(matches: Sequence[EvidenceMatch]) -> list[EvidenceMatch
     for item in matches:
         if item.evidence_id is None or item.evidence_id not in seen:
             result.append(item)
-            if item.evidence_id is not None:
-                seen.add(item.evidence_id)
         else:
             result.append(EvidenceMatch(None, 0, "none"))
+        seen.update(match.evidence_id for match in item.all_matches() if match.evidence_id is not None)
     return result

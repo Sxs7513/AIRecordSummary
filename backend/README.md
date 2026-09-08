@@ -139,14 +139,18 @@ can therefore be configured independently:
 
 ```text
 RAG_ONLINE_DEFAULT_MODEL=gemini-gemini-3.5-flash-lite
+RAG_ANSWER_JUDGE_MODEL=gemini-gemini-3.5-flash-lite
+RAG_ANSWER_JUDGE_PROMPT_VERSION=answer_judge_v5
+RAG_ANSWER_JUDGE_MAX_OUTPUT_TOKENS=4096
 RAG_ASR_ADJUDICATION_AUDIT_MODEL=qwen-qwen3.8-max
 RAG_ASR_ADJUDICATION_CONSTRUCT_MODEL=qwen-qwen3.8-max
 RAG_ASR_ADJUDICATION_DECISION_MODEL=qwen-qwen3.8-max
 ```
 
-All RAG nodes that require an online model use `RAG_ONLINE_DEFAULT_MODEL`,
-except Correct Agent expression Audit, candidate construction, and candidate
-decision, which use their corresponding stage-specific model settings.
+All RAG nodes that require an online model use `RAG_ONLINE_DEFAULT_MODEL`.
+End-to-end evaluation uses `RAG_ANSWER_JUDGE_MODEL` for its independent answer
+judge. Correct Agent expression Audit, candidate construction, and candidate
+decision use their corresponding stage-specific model settings.
 Local routing and grading nodes remain local. Supported reference providers
 are `gemini`, `qwen`, and `zhipu`.
 

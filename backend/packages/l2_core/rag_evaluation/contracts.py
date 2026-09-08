@@ -37,6 +37,12 @@ class EvidenceMatch:
     evidence_id: UUID | None
     relevance: int
     kind: str
+    covered_matches: tuple[EvidenceMatch, ...] = ()
+
+    def all_matches(self) -> tuple[EvidenceMatch, ...]:
+        if self.covered_matches:
+            return self.covered_matches
+        return (self,) if self.evidence_id is not None else ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,13 +71,13 @@ class RetrievalMetrics:
 
 @dataclass(frozen=True, slots=True)
 class GradeMetrics:
-    verdict_accuracy: float
+    answerability_accuracy: float
     answer_false_negative_rate: float
     unsafe_answer_rate: float
 
     def as_dict(self) -> dict[str, float]:
         return {
-            "verdict_accuracy": self.verdict_accuracy,
+            "answerability_accuracy": self.answerability_accuracy,
             "answer_false_negative_rate": self.answer_false_negative_rate,
             "unsafe_answer_rate": self.unsafe_answer_rate,
         }
